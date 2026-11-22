@@ -204,6 +204,12 @@ class MiniProtocol:
                 + bytes(pal_bytes))
 
     @staticmethod
+    def lcd_index8_segment(payload):
+        """8 位索引段（0x10）：一字节一个像素，固定 216 色立方调色板。"""
+        n = len(payload)
+        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x10,
+                                   (n >> 8) & 0xFF, n & 0xFF, 0x00) + payload
+
     def lcd_index_segment(payload):
         n = len(payload)
         return (MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x0E,
@@ -348,8 +354,10 @@ class FrameEncoder:
         self._last_raw = None
         self._last_tile_raw = None
         self._last_indexed = None
-        self.color4 = True          # 4 位索引色 + 每帧调色板（12.8 KB/帧，半个帧的字节数）
-        self.dither = False         # 抖动会让相邻帧差异变大，默认关
+        self.color4 = True          # 4 位索引色 + 每帧调色板（6.7 KB/帧）
+        # 16 色下抖动是性价比最高的画质手段：不增加字节数，只改索引值。
+        import os as _os
+        self.dither = _os.environ.get("MSU2_DITHER", "0") != "0"
 
     def reset(self):
         self._last_raw = None
@@ -391,6 +399,9 @@ class FrameEncoder:
         out += MiniProtocol.lcd_enter_direct_mode()
 
         if raw_mode and self.color4:
+            import os as _os
+            if _os.environ.get("MSU2_TILES", "0") == "1":
+                return bytes(out + self._encode_indexed_tiles(img))
             return bytes(out + self._encode_indexed(img))
 
         if raw_mode:
@@ -428,45 +439,113 @@ class FrameEncoder:
     # 一帧 160x80 = 12800 像素。RGB565 是 25600 字节，索引色只要 6400 字节，
     # 加上每帧 32 字节调色板，整帧报文从 25.6 KB 降到约 13 KB。
     # 调色板用 PIL 的自适应量化（中位切分），16 色；解码在固件里做。
-    def _encode_indexed(self, img):
-        from PIL import Image as _Image
+    # 固定 16 色调色板：4 级灰 + 6 个基色 + 2 个深色。
+    # 顺序与取值都不随画面变化，抖动图案因此逐帧稳定，静态区域不会闪烁。
+    PALETTE16 = [
+        (0, 0, 0), (64, 64, 64), (128, 128, 128), (255, 255, 255),
+        (255, 0, 0), (0, 200, 0), (0, 0, 255), (255, 220, 0),
+        (0, 220, 220), (220, 0, 220), (0, 90, 200), (150, 90, 40),
+        (90, 40, 0), (0, 60, 0), (60, 0, 60), (30, 30, 30),
+    ]
 
-        method = _Image.MEDIANCUT
-        dither = _Image.Dither.FLOYDSTEINBERG if self.dither else _Image.Dither.NONE
-        q = img.convert("RGB").quantize(colors=16, method=method, dither=dither)
+    def _palette_image(self):
+        im = Image.new("P", (1, 1))
+        flat = []
+        for r, g, b in self.PALETTE16:
+            flat += [r, g, b]
+        im.putpalette(flat + [0] * (768 - len(flat)))
+        return im
 
-        pal = list(q.getpalette() or [])
-        if len(pal) < 48:
-            pal += [0] * (48 - len(pal))
-        palbytes = bytearray(32)
-        for i in range(16):
-            r, g, b = pal[3 * i], pal[3 * i + 1], pal[3 * i + 2]
+    def _palette_bytes(self):
+        out = bytearray(32)
+        for i, (r, g, b) in enumerate(self.PALETTE16):
             v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-            palbytes[2 * i] = (v >> 8) & 0xFF
-            palbytes[2 * i + 1] = v & 0xFF
+            out[2 * i] = (v >> 8) & 0xFF
+            out[2 * i + 1] = v & 0xFF
+        return bytes(out)
 
-        px = q.tobytes()              # 一个像素一个字节，取值 0..15
-        key = bytes(palbytes) + px
-        if key == self._last_indexed:
+    # 有序抖动的 Bayer 8×8 矩阵（0..1）
+    BAYER8 = [
+        0, 32, 8, 40, 2, 34, 10, 42,
+        48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44, 4, 36, 14, 46, 6, 38,
+        60, 28, 52, 20, 62, 30, 54, 22,
+        3, 35, 11, 43, 1, 33, 9, 41,
+        51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47, 7, 39, 13, 45, 5, 37,
+        63, 31, 55, 23, 61, 29, 53, 21,
+    ]
+
+    def _quantize_index(self, img):
+        """把 RGB 图量化成 216 色索引矩阵（R/G/B 各 6 级）。"""
+        import numpy as _np
+        rgb = _np.asarray(img.convert("RGB"), dtype=_np.int16)
+        if self.dither:
+            h, w = rgb.shape[0], rgb.shape[1]
+            bay = _np.array(self.BAYER8, dtype=_np.int16).reshape(8, 8)
+            bay = (bay - 32).astype(_np.int16)
+            th = _np.tile(bay, ((h + 7) // 8, (w + 7) // 8))[:h, :w]
+            rgb = _np.clip(rgb + (th * 3)[..., None], 0, 255)
+        lvl = (rgb * 6 // 256).astype(_np.uint8)
+        return (lvl[..., 0] * 36 + lvl[..., 1] * 6 + lvl[..., 2]).astype(_np.uint8)
+
+    def _encode_indexed(self, img):
+        """整帧单窗口：一次设窗口、一次收流，画面整体切换，撕裂最小。"""
+        idx = self._quantize_index(img)
+        payload = idx.tobytes()
+        if payload == self._last_indexed:
             return b""
-        self._last_indexed = key
-        self._last_raw = self._to_rgb565(img)
-
-        n = len(px) // 2
-        idx = bytearray(n)
-        for k in range(n):
-            idx[k] = ((px[2 * k] & 0x0F) << 4) | (px[2 * k + 1] & 0x0F)
+        self._last_indexed = payload
 
         out = bytearray()
-        out += MiniProtocol.lcd_palette(bytes(palbytes))
-        for k in range(0, n, 128):
-            out += MiniProtocol.lcd_index_segment(idx[k:k + 128])
+        for k in range(0, len(payload), 128):
+            out += MiniProtocol.lcd_index8_segment(payload[k:k + 128])
         out += MiniProtocol.lcd_raw_end()
         return bytes(out)
 
-    TILE = 16
-    TILE_FULL_THRESHOLD = 32
+    def _encode_indexed_tiles(self, img):
+        """8 位索引 + 16×16 分块增量。
 
+        整帧 12.8 KB 在 64 字节包的链路上要 60 ms 以上；桌面上真正变化的
+        往往只有一小片，所以按块比对，只发变化的块。整块 16×16 = 256 字节。
+        """
+        import numpy as _np
+
+        rgb = _np.asarray(img.convert("RGB"), dtype=_np.int16)
+        h, w = rgb.shape[0], rgb.shape[1]
+        if self.dither:
+            bay = _np.array(self.BAYER8, dtype=_np.int16).reshape(8, 8)
+            bay = (bay - 32).astype(_np.int16)
+            th = _np.tile(bay, ((h + 7) // 8, (w + 7) // 8))[:h, :w]
+            rgb = _np.clip(rgb + (th * 3)[..., None], 0, 255)
+
+        lvl = (rgb * 6 // 256).astype(_np.uint8)
+        idx = (lvl[..., 0] * 36 + lvl[..., 1] * 6 + lvl[..., 2]).astype(_np.uint8)
+
+        tile = 16
+        prev = self._last_indexed
+        out = bytearray()
+        changed = 0
+        for ty in range(0, h, tile):
+            for tx in range(0, w, tile):
+                blk = idx[ty:ty + tile, tx:tx + tile]
+                if prev is not None and prev.shape == idx.shape:
+                    old = prev[ty:ty + tile, tx:tx + tile]
+                    if _np.array_equal(blk, old):
+                        continue
+                changed += 1
+                payload = blk.tobytes()
+                out += MiniProtocol.lcd_set_xy(tx, ty)
+                out += MiniProtocol.lcd_set_size(tx + blk.shape[1], ty + blk.shape[0])
+                out += MiniProtocol.lcd_enter_direct_mode()
+                for k in range(0, len(payload), 128):
+                    out += MiniProtocol.lcd_index8_segment(payload[k:k + 128])
+                out += MiniProtocol.lcd_raw_end()
+
+        self._last_indexed = idx
+        if changed == 0:
+            return b""
+        return bytes(out)
     def _encode_tiles(self, raw):
         T = self.TILE
         prev = self._last_tile_raw
@@ -2075,7 +2154,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <body>
 
 <h1>MSU2_MINI_Console</h1>
-<h3>本项目开源，采用 PolyForm Noncommercial License 1.0.0 </h3>
+<h3>本项目开源，采用 MIT 许可证 </h3>
 
 <div class="card">
   <h2>设备</h2>

@@ -135,6 +135,17 @@ class MiniProtocol:
                                    Cmd.DRAW_DATA, 0x00, tail & 0xFF, 0x00)
 
     @staticmethod
+    def lcd_raw_segment(data):
+        n = len(data)
+        return (MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x0C,
+                                    (n >> 8) & 0xFF, n & 0xFF, 0x00)
+                + bytes(data))
+
+    @staticmethod
+    def lcd_raw_end():
+        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x09, 0, 0, 0)
+
+    @staticmethod
     def lcd_direction(reverse):
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW,
                                    Cmd.DRAW_DIRECTION, reverse & 0x01, 0, 0)
@@ -152,6 +163,8 @@ class SerialTransport:
         self._handshaked = False
         self.last_error = None
         self.bytes_written = 0
+        self.version = ""
+        self.raw_mode = False
 
     def open(self):
         with self._lock:
@@ -250,8 +263,10 @@ class SerialTransport:
                 buf.extend(chunk)
                 idx = buf.find(b"\x00MSN")
                 if idx >= 0 and len(buf) >= idx + 6:
-                    log.info("检测到 MSN 设备, 版本=%s",
-                             bytes(buf[idx+4:idx+6]).decode("ascii", "ignore"))
+                    self.version = bytes(buf[idx+4:idx+6]).decode("ascii", "ignore")
+                    self.raw_mode = (self.version == "02")
+                    log.info("检测到 MSN 设备, 版本=%s%s", self.version,
+                             "（整段传输）" if self.raw_mode else "")
                     self.write(b"\x00MSNCN")
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True
@@ -286,7 +301,7 @@ class FrameEncoder:
             raw[2 * k + 1] = v & 0xFF
         return bytes(raw)
 
-    def encode(self, img):
+    def encode(self, img, raw_mode=False):
         if img.size != (SCREEN_W, SCREEN_H):
             img = img.resize((SCREEN_W, SCREEN_H))
         if img.mode != "RGB":
@@ -300,6 +315,12 @@ class FrameEncoder:
         out += MiniProtocol.lcd_set_xy(0, 0)
         out += MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
         out += MiniProtocol.lcd_enter_direct_mode()
+
+        if raw_mode:
+            for si in range(0, len(raw), 256):
+                out += MiniProtocol.lcd_raw_segment(raw[si:si + 256])
+            out += MiniProtocol.lcd_raw_end()
+            return bytes(out)
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -353,7 +374,8 @@ class MiniDevice:
     def connected(self): return self.transport.connected
 
     def show_image(self, img):
-        frame = self.encoder.encode(img)
+        frame = self.encoder.encode(
+            img, raw_mode=getattr(self.transport, "raw_mode", False))
         if not frame:
             return True
         SEG = 2048

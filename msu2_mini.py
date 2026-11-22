@@ -445,17 +445,22 @@ class FrameEncoder:
             palbytes[2 * i] = (v >> 8) & 0xFF
             palbytes[2 * i + 1] = v & 0xFF
 
-        idx = q.tobytes()
-        key = bytes(palbytes) + idx
+        px = q.tobytes()              # 一个像素一个字节，取值 0..15
+        key = bytes(palbytes) + px
         if key == self._last_indexed:
             return b""
         self._last_indexed = key
         self._last_raw = self._to_rgb565(img)
 
+        n = len(px) // 2
+        idx = bytearray(n)
+        for k in range(n):
+            idx[k] = ((px[2 * k] & 0x0F) << 4) | (px[2 * k + 1] & 0x0F)
+
         out = bytearray()
         out += MiniProtocol.lcd_palette(bytes(palbytes))
-        for k in range(0, len(idx), 256):
-            out += MiniProtocol.lcd_index_segment(idx[k:k + 256])
+        for k in range(0, n, 128):
+            out += MiniProtocol.lcd_index_segment(idx[k:k + 128])
         out += MiniProtocol.lcd_raw_end()
         return bytes(out)
 

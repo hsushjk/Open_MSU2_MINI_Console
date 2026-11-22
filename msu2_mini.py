@@ -278,9 +278,11 @@ class FrameEncoder:
 
     def __init__(self):
         self._last_raw = None
+        self._last_tile_raw = None
 
     def reset(self):
         self._last_raw = None
+        self._last_tile_raw = None
 
     @staticmethod
     def _to_rgb565(img):
@@ -317,10 +319,7 @@ class FrameEncoder:
         out += MiniProtocol.lcd_enter_direct_mode()
 
         if raw_mode:
-            for si in range(0, len(raw), 256):
-                out += MiniProtocol.lcd_raw_segment(raw[si:si + 256])
-            out += MiniProtocol.lcd_raw_end()
-            return bytes(out)
+            return bytes(out + self._encode_tiles(raw))
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -342,6 +341,56 @@ class FrameEncoder:
                     if u != fill:
                         out += MiniProtocol.lcd_data_block(idx, *u)
             out += MiniProtocol.lcd_segment_end_full()
+        return bytes(out)
+
+    # ---- v2 分块增量 -------------------------------------------------
+    #
+    # 160x80 切成 16x16 的块，共 10x5 = 50 块，每块 512 字节。
+    # 与上一帧逐块比较，只发变化的块；每块自带窗口，独立成一次流。
+    # 变化块超过 32 个时退回整帧传输，避免重复的窗口开销反而更慢。
+    TILE = 16
+    TILE_FULL_THRESHOLD = 32
+
+    def _encode_tiles(self, raw):
+        T = self.TILE
+        prev = self._last_tile_raw
+        raw = bytes(raw)
+
+        if prev is None or len(prev) != len(raw):
+            self._last_tile_raw = raw
+            return self._encode_full(raw)
+
+        tiles = []
+        for ty in range(0, SCREEN_H, T):
+            for tx in range(0, SCREEN_W, T):
+                for r in range(ty, min(ty + T, SCREEN_H)):
+                    off = (r * SCREEN_W + tx) * 2
+                    if raw[off:off + T * 2] != prev[off:off + T * 2]:
+                        tiles.append((tx, ty))
+                        break
+
+        self._last_tile_raw = raw
+        if not tiles:
+            return b""
+        if len(tiles) > self.TILE_FULL_THRESHOLD:
+            return self._encode_full(raw)
+
+        out = bytearray()
+        for tx, ty in tiles:
+            out += MiniProtocol.lcd_set_xy(tx, ty)
+            out += MiniProtocol.lcd_set_size(tx + T, ty + T)
+            out += MiniProtocol.lcd_enter_direct_mode()
+            for r in range(ty, ty + T):
+                off = (r * SCREEN_W + tx) * 2
+                out += MiniProtocol.lcd_raw_segment(raw[off:off + T * 2])
+            out += MiniProtocol.lcd_raw_end()
+        return bytes(out)
+
+    def _encode_full(self, raw):
+        out = bytearray()
+        for si in range(0, len(raw), 256):
+            out += MiniProtocol.lcd_raw_segment(raw[si:si + 256])
+        out += MiniProtocol.lcd_raw_end()
         return bytes(out)
 
 def _normalize_port(port):
@@ -378,12 +427,10 @@ class MiniDevice:
             img, raw_mode=getattr(self.transport, "raw_mode", False))
         if not frame:
             return True
-        SEG = 2048
+        SEG = 8192
         for i in range(0, len(frame), SEG):
             if not self.transport.write(frame[i:i+SEG]):
                 return False
-            time.sleep(0.003)
-        time.sleep(0.02)
         self.transport.read_all()
         return True
 

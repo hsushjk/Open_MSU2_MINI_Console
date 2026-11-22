@@ -423,15 +423,19 @@ class MiniDevice:
     def connected(self): return self.transport.connected
 
     def show_image(self, img):
+        t0 = time.perf_counter()
         frame = self.encoder.encode(
             img, raw_mode=getattr(self.transport, "raw_mode", False))
+        self.enc_ms = (time.perf_counter() - t0) * 1000.0
         if not frame:
             return True
-        SEG = 8192
-        for i in range(0, len(frame), SEG):
-            if not self.transport.write(frame[i:i+SEG]):
+        seg_write = 8192
+        for i in range(0, len(frame), seg_write):
+            if not self.transport.write(frame[i:i+seg_write]):
                 return False
         self.transport.read_all()
+        self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
+        self.frame_bytes = len(frame)
         return True
 
     def set_reverse(self, reverse):
@@ -1277,6 +1281,10 @@ class Scheduler(threading.Thread):
             "reconnects": int(self.metrics.get("reconnects", 0)),
             "touch": int(self.metrics.get("touch", 0)),
             "render_ms": {k: round(v, 2) for k, v in top},
+            "enc_ms": round(getattr(self.device, "enc_ms", 0.0), 2),
+            "tx_ms": round(getattr(self.device, "tx_ms", 0.0), 2),
+            "frame_bytes": int(getattr(self.device, "frame_bytes", 0)),
+            "composite_ms": round(self.metrics.get("comp_ms", 0.0), 2),
             "background": {"enabled": self._bg_enabled, "mode": self._bg_mode,
                            "dim": self._bg_dim, "blur": self._bg_blur,
                            "frames": len(self.background.frames)},
@@ -1422,6 +1430,14 @@ class Scheduler(threading.Thread):
             log.warning("未知触摸动作: %s", action)
 
     def _composite(self, widget_img, mono):
+        t0 = time.perf_counter()
+        img = self._composite_impl(widget_img, mono)
+        cost = (time.perf_counter() - t0) * 1000.0
+        prev = self.metrics.get("comp_ms", cost)
+        self.metrics["comp_ms"] = prev * 0.8 + cost * 0.2
+        return img
+
+    def _composite_impl(self, widget_img, mono):
         bg = self.background.tick(mono)
         if bg is None:
             canvas = Image.new("RGBA", (SCREEN_W, SCREEN_H), "black")

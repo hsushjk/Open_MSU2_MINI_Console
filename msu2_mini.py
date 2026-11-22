@@ -316,13 +316,12 @@ class SerialTransport:
             chunk = self.read_all()
             if chunk:
                 buf.extend(chunk)
-                idx = buf.find(b"\x00MSN")
+                idx = buf.find(b"\x00OPM")
                 if idx >= 0 and len(buf) >= idx + 6:
-                    self.version = bytes(buf[idx+4:idx+6]).decode("ascii", "ignore")
-                    self.raw_mode = (self.version == "02")
-                    log.info("检测到 MSN 设备, 版本=%s%s", self.version,
-                             "（整段传输）" if self.raw_mode else "")
-                    self.write(b"\x00MSNCN")
+                    self.version = "02"
+                    self.raw_mode = True
+                    log.info("检测到 OPMSU 设备（整段传输）")
+                    self.write(b"\x00OPEND")
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True
             time.sleep(0.01)

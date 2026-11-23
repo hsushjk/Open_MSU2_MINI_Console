@@ -873,12 +873,17 @@ class MiniDevice:
         payload = frame
         # 按 8192 字节分块写（与存档点一致）：一旦某一块写不进去，
         # 立即停下来，不会出现“写了一半、剩下的在超时后才报错”。
+        # Write in 2 KB pieces with a tiny gap: the device ring is 8 KB and its
+        # consumer is the main loop, so never push a whole 25 KB frame in one
+        # burst. This costs ~25 ms per frame and removes the overflow entirely.
         ok = True
-        seg_write = 8192
+        seg_write = 2048
         for i in range(0, len(payload), seg_write):
             if not self.transport.write(payload[i:i + seg_write]):
                 ok = False
                 break
+            if i + seg_write < len(payload):
+                time.sleep(0.002)
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
             # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。
@@ -900,6 +905,30 @@ class MiniDevice:
                 self.self_paced = True
                 self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
                 self.frame_bytes = len(frame)
+                return True
+            if got == 0:
+                # No verdict byte at all: the device was too busy to answer in
+                # time. That is not proof the frame was bad, so keep going
+                # (the next frame is a full redraw anyway).
+                self.self_paced = False
+                self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
+                self.frame_bytes = len(frame)
+                self._quiet_frames = int(getattr(self, "_quiet_frames", 0)) + 1
+                if self._quiet_frames in (3, 30):
+                    log.warning("device answered no verdict for %d frames "
+                                "(firmware without the queued verdict?)",
+                                self._quiet_frames)
+                if self._quiet_frames >= 8:
+                    # The device stopped answering: it is either wedged or has
+                    # just been reset by its own watchdog. Drop the link so the
+                    # scheduler reconnects (that also re-runs the handshake).
+                    log.error("device stopped answering; reconnecting")
+                    self._quiet_frames = 0
+                    try:
+                        self.transport.close()
+                    except Exception:
+                        pass
+                    self.encoder.reset()
                 return True
             self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
             if self._ack_fails in (1, 3, 10, 30):

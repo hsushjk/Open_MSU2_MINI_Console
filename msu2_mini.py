@@ -3187,11 +3187,18 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     </label>
   </div>
   <div style="margin-top:4px" id="bg-single-wrap">
-    <input type="text" id="bg-path" placeholder="path/to/image.gif|png|jpg" style="width:22em">
+    <button onclick="document.getElementById('bg-file').click()">选择背景图…</button>
+    <input type="file" id="bg-file" accept=".gif,.png,.jpg,.jpeg,.bmp,.webp"
+           style="display:none" onchange="bgPicked(event)">
+    <span class="tiny" id="bg-name">（未选择）</span>
+    <input type="hidden" id="bg-path">
   </div>
   <div style="margin-top:4px" id="bg-multi-wrap">
+    <button onclick="document.getElementById('bg-files').click()">添加背景图…（可多选）</button>
+    <input type="file" id="bg-files" accept=".gif,.png,.jpg,.jpeg,.bmp,.webp" multiple
+           style="display:none" onchange="bgPickedMulti(event)">
     <textarea id="bg-paths" rows="3" style="width:100%"
-      placeholder="多张背景：一行一个路径"></textarea>
+      placeholder="已选的背景图（一行一个，也可以手动粘贴路径）"></textarea>
   </div>
   <div style="margin-top:4px">
     <label style="font-size:12px;color:#666">显示方式
@@ -3237,8 +3244,11 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     </label>
   </div>
   <div style="margin-top:4px">
-    <input type="text" id="asset-boot-path" placeholder="开机图路径（png / jpg）" style="width:20em">
-    <button onclick="uploadAsset(0, 0)">写入设备</button>
+    <button onclick="document.getElementById('asset-boot-file').click()">选择开机图…</button>
+    <input type="file" id="asset-boot-file" accept=".png,.jpg,.jpeg,.bmp"
+           style="display:none" onchange="assetPicked(0, event)">
+    <span class="tiny" id="asset-boot-name">（未选择，选完自动写入设备）</span>
+    <input type="hidden" id="asset-boot-path">
     <button onclick="drawAsset(0, 0)">预览</button>
     <span class="msg" id="msg-asset-boot"></span>
   </div>
@@ -3255,8 +3265,11 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     </label>
   </div>
   <div style="margin-top:4px">
-    <input type="text" id="asset-standby-path"
-           placeholder="待机图路径（png / jpg），填好后点某个槽位的「写入」" style="width:24em">
+    <button onclick="document.getElementById('asset-standby-file').click()">选择待机图…</button>
+    <input type="file" id="asset-standby-file" accept=".png,.jpg,.jpeg,.bmp"
+           style="display:none" onchange="assetPicked(1, event)">
+    <span class="tiny" id="asset-standby-name">（未选择，选完点某个槽位的「写入」）</span>
+    <input type="hidden" id="asset-standby-path">
     <span class="msg" id="msg-asset-standby"></span>
   </div>
   <div id="asset-slot-list" style="margin-top:6px"></div>
@@ -4064,6 +4077,70 @@ async function post(path) {
   setTimeout(refresh, 250);
 }
 
+async function uploadFileToServer(file) {
+  try {
+    const r = await fetch('/api/upload', {
+      method: 'POST',
+      headers: {'X-Filename': encodeURIComponent(file.name)},
+      body: file,
+    });
+    const j = await r.json();
+    return (j && j.ok) ? j.path : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+async function bgPicked(ev) {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  setMsg('msg-bg', '正在读取图片…', false);
+  const p = await uploadFileToServer(f);
+  if (!p) { setMsg('msg-bg', '上传失败', true); return; }
+  document.getElementById('bg-path').value = p;
+  document.getElementById('bg-name').textContent = f.name;
+  setMsg('msg-bg', '', false);
+  const btn = document.getElementById('btn-bg');
+  if (btn && !btn.classList.contains('active')) toggleBackground();
+  else applyBgLook();
+}
+
+async function bgPickedMulti(ev) {
+  const files = ev.target.files;
+  if (!files || !files.length) return;
+  setMsg('msg-bg', '正在读取 ' + files.length + ' 张图片…', false);
+  const got = [];
+  for (const f of files) {
+    const p = await uploadFileToServer(f);
+    if (p) got.push(p);
+  }
+  if (!got.length) { setMsg('msg-bg', '上传失败', true); return; }
+  const ta = document.getElementById('bg-paths');
+  const cur = (ta.value || '').trim();
+  ta.value = (cur ? cur + '\n' : '') + got.join('\n');
+  setMsg('msg-bg', '已添加 ' + got.length + ' 张', false);
+  const btn = document.getElementById('btn-bg');
+  if (btn && !btn.classList.contains('active')) toggleBackground();
+  else applyBgLook();
+}
+
+async function assetPicked(kind, ev) {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const msg = kind ? 'msg-asset-standby' : 'msg-asset-boot';
+  setMsg(msg, '正在读取图片…', false);
+  const p = await uploadFileToServer(f);
+  if (!p) { setMsg(msg, '上传失败', true); return; }
+  document.getElementById(kind ? 'asset-standby-path' : 'asset-boot-path').value = p;
+  document.getElementById(kind ? 'asset-standby-name' : 'asset-boot-name').textContent = f.name;
+  if (kind === 0) {
+    await uploadAsset(0, 0);          /* 开机图选完直接写进设备并预览 */
+    await drawAsset(0, 0);
+  } else {
+    setMsg('msg-asset-standby', '已选好，点上面某个槽位的「写入」', false);
+  }
+}
+
 async function toggleBackground() {
   const btn = document.getElementById('btn-bg');
   const currentlyOn = btn.classList.contains('active');
@@ -4821,6 +4898,33 @@ class WebUI(threading.Thread):
                         ok, why = sched.asset_draw_safe(int(body.get("kind", 0)),
                                                         int(body.get("slot", 0)))
                         self._json({"ok": ok, "err": "" if ok else why})
+                    elif self.path == "/api/upload":
+                        raw_name = self.headers.get("X-Filename") or "upload.bin"
+                        try:
+                            from urllib.parse import unquote
+                            raw_name = unquote(raw_name)
+                        except Exception:
+                            pass
+                        try:
+                            n = int(self.headers.get("Content-Length") or 0)
+                        except Exception:
+                            n = 0
+                        if n <= 0 or n > 32 * 1024 * 1024:
+                            self._json({"ok": False, "err": "文件为空或超过 32 MB"})
+                        else:
+                            data = self.rfile.read(n)
+                            updir = _data_dir() / "uploads"
+                            updir.mkdir(parents=True, exist_ok=True)
+                            base = os.path.basename(str(raw_name)) or "upload.bin"
+                            safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_"
+                                           for ch in base)[-60:] or "upload.bin"
+                            dst = updir / ("%s_%s" % (time.strftime("%H%M%S"), safe))
+                            try:
+                                dst.write_bytes(data)
+                                self._json({"ok": True, "path": str(dst),
+                                            "size": len(data)})
+                            except Exception as exc:
+                                self._json({"ok": False, "err": "保存失败：%s" % (exc,)})
                     elif self.path == "/api/asset/wipe":
                         ok, why = sched.asset_wipe_safe()
                         self._json({"ok": ok, "err": "" if ok else why})

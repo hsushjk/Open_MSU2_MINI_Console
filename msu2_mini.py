@@ -3284,15 +3284,16 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   </div>
   <div style="margin-top:6px">
     <label style="font-size:12px;color:#666">开机画面
-      <select id="asset-boot">
+      <select id="asset-boot" onchange="syncAssetUi()">
         <option value="0">不画</option>
         <option value="1">显示 NOR 里的图片</option>
         <option value="2">跑自检并显示结果</option>
       </select>
     </label>
-    <label style="font-size:12px;color:#666;margin-left:12px">停留
+    <label id="asset-boot-hold-wrap" style="font-size:12px;color:#666;margin-left:12px">停留
       <input type="number" id="asset-boot-hold" min="1" max="60" value="3" style="width:3.5em"> 秒
     </label>
+    <span class="tiny" id="asset-boot-hold-hint" style="margin-left:8px;color:#888"></span>
   </div>
   <div style="margin-top:4px">
     <button onclick="document.getElementById('asset-boot-file').click()">选择开机图…</button>
@@ -4254,6 +4255,11 @@ function syncAssetUi() {
   const wrap = document.getElementById('asset-dwell-wrap');
   if (!sel || !wrap) return;
   wrap.style.display = (parseInt(sel.value, 10) === 2) ? '' : 'none';
+  const bm = parseInt((document.getElementById('asset-boot') || {}).value || '0', 10);
+  const bw = document.getElementById('asset-boot-hold-wrap');
+  const bh = document.getElementById('asset-boot-hold-hint');
+  if (bw) bw.style.display = (bm === 1) ? '' : 'none';
+  if (bh) bh.textContent = (bm === 2) ? '（自检画面固定停留 1.5 秒）' : '';
 }
 
 async function refreshAsset() {

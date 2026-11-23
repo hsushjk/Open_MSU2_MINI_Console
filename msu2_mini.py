@@ -3258,6 +3258,8 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <option value="0">黑屏</option>
         <option value="1">四角方块（白黄闪）</option>
         <option value="2">图片轮播</option>
+        <option value="3">小球弹跳（带拖尾）</option>
+        <option value="4">呼吸灯</option>
       </select>
     </label>
     <label id="asset-dwell-wrap" style="font-size:12px;color:#666;margin-left:12px">每张

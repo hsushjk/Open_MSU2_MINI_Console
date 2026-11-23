@@ -787,6 +787,8 @@ class MiniDevice:
         ok = self.transport.open()
         if ok:
             self.encoder.reset()
+            self._verify_acks = None          # 重新连上就重新相信设备
+            self._ack_fails = 0
         return ok
 
     def close(self):  self.transport.close()
@@ -844,6 +846,11 @@ class MiniDevice:
                 if self._ack_fails in (3, 30):
                     log.warning("设备连续 %d 帧没有回执：可能卡死了，请拔插一次 USB",
                                 self._ack_fails)
+                if self._ack_fails >= 5:
+                    # 设备已经彻底不听了：再逐帧等回执只会让界面卡死，
+                    # 关掉校验把控制权交回给用户（拔插后自动恢复）。
+                    self._verify_acks = False
+                    log.error("停止逐帧校验：设备没有回执，请拔插一次 USB")
                 # 有没有回执都先同步：设备可能停在“等像素”里，
                 # 只有栅栏能把它拉回命令模式，否则后面每一帧都白费。
                 self.transport.resync()
@@ -854,20 +861,6 @@ class MiniDevice:
             self.transport.read_all()
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
-        if st is not None:
-            self.last_status = st
-            bad = (st["win"] > 0 and st["px"] != st["win"])
-            if st["aborts"] != getattr(self, "_aborts_seen", st["aborts"]):
-                self._aborts_seen = st["aborts"]
-                bad = True
-            if st["tmo"] != getattr(self, "_tmo_seen", st["tmo"]):
-                self._tmo_seen = st["tmo"]
-                bad = True
-            if bad:
-                log.debug("设备收流不完整: px=%s win=%s aborts=%s ovf=%s",
-                          st["px"], st["win"], st["aborts"], st["ovf"])
-                self.encoder.reset()
-                return False
         return True
 
     def set_reverse(self, reverse):

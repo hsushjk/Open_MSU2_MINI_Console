@@ -810,8 +810,29 @@ async function toggleBackground() {
   setTimeout(refresh, 250);
 }
 
-function assetSlotIndex() {
-  return (parseInt(document.getElementById('asset-slot').value || '1', 10) || 1) - 1;
+function renderSlotList(d, used) {
+  const box = document.getElementById('asset-slot-list');
+  if (!box) return;
+  let html = '';
+  for (let i = 0; i < 8; i++) {
+    const has = !!(d && (d.standby_mask & (1 << i)));
+    html += '<div style="margin-top:3px">' +
+      '<span style="display:inline-block;width:3.2em;color:#666">槽 ' + (i + 1) + '</span>' +
+      '<span style="display:inline-block;width:4.2em;color:' + (has ? '#2d7' : '#999') + '">' +
+      (has ? '有图' : '空槽') + '</span>' +
+      '<button onclick="uploadAsset(1, ' + i + ')" style="margin-right:4px">写入</button>' +
+      (has ? '<button onclick="drawAsset(1, ' + i + ')" style="margin-right:4px">预览</button>' +
+             '<button onclick="eraseAsset(1, ' + i + ')">擦除</button>' : '') +
+      '</div>';
+  }
+  box.innerHTML = html;
+}
+
+function syncAssetUi() {
+  const sel = document.getElementById('asset-standby');
+  const wrap = document.getElementById('asset-dwell-wrap');
+  if (!sel || !wrap) return;
+  wrap.style.display = (parseInt(sel.value, 10) === 2) ? '' : 'none';
 }
 
 async function refreshAsset() {
@@ -819,7 +840,6 @@ async function refreshAsset() {
   if (!j || !j.ok) { setMsg('msg-asset', '读取失败', true); return; }
   document.getElementById('asset-boot').value = String(j.boot_mode || 0);
   document.getElementById('asset-standby').value = String(j.standby_mode);
-  document.getElementById('asset-count').value = String(j.count || 1);
   document.getElementById('asset-dwell').value = String(j.dwell || 3);
   const d = j.device;
   const bhEl = document.getElementById('asset-boot-hold');
@@ -828,19 +848,23 @@ async function refreshAsset() {
   const slots = [];
   for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
   document.getElementById('asset-state').textContent =
-    '设备上：开机图 ' + (d.boot_valid ? '有' : '无') +
+    '设备固件 v' + (d.fw || '?') +
+    '；开机图 ' + (d.boot_valid ? '有' : '无') +
     '；待机图 ' + (slots.length ? ('第 ' + slots.join('/') + ' 张') : '无') +
     '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
+  renderSlotList(d, slots);
+  syncAssetUi();
 }
 
 async function saveAssetSettings() {
   const body = {
     boot_mode: parseInt(document.getElementById('asset-boot').value, 10) || 0,
     standby_mode: parseInt(document.getElementById('asset-standby').value, 10),
-    count: parseInt(document.getElementById('asset-count').value, 10) || 1,
+    count: 8,
     dwell: parseInt(document.getElementById('asset-dwell').value, 10) || 3,
-    boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 4,
+    boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 3,
   };
+  setMsg('msg-asset', '保存中…（正在写设备）', false);
   const j = await postJSON('/api/asset/settings', body);
   setMsg('msg-asset', j && j.ok ? '已保存到设备' : ('失败：' + ((j && j.err) || '设备没有确认')), !(j && j.ok));
   if (j && j.ok) refreshAsset();
@@ -857,7 +881,6 @@ async function uploadAsset(kind, slot) {
   if (j && j.ok) refreshAsset();
 }
 
-function uploadStandby() { uploadAsset(1, assetSlotIndex()); }
 
 async function drawAsset(kind, slot) {
   const j = await postJSON('/api/asset/draw', { kind: kind, slot: slot });
@@ -865,9 +888,11 @@ async function drawAsset(kind, slot) {
          j && j.ok ? '已显示' : ('失败：' + ((j && j.err) || '没有这张图')), !(j && j.ok));
 }
 
-async function eraseStandby() {
-  const j = await postJSON('/api/asset/erase', { kind: 1, slot: assetSlotIndex() });
-  setMsg('msg-asset-standby', j && j.ok ? '已擦除' : '擦除失败', !(j && j.ok));
+async function eraseAsset(kind, slot) {
+  setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot', '正在擦除…', false);
+  const j = await postJSON('/api/asset/erase', { kind: kind, slot: slot });
+  setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot',
+         j && j.ok ? '已擦除' : ('失败：' + ((j && j.err) || '擦除失败')), !(j && j.ok));
   refreshAsset();
 }
 

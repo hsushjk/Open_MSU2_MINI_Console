@@ -3194,7 +3194,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       </select>
     </label>
     <label style="font-size:12px;color:#666;margin-left:12px">停留
-      <input type="number" id="asset-boot-hold" min="1" max="60" value="4" style="width:3.5em"> 秒
+      <input type="number" id="asset-boot-hold" min="1" max="60" value="3" style="width:3.5em"> 秒
     </label>
   </div>
   <div style="margin-top:4px">
@@ -3205,32 +3205,22 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   </div>
   <div style="margin-top:10px">
     <label style="font-size:12px;color:#666">待机画面
-      <select id="asset-standby">
+      <select id="asset-standby" onchange="syncAssetUi()">
         <option value="0">黑屏</option>
         <option value="1">四角方块（白黄闪）</option>
         <option value="2">图片轮播</option>
       </select>
     </label>
-    <label style="font-size:12px;color:#666;margin-left:12px">张数
-      <input type="number" id="asset-count" min="1" max="8" value="1" style="width:3.5em">
-    </label>
-    <label style="font-size:12px;color:#666;margin-left:12px">每张
+    <label id="asset-dwell-wrap" style="font-size:12px;color:#666;margin-left:12px">每张
       <input type="number" id="asset-dwell" min="1" max="60" value="3" style="width:3.5em"> 秒
     </label>
   </div>
   <div style="margin-top:4px">
-    第
-    <select id="asset-slot">
-      <option value="1">1</option><option value="2">2</option><option value="3">3</option>
-      <option value="4">4</option><option value="5">5</option><option value="6">6</option>
-      <option value="7">7</option><option value="8">8</option>
-    </select>
-    张
-    <input type="text" id="asset-standby-path" placeholder="待机图路径" style="width:18em">
-    <button onclick="uploadStandby()">写入设备</button>
-    <button onclick="eraseStandby()">擦除这张</button>
+    <input type="text" id="asset-standby-path"
+           placeholder="待机图路径（png / jpg），填好后点某个槽位的「写入」" style="width:24em">
     <span class="msg" id="msg-asset-standby"></span>
   </div>
+  <div id="asset-slot-list" style="margin-top:6px"></div>
   <div style="margin-top:6px">
     <button onclick="saveAssetSettings()">保存设置</button>
     <button onclick="refreshAsset()">刷新</button>
@@ -4071,8 +4061,29 @@ async function toggleBackground() {
   setTimeout(refresh, 250);
 }
 
-function assetSlotIndex() {
-  return (parseInt(document.getElementById('asset-slot').value || '1', 10) || 1) - 1;
+function renderSlotList(d, used) {
+  const box = document.getElementById('asset-slot-list');
+  if (!box) return;
+  let html = '';
+  for (let i = 0; i < 8; i++) {
+    const has = !!(d && (d.standby_mask & (1 << i)));
+    html += '<div style="margin-top:3px">' +
+      '<span style="display:inline-block;width:3.2em;color:#666">槽 ' + (i + 1) + '</span>' +
+      '<span style="display:inline-block;width:4.2em;color:' + (has ? '#2d7' : '#999') + '">' +
+      (has ? '有图' : '空槽') + '</span>' +
+      '<button onclick="uploadAsset(1, ' + i + ')" style="margin-right:4px">写入</button>' +
+      (has ? '<button onclick="drawAsset(1, ' + i + ')" style="margin-right:4px">预览</button>' +
+             '<button onclick="eraseAsset(1, ' + i + ')">擦除</button>' : '') +
+      '</div>';
+  }
+  box.innerHTML = html;
+}
+
+function syncAssetUi() {
+  const sel = document.getElementById('asset-standby');
+  const wrap = document.getElementById('asset-dwell-wrap');
+  if (!sel || !wrap) return;
+  wrap.style.display = (parseInt(sel.value, 10) === 2) ? '' : 'none';
 }
 
 async function refreshAsset() {
@@ -4080,11 +4091,10 @@ async function refreshAsset() {
   if (!j || !j.ok) { setMsg('msg-asset', '读取失败', true); return; }
   document.getElementById('asset-boot').value = String(j.boot_mode || 0);
   document.getElementById('asset-standby').value = String(j.standby_mode);
-  document.getElementById('asset-count').value = String(j.count || 1);
   document.getElementById('asset-dwell').value = String(j.dwell || 3);
   const d = j.device;
   const bhEl = document.getElementById('asset-boot-hold');
-  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 4);
+  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
   const slots = [];
   for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
@@ -4093,16 +4103,19 @@ async function refreshAsset() {
     '；开机图 ' + (d.boot_valid ? '有' : '无') +
     '；待机图 ' + (slots.length ? ('第 ' + slots.join('/') + ' 张') : '无') +
     '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
+  renderSlotList(d, slots);
+  syncAssetUi();
 }
 
 async function saveAssetSettings() {
   const body = {
     boot_mode: parseInt(document.getElementById('asset-boot').value, 10) || 0,
     standby_mode: parseInt(document.getElementById('asset-standby').value, 10),
-    count: parseInt(document.getElementById('asset-count').value, 10) || 1,
+    count: 8,
     dwell: parseInt(document.getElementById('asset-dwell').value, 10) || 3,
-    boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 4,
+    boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 3,
   };
+  setMsg('msg-asset', '保存中…（正在写设备）', false);
   const j = await postJSON('/api/asset/settings', body);
   setMsg('msg-asset', j && j.ok ? '已保存到设备' : ('失败：' + ((j && j.err) || '设备没有确认')), !(j && j.ok));
   if (j && j.ok) refreshAsset();
@@ -4119,7 +4132,6 @@ async function uploadAsset(kind, slot) {
   if (j && j.ok) refreshAsset();
 }
 
-function uploadStandby() { uploadAsset(1, assetSlotIndex()); }
 
 async function drawAsset(kind, slot) {
   const j = await postJSON('/api/asset/draw', { kind: kind, slot: slot });
@@ -4127,9 +4139,11 @@ async function drawAsset(kind, slot) {
          j && j.ok ? '已显示' : ('失败：' + ((j && j.err) || '没有这张图')), !(j && j.ok));
 }
 
-async function eraseStandby() {
-  const j = await postJSON('/api/asset/erase', { kind: 1, slot: assetSlotIndex() });
-  setMsg('msg-asset-standby', j && j.ok ? '已擦除' : '擦除失败', !(j && j.ok));
+async function eraseAsset(kind, slot) {
+  setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot', '正在擦除…', false);
+  const j = await postJSON('/api/asset/erase', { kind: kind, slot: slot });
+  setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot',
+         j && j.ok ? '已擦除' : ('失败：' + ((j && j.err) || '擦除失败')), !(j && j.ok));
   refreshAsset();
 }
 

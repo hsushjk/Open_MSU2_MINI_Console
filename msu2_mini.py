@@ -367,21 +367,36 @@ class SerialTransport:
     def resync(self, timeout=0.5):
         """把设备从“等像素”拉回“等命令”。
 
-        v17 固件里已经没有栅栏：设备 400 ms 没有进展就会自己作废当前段。
-        这里只做两件事——把半路的像素计数喂到 0（补足 2048 字节上限），
-        再把迟到的回执清掉，免得被下一帧当成“收齐了”。
+        以前是往串口灌 25 KB 的收流帧，靠“喂饱像素计数”把设备顶出来；问题是
+        那堆字节在设备凑够像素之后会被当命令解析，可能拼出 class 3（flash）之类
+        的野命令。v39 固件自己会在“30 ms 没字节”或“一帧超过 400 ms”时作废
+        未完成的段，所以这里只要闭嘴等一会儿，再发一帧 0 像素的空帧就够：
+        设备放弃半截像素流、回到命令解析，状态的残留也一起清零。
         """
         with self._lock:
             if not self._connected or not self._ser:
                 return False
             try:
-                # 设备卡在“等像素”时，命令会被当成像素吃掉。要把它喂饱只能灌
-                # 满一帧（整屏 25 600 像素 → 最多 25 600 字节帧头计数）。
-                blob = END_FRAME * 4300         # 25 800 B
-                self._ser.write(blob)
-                time.sleep(max(0.08, len(blob) / 140000.0))
                 self._ser.reset_input_buffer()
-                return True
+                time.sleep(0.12)                  # 让设备的 30 ms 静默规则生效
+                self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
+                self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
+                self._ser.write(MiniProtocol.lcd_enter_direct_mode())
+                self._ser.write(END_FRAME)        # 0 像素的收流：flush + 归零 + 裁决
+                time.sleep(0.05)
+                deadline = time.monotonic() + timeout
+                got = b""
+                while time.monotonic() < deadline:
+                    try:
+                        chunk = self._ser.read(16)
+                    except Exception:
+                        break
+                    if chunk:
+                        got += chunk
+                        break
+                    time.sleep(0.01)
+                self._ser.reset_input_buffer()
+                return bool(got)
             except Exception:
                 self._connected = False; self._handshaked = False
                 return False

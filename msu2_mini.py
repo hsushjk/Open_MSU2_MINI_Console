@@ -119,7 +119,7 @@ def lcd_segment_payload(chunk):
 HEARTBEAT_INTERVAL = 2.0
 
 TOUCH_CH = 9
-TOUCH_SAMPLE_INTERVAL = 0.03
+TOUCH_SAMPLE_INTERVAL = 0.04
 TOUCH_LONG_PRESS = 0.8
 TOUCH_DOUBLE_WINDOW = 0.35
 TOUCH_MIN_TAP_GAP = 0.04
@@ -639,10 +639,13 @@ class MiniDevice:
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
         if not frame:
             return True
-        seg_write = 8192
-        for i in range(0, len(frame), seg_write):
-            if not self.transport.write(frame[i:i+seg_write]):
-                return False
+        # 整帧一次写：分段写会让别的线程（触摸轮询）把请求字节插进帧中间，
+        # 设备按“上一段的剩余字节数”消费，从此整条流错位。
+        ok = self.transport.write(frame)
+        if not ok:
+            # 写失败/截断时清掉帧缓存，下一轮强制整帧重发，避免屏幕停在半帧。
+            self.encoder.reset()
+            return False
         self.transport.read_all()
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
@@ -660,7 +663,7 @@ class MiniDevice:
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
             return None
-        return self.transport.read_adc(TOUCH_CH, timeout=0.03)
+        return self.transport.read_adc(TOUCH_CH, timeout=0.008)
 
 class Background:
     MAX_FRAMES = 300
@@ -1726,7 +1729,9 @@ class Scheduler(threading.Thread):
                         if self.device.show_image(self._composite(overlay, mono)):
                             self._last_send_mono = mono
                             self._count_frame(mono)
-                        self._force_send = False
+                            self._force_send = False
+                        else:
+                            self._force_send = True      # ???????????
                 elif need_render:
                     last_mono = mono
                     t0 = time.perf_counter()
@@ -1750,7 +1755,9 @@ class Scheduler(threading.Thread):
                             if self.device.show_image(self._composite(frame, mono)):
                                 self._last_send_mono = mono
                                 self._count_frame(mono)
-                            self._force_send = False
+                                self._force_send = False
+                            else:
+                                self._force_send = True
                     log.debug("渲染 %s: render=%.1fms total=%.1fms",
                               w.name, cost, (time.perf_counter() - t0) * 1000.0)
                 elif need_bg:
@@ -1759,6 +1766,8 @@ class Scheduler(threading.Thread):
                             self._composite(self._last_imgs.get(w.name), mono)):
                         self._last_send_mono = mono
                         self._count_frame(mono)
+                    else:
+                        self._force_send = True
                 elif need_heartbeat:
                     if self.device.heartbeat():
                         self._last_send_mono = mono

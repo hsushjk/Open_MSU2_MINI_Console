@@ -243,6 +243,12 @@ class MiniProtocol:
     def read_adc(ch):
         return MiniProtocol._frame(Cmd.ADC, ch, 0, 0, 0, 0)
 
+# 同步栅栏：坏帧之后连发这几个字节，设备无论停在收像素还是等命令，
+# 都会认出来、把现场清干净并回一个 0x06。像素里出现它的概率是 2^-48。
+SYNC_FENCE = bytes((0xA5, 0x5A, 0xA5, 0x5A, 0x0E, 0x07))
+END_FRAME = bytes((0x02, 0x03, 0x09, 0x00, 0x00, 0x00))
+
+
 class SerialTransport:
     def __init__(self, port, baud=SCREEN_BAUD, timeout=0.05):
         self.port = port; self.baud = baud; self.timeout = timeout
@@ -312,13 +318,75 @@ class SerialTransport:
             if not self._connected or not self._ser:
                 return False
             try:
-                self._ser.write(data)
-                self.bytes_written += len(data)
+                view = memoryview(bytes(data))
+                total = len(view)
+                sent = 0
+                t0 = time.monotonic()
+                while sent < total:
+                    n = self._ser.write(view[sent:]) or 0
+                    if n <= 0:
+                        # 短写：给驱动喘口气，别把半帧当成整帧发出去
+                        if time.monotonic() - t0 > 3.0:
+                            raise IOError("写入卡住（3 秒没有进展）")
+                        time.sleep(0.001)
+                        continue
+                    sent += n
+                self.bytes_written += total
                 return True
             except Exception as e:
                 log.warning("写入失败: %s", e)
                 self._connected = False; self._handshaked = False
                 return False
+
+    def resync(self, timeout=0.4):
+        """把设备从“等像素”拉回“等命令”：连发栅栏，等它回 0x06。"""
+        with self._lock:
+            if not self._connected or not self._ser:
+                return False
+            try:
+                self._ser.reset_input_buffer()
+                # 先补几个收流命令（对老固件是唯一的出路：把卡在半路的
+                # 像素计数喂到 0），再连发同步栅栏把设备拉回命令模式。
+                for _ in range(8):
+                    self._ser.write(END_FRAME)
+                for _ in range(3):
+                    self._ser.write(SYNC_FENCE)
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < timeout:
+                    n = self._ser.in_waiting
+                    if n:
+                        if b"\x06" in self._ser.read(n):
+                            return True
+                    time.sleep(0.004)
+                return False
+            except Exception:
+                self._connected = False; self._handshaked = False
+                return False
+
+    def read_verdicts(self, count, timeout=0.4):
+        """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。"""
+        with self._lock:
+            if not self._connected or not self._ser:
+                return False, 0
+            got = 0
+            bad = False
+            buf = bytearray()
+            t0 = time.monotonic()
+            while got < count and time.monotonic() - t0 < timeout:
+                n = self._ser.in_waiting
+                if n:
+                    buf.extend(self._ser.read(n))
+                while buf:
+                    b = buf[0]
+                    del buf[0]
+                    if b == 0x06:
+                        got += 1
+                    elif b == 0x15:
+                        got += 1
+                        bad = True
+                if got < count:
+                    time.sleep(0.003)
+            return (got >= count and not bad), got
 
     def read_all(self):
         with self._lock:
@@ -751,23 +819,37 @@ class MiniDevice:
         # 设备按“上一段的剩余字节数”消费，从此整条流错位。
         ok = self.transport.write(frame)
         if not ok:
-            # 写失败/截断时清掉帧缓存，下一轮强制整帧重发，避免屏幕停在半帧。
-            # 再补一个收流命令，让设备丢掉段中间残留的状态（raw_left / stage），
-            # 否则下一次整帧会从错位的位置开始画。
+            # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
+            # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。
             self.encoder.reset()
             try:
                 if getattr(self.transport, "connected", False):
-                    self.transport.write(MiniProtocol.lcd_raw_end())
-                    time.sleep(0.05)
-                    self.transport.read_all()
+                    self.transport.resync()
             except Exception:
                 pass
             return False
-        st = None
         fw = getattr(self.transport, "fw_version", None)
-        if getattr(self.encoder, "last_full", False) and fw and fw >= (12, 0):
-            # 整屏帧带状态回包：px 必须等于 win，否则说明中间丢了字节。
-            st = self.transport.read_status(0.12)
+        verify = getattr(self, "_verify_acks", None)
+        if verify is None:
+            verify = bool(fw and fw >= (13, 0))
+            self._verify_acks = verify
+        if verify:
+            # 每个收流命令设备都回一个裁决字节：数目对不上或出现 0x15，
+            # 说明中间丢了字节/超时作废，必须先同步再整帧重发。
+            want = frame.count(END_FRAME)
+            ok_ack, got = self.transport.read_verdicts(want, 0.4)
+            if not ok_ack:
+                log.debug("收流裁决不全: %d/%d", got, want)
+                self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
+                if self._ack_fails in (3, 30):
+                    log.warning("设备连续 %d 帧没有回执：可能卡死了，请拔插一次 USB",
+                                self._ack_fails)
+                # 有没有回执都先同步：设备可能停在“等像素”里，
+                # 只有栅栏能把它拉回命令模式，否则后面每一帧都白费。
+                self.transport.resync()
+                self.encoder.reset()
+                return False
+            self._ack_fails = 0
         else:
             self.transport.read_all()
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms

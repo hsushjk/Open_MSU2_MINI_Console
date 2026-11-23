@@ -3199,9 +3199,7 @@ async function applyDebug() {
     const j = await postJSON('/api/debug', { on: el.checked });
     devResult(j, el.checked ? '调试模式已开' : '调试模式已关', 'msg-debug');
   } catch(e) {
-    setMsg('msg-display', '失败: ' + e, true);
-  } catch(e2) {
-    setMsg('msg-debug', '失败: ' + e2, true);
+    setMsg('msg-debug', '失败: ' + e, true);
   }
 }
 

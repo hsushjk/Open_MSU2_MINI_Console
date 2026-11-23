@@ -165,6 +165,19 @@ class MiniProtocol:
     def _frame(*vals):
         return bytes(v & 0xFF for v in vals)
 
+    # --- 设备端配置存档（v30+）：亮/朝向/翻转/页，存在板载 NOR 里 ---
+    @staticmethod
+    def devcfg_info():
+        return MiniProtocol._frame(0x09, 0x01, 0, 0, 0, 0)
+
+    @staticmethod
+    def devcfg_write(dim, orient, reverse, page):
+        return MiniProtocol._frame(0x09, 0x02, dim, orient, reverse, page)
+
+    @staticmethod
+    def devcfg_clear():
+        return MiniProtocol._frame(0x09, 0x03, 0, 0, 0, 0)
+
     @staticmethod
     def lcd_set_xy(x, y):
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_SET_XY,
@@ -448,6 +461,67 @@ class SerialTransport:
             except Exception as e:
                 log.debug("查询固件版本失败: %s", e)
             return None
+
+    def devcfg_info(self, timeout=0.5):
+        """读设备端存档（板载 NOR）。
+
+        回包 11 字节：09 01 id0 id1 id2 valid dim orient reverse page AA。
+        返回 dict 或 None（老固件 / 没有 NOR）。
+        """
+        with self._lock:
+            if not self._connected or not self._ser:
+                return None
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.write(MiniProtocol.devcfg_info())
+                t0 = time.monotonic()
+                buf = bytearray()
+                while time.monotonic() - t0 < timeout:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                    while len(buf) >= 11:
+                        if buf[0] == 0x09 and buf[1] == 0x01 and buf[10] == 0xAA:
+                            fid = bytes(buf[2:5])
+                            info = {
+                                "flash_id": fid.hex().upper(),
+                                "valid": bool(buf[5]),
+                                "dim": buf[6],
+                                "orient": buf[7],
+                                "reverse": buf[8],
+                                "page": buf[9],
+                            }
+                            del buf[:11]
+                            return info
+                        del buf[0]
+                    time.sleep(0.005)
+            except Exception as e:
+                log.debug("读设备存档失败: %s", e)
+            return None
+
+    def devcfg_write(self, dim, orient, reverse, page, timeout=1.5):
+        """把配置写进设备 NOR；成功返回 True。擦除+编程约 20 ms，别和发帧抢串口。"""
+        with self._lock:
+            if not self._connected or not self._ser:
+                return False
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.write(MiniProtocol.devcfg_write(dim, orient,
+                                                          reverse, page))
+                t0 = time.monotonic()
+                buf = bytearray()
+                while time.monotonic() - t0 < timeout:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                    for i, b in enumerate(buf):
+                        if b in (0x06, 0x15):
+                            del buf[:i + 1]
+                            return b == 0x06
+                    time.sleep(0.01)
+            except Exception as e:
+                log.warning("写设备存档失败: %s", e)
+            return False
 
     def read_status(self, timeout=0.12):
         """收流后设备回的 16 字节状态帧（0x55 ... 0xAA）。
@@ -861,6 +935,12 @@ class MiniDevice:
         self.transport.read_all()
         return ok
 
+    def devcfg_info(self):
+        return self.transport.devcfg_info()
+
+    def devcfg_write(self, dim, orient, reverse, page):
+        return self.transport.devcfg_write(dim, orient, reverse, page)
+
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
             return None
@@ -1248,6 +1328,7 @@ class Scheduler(threading.Thread):
         self._on_shutdown = on_shutdown
         self._save_timer = None
         self._save_timer_lock = threading.Lock()
+        self._devcfg_dirty = False        # 设备 NOR 存档待写
 
         self.orientation = config.get("orientation", LANDSCAPE)
         self.reverse = bool(config.get("reverse", False))
@@ -1507,6 +1588,73 @@ class Scheduler(threading.Thread):
         if self.config.get("current_page") != name:
             self.config["current_page"] = name
             self._save_config()
+            self._devcfg_dirty = True
+
+    # ---------- 设备端配置存档（v30 起：板载 NOR 记住亮度/朝向/翻转/页） ----------
+    def _devcfg_boot_sync(self):
+        """连上设备后先读它记的配置：设备是断电记忆的权威，读回来就用。"""
+        try:
+            info = self.device.devcfg_info()
+        except Exception:
+            info = None
+        if not info:
+            self._devcfg_dirty = True        # 老固件或读不到：先把当前配置写进去
+            return
+        log.info("设备存档: NOR=%s 有效=%s 亮度=%d 朝向=%s 翻转=%s 页=%d",
+                 info["flash_id"], "是" if info["valid"] else "否",
+                 info["dim"], "竖屏" if info["orient"] else "横屏",
+                 "开" if info["reverse"] else "关", info["page"])
+        if not info["valid"]:
+            self._devcfg_dirty = True
+            return
+        dim = _coerce_int(info["dim"], self._dim, 0, 90)
+        if dim != self._dim:
+            self._dim = dim
+            self.config.setdefault("display", {})["dim"] = dim
+            log.info("从设备恢复暗化: %d%%", dim)
+        orient = PORTRAIT if info["orient"] else LANDSCAPE
+        if orient != self.orientation:
+            self.orientation = orient
+            self.ctx.orientation = orient
+            self.config["orientation"] = orient
+            try:
+                self._ensure_supported()
+            except Exception:
+                pass
+            log.info("从设备恢复朝向: %s", orient)
+        rev = bool(info["reverse"])
+        if rev != self.reverse:
+            self.reverse = rev
+            self.device.set_reverse(rev)
+            self.config["reverse"] = rev
+            log.info("从设备恢复翻转: %s", rev)
+        # 页只在配置里没记过时采用（插件顺序可能变过，硬套索引不可靠）
+        if "current_page" not in self.config and self._widgets:
+            idx = min(int(info["page"]), len(self._widgets) - 1)
+            if idx != self._current:
+                self._current = idx
+                log.info("从设备恢复页: %s", self._widgets[idx].name)
+        self._switch.set()
+
+    def _flush_devcfg(self):
+        """把当前配置写进设备 NOR。只在主循环的空档调用——绝不能和发帧抢串口。"""
+        page = self._current if self._widgets else 0
+        ok = False
+        try:
+            ok = self.device.devcfg_write(
+                _coerce_int(self._dim, 0, 0, 90),
+                1 if self.orientation == PORTRAIT else 0,
+                1 if self.reverse else 0,
+                page & 0xFF)
+        except Exception as e:
+            log.warning("写设备存档异常: %s", e)
+        self._devcfg_dirty = False
+        if ok:
+            log.info("设备存档已更新: 亮度 %d%% 朝向 %s 页 %s",
+                     self._dim, self.orientation,
+                     self._widgets[page].name if self._widgets else "-")
+        else:
+            log.warning("设备存档写入失败（下次改设置时会重试）")
 
     def find_widget(self, name):
         for w in self._widgets:
@@ -1568,6 +1716,7 @@ class Scheduler(threading.Thread):
         self.device.set_reverse(self.reverse)
         self.config["reverse"] = self.reverse
         self._save_config()
+        self._devcfg_dirty = True
         self._switch.set()
         log.info("翻转 -> %s", self.reverse)
         return True
@@ -1581,6 +1730,7 @@ class Scheduler(threading.Thread):
         self._save_config()
         self._ensure_supported()
         self._switch.set()
+        self._devcfg_dirty = True
         log.info("朝向 -> %s", self.orientation)
         return True
 
@@ -1592,6 +1742,7 @@ class Scheduler(threading.Thread):
         self._dim = v
         self.config.setdefault("display", {})["dim"] = v
         self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
+        self._devcfg_dirty = True        # 亮度也记到设备里
         self._force_send = True
         log.info("暗化 -> %d%%", v)
         return True
@@ -1954,9 +2105,13 @@ class Scheduler(threading.Thread):
                     self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
                     last_mono = 0.0
                     last_bg_ts = 0.0
+                    self._devcfg_boot_sync()
 
                 self._drain_ops()
                 self._watch_widgets(time.monotonic())
+
+                if self._devcfg_dirty:
+                    self._flush_devcfg()
 
                 widgets = self._widgets
                 current = self._current
@@ -4335,6 +4490,16 @@ def cmd_selftest(port=None):
             _console("  固件 %d.%d" % fw)
         else:
             _console("  固件版本未知（v8 及更早没有版本帧）")
+
+        # 0) 设备存档（v30 起：板载 NOR 记得亮度/朝向/翻转/页）
+        info = tr.devcfg_info()
+        if info:
+            _console("  存档 NOR=%s 有效=%s 亮度=%d 朝向=%s 翻转=%s 页=%d"
+                     % (info["flash_id"], "是" if info["valid"] else "否",
+                        info["dim"], "竖" if info["orient"] else "横",
+                        "开" if info["reverse"] else "关", info["page"]))
+        else:
+            _console("  设备存档不可用（v30 之前，或 NOR 读不到）")
 
         # 1) 触摸：连读 10 次，看有没有非 0 值
         vals = []

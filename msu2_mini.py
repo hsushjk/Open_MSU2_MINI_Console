@@ -247,6 +247,7 @@ class SerialTransport:
         self.port = port; self.baud = baud; self.timeout = timeout
         self._ser = None
         self._lock = threading.RLock()
+        self.fw_version = None
         self._connected = False
         self._handshaked = False
         self.last_error = None
@@ -280,6 +281,16 @@ class SerialTransport:
             if not self._handshaked and not self.handshake():
                 self.close(); return False
             log.info("串口已打开: %s @ %d", self.port, self.baud)
+            ver = self.query_version()
+            if ver:
+                major, minor, touch = ver
+                self.fw_version = (major, minor)
+                log.info("固件版本 %d.%d，触摸读数 %d", major, minor, touch)
+                if touch == 0:
+                    log.warning("固件自检的触摸读数为 0：这一版 ADC 仍没产出，"
+                                "请确认烧的是 MSU2_open_v9.hex")
+            else:
+                log.warning("固件没有回应版本查询（可能是 v8 或更早的固件）")
             return True
 
     def close(self):
@@ -317,6 +328,36 @@ class SerialTransport:
             except Exception:
                 self._connected = False; self._handshaked = False
                 return b""
+
+    def query_version(self, timeout=0.4):
+        """问固件版本；返回 (major, minor, touch) 或 None。
+
+        新固件（v9 起）会在同一个回包里带上当前触摸读数，所以这一条日志
+        就能同时回答“烧的是哪一版”和“ADC 有没有在产出”。
+        """
+        with self._lock:
+            if not self._connected or not self._ser:
+                return None
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.write(bytes([0x00, 0x56, 0, 0, 0, 0]))
+                t0 = time.monotonic()
+                buf = bytearray()
+                while time.monotonic() - t0 < timeout:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                    while len(buf) >= 6:
+                        if buf[0] == 0x56 and buf[5] == 0xAA:
+                            major, minor = buf[1], buf[2]
+                            touch = (buf[3] << 8) | buf[4]
+                            del buf[:6]
+                            return major, minor, touch
+                        del buf[0]
+                    time.sleep(0.005)
+            except Exception as e:
+                log.debug("查询固件版本失败: %s", e)
+            return None
 
     def read_adc(self, ch, timeout=0.05):
         with self._lock:

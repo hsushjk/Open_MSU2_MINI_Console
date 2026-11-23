@@ -843,7 +843,7 @@ async function refreshAsset() {
   document.getElementById('asset-dwell').value = String(j.dwell || 3);
   const d = j.device;
   const bhEl = document.getElementById('asset-boot-hold');
-  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 4);
+  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
   const slots = [];
   for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
@@ -893,6 +893,17 @@ async function eraseAsset(kind, slot) {
   const j = await postJSON('/api/asset/erase', { kind: kind, slot: slot });
   setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot',
          j && j.ok ? '已擦除' : ('失败：' + ((j && j.err) || '擦除失败')), !(j && j.ok));
+  refreshAsset();
+}
+
+async function wipeAsset() {
+  if (!confirm('确定要抹掉设备板载 NOR 吗？\n\n会删掉全部开机图、待机图，并把画面设置恢复默认（不画开机图 / 四角方块 / 停留 3 秒）。\n此操作不可撤销。')) {
+    return;
+  }
+  setMsg('msg-asset', '正在抹除…（约 1 秒）', false);
+  const j = await postJSON('/api/asset/wipe', {});
+  setMsg('msg-asset', j && j.ok ? '已抹掉，设置恢复默认' : ('失败：' + ((j && j.err) || '设备没有确认')),
+         !(j && j.ok));
   refreshAsset();
 }
 

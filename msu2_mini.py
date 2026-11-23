@@ -224,6 +224,11 @@ class MiniProtocol:
                                    count, dwell)
 
     @staticmethod
+    def asset_wipe():
+        """抹掉全部资产与设置：`0A 0A`"""
+        return MiniProtocol._frame(0x0A, 0x0A, 0, 0, 0, 0)
+
+    @staticmethod
     def asset_boot_hold(secs):
         """开机画面停留秒数：`0A 09 secs`"""
         return MiniProtocol._frame(0x0A, 0x09, int(secs) & 0xFF, 0, 0, 0)
@@ -601,6 +606,14 @@ class SerialTransport:
         self.write(MiniProtocol.asset_erase(kind, slot))
         st = self._asset_reply(0x05, timeout)
         return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认擦除（%r）" % (st,))
+
+    def asset_wipe(self, timeout=25.0):
+        """抹掉板载 NOR 里的全部图片与设置（逐槽擦 4K，约 0.3 秒）。"""
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
+        self.write(MiniProtocol.asset_wipe())
+        st = self._asset_reply(0x0A, timeout)
+        return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认抹除（%r）" % (st,))
 
     def asset_settings(self, boot_mode, standby_mode, count, dwell,
                        boot_hold=4, timeout=4.0):
@@ -1217,6 +1230,9 @@ class MiniDevice:
     def asset_settings(self, boot_mode, standby_mode, count, dwell, boot_hold=4):
         return self.transport.asset_settings(boot_mode, standby_mode,
                                              count, dwell, boot_hold)
+
+    def asset_wipe(self):
+        return self.transport.asset_wipe()
 
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
@@ -1921,6 +1937,9 @@ class Scheduler(threading.Thread):
 
     def asset_erase_safe(self, kind, slot):
         return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
+
+    def asset_wipe_safe(self):
+        return self._asset_idle(lambda: self.device.asset_wipe(), pause=1.0)
 
     def asset_settings_safe(self, boot_mode, standby_mode, count, dwell,
                             boot_hold=4):
@@ -3224,6 +3243,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <div style="margin-top:6px">
     <button onclick="saveAssetSettings()">保存设置</button>
     <button onclick="refreshAsset()">刷新</button>
+    <button onclick="wipeAsset()" style="color:#c33">抹掉板载 NOR（全部）</button>
     <span class="msg" id="msg-asset"></span>
     <div class="tiny" id="asset-state" style="margin-top:4px"></div>
   </div>
@@ -4147,6 +4167,17 @@ async function eraseAsset(kind, slot) {
   refreshAsset();
 }
 
+async function wipeAsset() {
+  if (!confirm('确定要抹掉设备板载 NOR 吗？\n\n会删掉全部开机图、待机图，并把画面设置恢复默认（不画开机图 / 四角方块 / 停留 3 秒）。\n此操作不可撤销。')) {
+    return;
+  }
+  setMsg('msg-asset', '正在抹除…（约 1 秒）', false);
+  const j = await postJSON('/api/asset/wipe', {});
+  setMsg('msg-asset', j && j.ok ? '已抹掉，设置恢复默认' : ('失败：' + ((j && j.err) || '设备没有确认')),
+         !(j && j.ok));
+  refreshAsset();
+}
+
 async function shutdownApp() {
   if (!confirm('确定要关闭 MSU2_MINI 上位机吗？\n关闭后需要重新启动才能继续使用。')) {
     return;
@@ -4769,6 +4800,9 @@ class WebUI(threading.Thread):
                         body = self._read_json()
                         ok, why = sched.asset_draw_safe(int(body.get("kind", 0)),
                                                         int(body.get("slot", 0)))
+                        self._json({"ok": ok, "err": "" if ok else why})
+                    elif self.path == "/api/asset/wipe":
+                        ok, why = sched.asset_wipe_safe()
                         self._json({"ok": ok, "err": "" if ok else why})
                     elif self.path == "/api/asset/erase":
                         body = self._read_json()

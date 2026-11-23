@@ -342,33 +342,22 @@ class SerialTransport:
                 self._connected = False; self._handshaked = False
                 return False
 
-    def resync(self, timeout=0.4):
-        """把设备从“等像素”拉回“等命令”：连发栅栏，等它回 0x06。"""
+    def resync(self, timeout=0.5):
+        """把设备从“等像素”拉回“等命令”。
+
+        v17 固件里已经没有栅栏：设备 400 ms 没有进展就会自己作废当前段。
+        这里只做两件事——把半路的像素计数喂到 0（补足 2048 字节上限），
+        再把迟到的回执清掉，免得被下一帧当成“收齐了”。
+        """
         with self._lock:
             if not self._connected or not self._ser:
                 return False
             try:
+                blob = END_FRAME * 420          # 2520 B，足够填掉任何 raw_left
+                self._ser.write(blob)
+                time.sleep(max(0.05, len(blob) / 100000.0))
                 self._ser.reset_input_buffer()
-                # 先补几个收流命令（对老固件是唯一的出路：把卡在半路的
-                # 像素计数喂到 0），再连发同步栅栏把设备拉回命令模式。
-                for _ in range(8):
-                    self._ser.write(END_FRAME)
-                for _ in range(3):
-                    self._ser.write(SYNC_FENCE)
-                t0 = time.monotonic()
-                while time.monotonic() - t0 < timeout:
-                    n = self._ser.in_waiting
-                    if n:
-                        chunk = self._ser.read(n)
-                        # v15 起栅栏回执是 0x07；老固件回 0x06，都算同步成功
-                        if b"\x07" in chunk or b"\x06" in chunk:
-                            # 栅栏发了 3 个，设备会回 3 个 0x06；剩下的如果留在
-                            # 缓冲里，下一帧读回执时会被当成“这帧收齐了”。
-                            time.sleep(0.02)
-                            self._ser.reset_input_buffer()
-                            return True
-                    time.sleep(0.004)
-                return False
+                return True
             except Exception:
                 self._connected = False; self._handshaked = False
                 return False
@@ -548,6 +537,17 @@ class SerialTransport:
                     self.raw_mode = True
                     log.info("检测到 OPMSU 设备（整段传输）")
                     self.write(b"\x00OPEND")
+                    time.sleep(0.05); self.read_all()
+                    self._handshaked = True; return True
+                idx = buf.find(b"\x00MSN")
+                if idx >= 0 and len(buf) >= idx + 6:
+                    # 老固件（存档点/proto25）：整段传输协议一样，只是没有
+                    # 版本查询、没有裁决字节、ADC 恒 0。
+                    self.version = chr(buf[idx + 4]) + chr(buf[idx + 5])
+                    self.raw_mode = (self.version == "02")
+                    log.info("检测到 MSN 设备, 版本=%s%s", self.version,
+                             "（整段传输）" if self.raw_mode else "")
+                    self.write(b"\x00MSNCN")
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True
             time.sleep(0.01)
@@ -830,17 +830,10 @@ class MiniDevice:
             self._ack_fails = 0
             self._zero_acks = 0
             fwv = getattr(self.transport, "fw_version", None)
-            if fwv is not None and fwv < (15, 0):
-                log.warning("固件版本 %d.%d 偏旧：整屏帧超过 200 ms 会被设备判失败，"
-                            "请烧 MSU2_open_v15.hex", fwv[0], fwv[1])
             if fwv is None:
-                # 上手时设备可能正卡在“等像素”里（上一轮崩在半路），版本查询
-                # 不理人。先发栅栏把它拉回命令模式，再问一次版本。
-                try:
-                    self.transport.resync()
-                    self.transport.query_version()
-                except Exception:
-                    pass
+                log.info("固件没有回版本号（proto25 或更早），按老固件处理")
+            elif fwv < (13, 0):
+                log.warning("固件版本 %d.%d 太旧，请烧 MSU2_open_v17.hex", fwv[0], fwv[1])
         return ok
 
     def close(self):  self.transport.close()
@@ -879,10 +872,6 @@ class MiniDevice:
         # 整帧一次写：分段写会让别的线程（触摸轮询）把请求字节插进帧中间，
         # 设备按“上一段的剩余字节数”消费，从此整条流错位。
         payload = frame
-        if getattr(self.transport, "raw_mode", False):
-            # 每帧开头先发同步栅栏：万一上一帧把设备留在“等像素”里，设备看到
-            # 栅栏会立刻作废半开的流、回到命令模式，这一帧就不会被吃掉开头。
-            payload = SYNC_FENCE + bytes(frame)
         ok = self.transport.write(payload)
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
@@ -895,90 +884,44 @@ class MiniDevice:
                 pass
             return False
         fw = getattr(self.transport, "fw_version", None)
-        if bool(getattr(self.transport, "raw_mode", False)) and fw is not None and fw >= (16, 0):
-            # v16 的正解：写完先按实测吞吐睡够“设备吃完这一帧”的时间，再问
-            # 一次空闲。等到空闲，主循环接下来发的触摸/心跳就不会落进还没吃
-            # 完的像素流里（那些 6 字节会被当成像素吃掉，整条流从此错位，
-            # 就是用户看到的“分成三份/错位/彩条”）。
-            bps = float(getattr(self, "_wire_bps", 100000.0)) or 100000.0
-            need = len(payload) * 1.25 / bps + 0.006
-            if need > 0.0:
-                time.sleep(min(need, 1.2))
-            if not self.transport.wait_idle(0.3):
-                self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
-                if self._ack_fails in (1, 3, 10, 30):
-                    log.warning("设备没有回到空闲（第 %d 次），重新同步后重发这一帧",
-                                self._ack_fails)
-                try:
-                    self.transport.resync()
-                except Exception:
-                    pass
-                self.encoder.reset()
-                return False
-            self._ack_fails = 0
-            self._zero_acks = 0
-            self.self_paced = True
+        raw = bool(getattr(self.transport, "raw_mode", False))
+        if (not raw) or fw is None or fw < (13, 0):
+            # 老固件（proto25 及更早）不回裁决字节，只能靠发送间隔兜底。
+            self.self_paced = False
+            self.transport.read_all()
             self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
             self.frame_bytes = len(frame)
-            # 吞吐自适应：用“设备真正吃完一帧”的耗时估下一条要等多久。
-            span = (time.perf_counter() - t0)
-            if span > 0.005:
-                inst = len(payload) / span
-                self._wire_bps = max(40000.0, min(400000.0,
-                                                 getattr(self, "_wire_bps", inst) * 0.7 + inst * 0.3))
             return True
-        verify = getattr(self, "_verify_acks", None)
-        self.self_paced = False          # 老固件没有空闲探询，仍靠发送间隔兜底
-        if verify is None:
-            raw = bool(getattr(self.transport, "raw_mode", False))
-            verify = bool(raw and (fw is None or fw >= (13, 0)))
-            self._verify_acks = verify
-        if verify:
-            # 每个收流命令设备都回一个裁决字节：数目对不上或出现 0x15，
-            # 说明中间丢了字节/超时作废，必须先同步再整帧重发。
-            #
-            # 这里是“每帧必读”，不能只读整屏帧：设备把一帧的字节从环里
-            # 消费完才回最后一个裁决，读到它就等于确认“这一帧已经整个进
-            # 设备了”。否则主循环马上会发触摸/心跳命令，那些 6 字节正好
-            # 落在上一帧还没消费完的像素流中间，被设备当成像素吃掉，整条
-            # 流错位——这就是“画面分成三份/错位/彩条”的根因。
-            # v13~v15 的老路径：只校验整屏帧。分块帧每条 0x09 都回裁决字节，
-            # 设备 EP3 只有一笔在途，连着发的会被覆盖，反倒制造假“没回执”。
-            # （v16 起上面的 wait_idle 已经把这件事做对了，不再走这里。）
-            want = frame.count(END_FRAME) if getattr(self.encoder, "last_full", False) else 0
-            ok_ack, got = (True, want) if want == 0 else self.transport.read_verdicts(want, 0.4)
-            if not ok_ack:
-                log.debug("收流裁决不全: %d/%d", got, want)
-                self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
-                if self._ack_fails in (3, 30):
-                    log.warning("设备连续 %d 帧没有回执，正在重新打开串口恢复",
-                                self._ack_fails)
-                    try:
-                        self.transport.close()
-                        time.sleep(0.2)
-                        self.open()          # 重开串口 + 清空编码缓存 => 整屏重画
-                    except Exception:
-                        pass
-                if got == 0:
-                    self._zero_acks = int(getattr(self, "_zero_acks", 0)) + 1
-                    if self._zero_acks >= 3 and not (fw and fw >= (13, 0)):
-                        # 老固件根本不回裁决字，每帧白等 0.4 s 会把界面拖成
-                        # 幻灯片；关掉校验，但栅栏前缀照发，照样能把它拉回来。
-                        self._verify_acks = False
-                        log.info("设备不回裁决字（固件早于 v13），改为只发栅栏")
-                else:
-                    self._zero_acks = 0
-                # 有没有回执都先同步：设备可能停在“等像素”里，
-                # 只有栅栏能把它拉回命令模式，否则后面每一帧都白费。
-                self.transport.resync()
-                self.encoder.reset()
-                return False
-            self._ack_fails = 0
-        else:
-            self.transport.read_all()
+        # v13 起，设备每收完一个收流命令就回一个裁决字节（0x06 收齐 /
+        # 0x15 丢了）。读到最后一个就等于“这一帧已经整个进设备了”。
+        # 关键：这是唯一不往像素流里插字节的同步方式。以前那套“栅栏前缀”
+        # 和“0x57 空闲探询”都会在设备还没吃完时把上一帧打断/把命令塞进
+        # 像素里，正是花屏的来源，已经全部删掉。
+        want = frame.count(END_FRAME)
+        ok_ack, got = (True, want) if want == 0 else self.transport.read_verdicts(want, 0.6)
+        if not ok_ack:
+            self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
+            if self._ack_fails in (1, 3, 10, 30):
+                log.warning("这一帧设备没收全（%d/%d 个回执），重发", got, want)
+            self.encoder.reset()
+            self._recover()
+            return False
+        self._ack_fails = 0
+        self.self_paced = True
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
         return True
+
+    def _recover(self):
+        """设备可能停在“等像素”里：等它自己的 400 ms 看门狗作废该段，
+        再把像素计数喂到 0。"""
+        try:
+            if not getattr(self.transport, "connected", False):
+                return
+            time.sleep(0.45)
+            self.transport.resync()
+        except Exception:
+            pass
 
     def set_reverse(self, reverse):
         self.screen_reversed = bool(reverse)

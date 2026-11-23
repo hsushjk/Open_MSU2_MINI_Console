@@ -247,6 +247,10 @@ class MiniProtocol:
 # 都会认出来、把现场清干净并回一个 0x06。像素里出现它的概率是 2^-48。
 SYNC_FENCE = bytes((0xA5, 0x5A, 0xA5, 0x5A, 0x0E, 0x07))
 END_FRAME = bytes((0x02, 0x03, 0x09, 0x00, 0x00, 0x00))
+# v16 起：空闲探询。设备只有在“上一帧的字节全吃完、没有半开的段”时才能
+# 解析到这条命令并回包，所以收到回包 = 设备确实空下来了。
+QUERY_IDLE = bytes((0x00, 0x57, 0x00, 0x00, 0x00, 0x00))
+IDLE_REPLY = b"\x57IDLE\xaa"
 
 
 class SerialTransport:
@@ -368,6 +372,35 @@ class SerialTransport:
             except Exception:
                 self._connected = False; self._handshaked = False
                 return False
+
+    def wait_idle(self, timeout=0.8):
+        """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
+
+        设备把一帧的字节从接收环里消费完才会回到命令解析，所以能回这个
+        包就说明“现在发触摸/心跳是安全的”。收不到就整帧重发，绝不能把
+        命令字节塞进还没吃完的像素流里——那会被当成像素吃掉，整条流错位。
+        """
+        with self._lock:
+            if not self._connected or not self._ser:
+                return False
+            t_end = time.monotonic() + max(timeout, 0.05)
+            while time.monotonic() < t_end:
+                try:
+                    self._ser.reset_input_buffer()
+                    self._ser.write(QUERY_IDLE)
+                except Exception:
+                    self._connected = False; self._handshaked = False
+                    return False
+                deadline = time.monotonic() + 0.06
+                buf = bytearray()
+                while time.monotonic() < deadline:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                        if IDLE_REPLY in bytes(buf):
+                            return True
+                    time.sleep(0.002)
+            return False
 
     def read_verdicts(self, count, timeout=0.4):
         """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。"""
@@ -862,7 +895,40 @@ class MiniDevice:
                 pass
             return False
         fw = getattr(self.transport, "fw_version", None)
+        if bool(getattr(self.transport, "raw_mode", False)) and fw is not None and fw >= (16, 0):
+            # v16 的正解：写完先按实测吞吐睡够“设备吃完这一帧”的时间，再问
+            # 一次空闲。等到空闲，主循环接下来发的触摸/心跳就不会落进还没吃
+            # 完的像素流里（那些 6 字节会被当成像素吃掉，整条流从此错位，
+            # 就是用户看到的“分成三份/错位/彩条”）。
+            bps = float(getattr(self, "_wire_bps", 100000.0)) or 100000.0
+            need = len(payload) * 1.25 / bps + 0.006
+            if need > 0.0:
+                time.sleep(min(need, 1.2))
+            if not self.transport.wait_idle(0.3):
+                self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
+                if self._ack_fails in (1, 3, 10, 30):
+                    log.warning("设备没有回到空闲（第 %d 次），重新同步后重发这一帧",
+                                self._ack_fails)
+                try:
+                    self.transport.resync()
+                except Exception:
+                    pass
+                self.encoder.reset()
+                return False
+            self._ack_fails = 0
+            self._zero_acks = 0
+            self.self_paced = True
+            self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
+            self.frame_bytes = len(frame)
+            # 吞吐自适应：用“设备真正吃完一帧”的耗时估下一条要等多久。
+            span = (time.perf_counter() - t0)
+            if span > 0.005:
+                inst = len(payload) / span
+                self._wire_bps = max(40000.0, min(400000.0,
+                                                 getattr(self, "_wire_bps", inst) * 0.7 + inst * 0.3))
+            return True
         verify = getattr(self, "_verify_acks", None)
+        self.self_paced = False          # 老固件没有空闲探询，仍靠发送间隔兜底
         if verify is None:
             raw = bool(getattr(self.transport, "raw_mode", False))
             verify = bool(raw and (fw is None or fw >= (13, 0)))
@@ -870,9 +936,15 @@ class MiniDevice:
         if verify:
             # 每个收流命令设备都回一个裁决字节：数目对不上或出现 0x15，
             # 说明中间丢了字节/超时作废，必须先同步再整帧重发。
-            # 只有整屏帧才有唯一的收流命令（一条 0x09）。分块帧一条 0x09
-            # 就有一个裁决字节，设备 EP3 只有一笔在途、主机又在写下一帧，
-            # 连着发的裁决会被覆盖，反倒制造假的“没回执”。所以只校验整屏帧。
+            #
+            # 这里是“每帧必读”，不能只读整屏帧：设备把一帧的字节从环里
+            # 消费完才回最后一个裁决，读到它就等于确认“这一帧已经整个进
+            # 设备了”。否则主循环马上会发触摸/心跳命令，那些 6 字节正好
+            # 落在上一帧还没消费完的像素流中间，被设备当成像素吃掉，整条
+            # 流错位——这就是“画面分成三份/错位/彩条”的根因。
+            # v13~v15 的老路径：只校验整屏帧。分块帧每条 0x09 都回裁决字节，
+            # 设备 EP3 只有一笔在途，连着发的会被覆盖，反倒制造假“没回执”。
+            # （v16 起上面的 wait_idle 已经把这件事做对了，不再走这里。）
             want = frame.count(END_FRAME) if getattr(self.encoder, "last_full", False) else 0
             ok_ack, got = (True, want) if want == 0 else self.transport.read_verdicts(want, 0.4)
             if not ok_ack:
@@ -1712,13 +1784,19 @@ class Scheduler(threading.Thread):
         # 链路预算：按上一帧的实际传输时间给下一帧留出间隔。高清整帧有 25 KB，
         # 每秒能发的帧数是有上限的；连续排帧会把数据压在设备侧，帧中间断流
         # 就表现为花屏、错位（尤其是动画背景图这种每帧全屏都变的场景）。
-        try:
-            tx = float(getattr(self.device, "tx_ms", 0.0) or 0.0)
-        except Exception:
-            tx = 0.0
-        if tx > 0.0:
-            self._send_gap = min(0.6, tx / 1000.0 * 1.15)
-        self._last_frame_mono = mono
+        # v16 起 show_image 自己会等设备回空闲，链路已经不会堆积，再加间隔
+        # 只会白白拖低帧率。
+        if getattr(self.device, "self_paced", False):
+            self._send_gap = 0.0
+            self._last_frame_mono = mono
+        else:
+            try:
+                tx = float(getattr(self.device, "tx_ms", 0.0) or 0.0)
+            except Exception:
+                tx = 0.0
+            if tx > 0.0:
+                self._send_gap = min(0.6, tx / 1000.0 * 1.15)
+            self._last_frame_mono = mono
         total = 0
         try:
             total = int(getattr(self.device.transport, "bytes_written", 0))

@@ -299,8 +299,16 @@ class SerialTransport:
                 self.fw_version = (major, minor)
                 log.info("固件版本 %d.%d，触摸读数 %d", major, minor, touch)
                 if touch == 0:
-                    log.warning("固件自检的触摸读数为 0：这一版 ADC 仍没产出，"
-                                "请确认烧的是 MSU2_open_v9.hex")
+                    for _ in range(6):
+                        time.sleep(0.08)
+                        again = self.query_version(timeout=0.25)
+                        if again and again[2] > 0:
+                            touch = again[2]
+                            log.info("触摸读数 %d（第一拍稍晚才有）", touch)
+                            break
+                    if touch == 0:
+                        log.warning("固件上报的触摸读数是 0：ADC 还没有产出结果"
+                                    "（没有触摸的老固件可以忽略这条）")
             else:
                 log.warning("固件没有回应版本查询（可能是 v8 或更早的固件）")
             return True
@@ -1753,14 +1761,22 @@ class Scheduler(threading.Thread):
         return True
 
     def _apply_background(self):
+        # 拖模糊/暗化时只有修饰变了，图不用重新解码：按关键字段判断
+        key = (self._bg_enabled, self._bg_source, self._bg_path,
+               tuple(self._bg_paths), self._bg_mode,
+               self._bg_interval, self._bg_shuffle)
+        same = key == getattr(self, "_bg_loaded_key", None)
         self.background.configure(self._bg_dim, self._bg_blur)
         if self._bg_enabled and self._bg_source == "playlist" and self._bg_paths:
-            self.background.load_playlist(self._bg_paths, self._bg_mode,
-                                          self._bg_interval, self._bg_shuffle)
+            if not same or not self.background.groups:
+                self.background.load_playlist(self._bg_paths, self._bg_mode,
+                                              self._bg_interval, self._bg_shuffle)
         elif self._bg_enabled and self._bg_path:
-            self.background.load(self._bg_path, self._bg_mode)
-        else:
+            if not same or not self.background.raw:
+                self.background.load(self._bg_path, self._bg_mode)
+        elif not same:
             self.background.load("", self._bg_mode)
+        self._bg_loaded_key = key
         self._switch.set()
         log.info("背景 -> enabled=%s mode=%s dim=%d blur=%d path=%s",
                  self._bg_enabled, self._bg_mode, self._bg_dim, self._bg_blur,
@@ -3760,12 +3776,15 @@ class WebUI(threading.Thread):
             def log_message(self, *a): pass
 
             def _send(self, body, ctype):
-                self.send_response(200)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (ConnectionError, OSError):
+                    pass        # the tab was closed mid-request
 
             def _json(self, obj):
                 self._send(json.dumps(obj, ensure_ascii=False).encode(),

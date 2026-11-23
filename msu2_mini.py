@@ -378,10 +378,12 @@ class SerialTransport:
                 return False
             try:
                 self._ser.reset_input_buffer()
-                time.sleep(0.12)                  # 让设备的 30 ms 静默规则生效
-                self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
-                self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
-                self._ser.write(MiniProtocol.lcd_enter_direct_mode())
+                # 千万不能再发“开流(0x07)”：那等于告诉设备“准备好收 25600 个像素”，
+                # 主机又不会真发，设备就一直等着吃字节、把所有命令都当像素吞掉，
+                # 看起来就像“设备死了”。v43 固件自己会超时放弃半截流，这里只要
+                # 安静一会儿，再补一条收流命令把状态清干净即可。
+                time.sleep(0.45)
+                self._ser.reset_input_buffer()
                 self._ser.write(END_FRAME)        # 0 像素的收流：flush + 归零 + 裁决
                 time.sleep(0.05)
                 deadline = time.monotonic() + timeout
@@ -939,101 +941,19 @@ class MiniDevice:
             except Exception:
                 pass
             return False
-        fw = getattr(self.transport, "fw_version", None)
-        raw = bool(getattr(self.transport, "raw_mode", False))
-        if not getattr(self.encoder, "last_full", False):
-            # 差分帧：每条收流命令都会回一个裁决字节，不读掉会污染
-            # 后面的触摸应答缓冲；这里只清理，不判成败。
-            want_delta = bytes(frame).count(END_FRAME)
-            if want_delta:
-                self.transport.read_verdicts(want_delta, 0.08)
-            self.self_paced = True
-            return True
-        if raw and fw is not None and fw >= (23, 0):
-            # Full frame written; wait for the device verdict byte. 0x06 = all
-            # 12800 pixels arrived, 0x15 = short. We never send the next frame
-            # before the ack, so the receive ring can never overflow.
-            ok_ack, got = self.transport.read_verdicts(1, 1.5)
-            if ok_ack:
-                self.self_paced = True
-                self._pace_bps = min(getattr(self, "_pace_max", 240000.0),
-                                     getattr(self, "_pace_bps", 140000.0) * 1.04)
-                self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
-                self.frame_bytes = len(frame)
-                return True
-            if got == 0:
-                # No verdict byte at all: the device was too busy to answer in
-                # time. That is not proof the frame was bad, so keep going
-                # (the next frame is a full redraw anyway).
-                self.self_paced = False
-                self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
-                self.frame_bytes = len(frame)
-                self._quiet_frames = int(getattr(self, "_quiet_frames", 0)) + 1
-                if self._quiet_frames in (3, 30):
-                    log.warning("device answered no verdict for %d frames "
-                                "(firmware without the queued verdict?)",
-                                self._quiet_frames)
-                if self._quiet_frames >= 8:
-                    # The device stopped answering: it is either wedged or has
-                    # just been reset by its own watchdog. Drop the link so the
-                    # scheduler reconnects (that also re-runs the handshake).
-                    log.error("device stopped answering; reconnecting")
-                    self._quiet_frames = 0
-                    try:
-                        self.transport.close()
-                    except Exception:
-                        pass
-                    self.encoder.reset()
-                return True
-            self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
-            # 设备说像素不够：字节在路上真丢了。降速重发。
-            self._pace_bps = max(40000.0, getattr(self, "_pace_bps", 140000.0) * 0.6)
-            self._pace_max = max(60000.0, min(getattr(self, "_pace_max", 240000.0),
-                                            getattr(self, "_pace_bps", 140000.0) * 0.85))
-            _st = getattr(self.transport, "last_status", None)
-            if _st:
-                log.warning("device saw px=%d win=%d drop=%d (%.1f KB missing)",
-                            _st.get("px", -1), _st.get("win", -1),
-                            _st.get("drop", -1),
-                            max(0, (_st.get("win", 0) - _st.get("px", 0))) * 2 / 1024.0)
-            if self._ack_fails in (1, 3, 10, 30):
-                log.warning("device did not confirm the frame (attempt %d, got %d "
-                            "verdict bytes), resending at %.0f KB/s",
-                            self._ack_fails, got, self._pace_bps / 1000.0)
-            self.encoder.reset()
-            try:
-                self.transport.resync()
-            except Exception:
-                pass
-            return False
-        # 裁决字节默认关闭：v13~v19 的事实是，任何往像素流附近加的东西
-        # （栅栏前缀、空闲探询、逐帧回执）都会引入新的错帧，而它对可见
-        # 故障的贡献是零。需要定位问题时再设 MSU2_VERDICT=1 打开。
-        if os.environ.get("MSU2_VERDICT", "0") != "1":
-            fw = None
-        if (not raw) or fw is None or fw < (13, 0):
-            # 老固件（proto25 及更早）不回裁决字节，只能靠发送间隔兜底。
-            self.self_paced = False
+        # 整帧已经写进串口了：不再等任何回执。
+        # 为什么：从 v38 起每帧都是整屏全量重绘（encode() 恒走 _encode_full），
+        # 某一帧在路上丢了几个字节，下一帧也会把整屏重新盖一遍，坏帧最多闪一下。
+        # 相反，逐帧等回执会把“设备忙得没空回话”误判成“设备坏了”，接着重连，
+        # 而重连发生在设备正停在半帧里的时刻，于是后续命令全被当成像素吃掉 ——
+        # 那才是真正把设备搞哑的链路。宁可不确认，也绝不打断它。
+        self.self_paced = False
+        try:
             self.transport.read_all()
-            self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
-            self.frame_bytes = len(frame)
-            return True
-        # v13 起，设备每收完一个收流命令就回一个裁决字节（0x06 收齐 /
-        # 0x15 丢了）。读到最后一个就等于“这一帧已经整个进设备了”。
-        # 关键：这是唯一不往像素流里插字节的同步方式。以前那套“栅栏前缀”
-        # 和“0x57 空闲探询”都会在设备还没吃完时把上一帧打断/把命令塞进
-        # 像素里，正是花屏的来源，已经全部删掉。
-        want = frame.count(END_FRAME)
-        ok_ack, got = (True, want) if want == 0 else self.transport.read_verdicts(want, 0.6)
-        if not ok_ack:
-            self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
-            if self._ack_fails in (1, 3, 10, 30):
-                log.warning("这一帧设备没收全（%d/%d 个回执），重发", got, want)
-            self.encoder.reset()
-            self._recover()
-            return False
+        except Exception:
+            pass
+        self._quiet_frames = 0
         self._ack_fails = 0
-        self.self_paced = True
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
         return True
@@ -2848,7 +2768,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <option value="10">10%</option>
       </select>
     </label>
-    <span class="tiny" id="dim-hint">100% = 原亮度（整屏压暗，插件和背景一起生效）；设备会记住这个值。</span>
   </div>
 </div>
 
@@ -2966,8 +2885,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <div class="card">
   <h2>设备</h2>
   <div style="font-size:13px">
-    <label><input type="checkbox" id="disp-debug" onchange="applyDebug()"> 调试模式</label>
-    <span class="msg" id="msg-debug"></span>
     <span class="tiny">在屏上画联机点和完整性角标，仅排查用；只在本届会话有效，断电重开自动关闭。</span>
   </div>
 </div>
@@ -3117,7 +3034,7 @@ async function loadDim() {
 
 /* 写设备 NOR 的四个控件：动一个就把四个全锁住，等设备回执再放开。
  * 写一次 NOR 要二三十毫秒，期间设备不服务串口，所以这段时间也不推帧。 */
-const DEV_LOCK_IDS = ['disp-dim', 'btn-orient', 'btn-rev', 'disp-debug'];
+const DEV_LOCK_IDS = ['disp-dim', 'btn-orient', 'btn-rev'];
 let devBusy = false;
 
 function lockDev(text) {
@@ -3183,25 +3100,7 @@ async function applyReverse() {
   }
 }
 
-async function loadDebug() {
-  try {
-    const j = await getJSON('/api/debug');
-    const el = document.getElementById('disp-debug');
-    if (el && document.activeElement !== el) el.checked = !!j.on;
-  } catch(e) {}
-}
 
-async function applyDebug() {
-  const el = document.getElementById('disp-debug');
-  if (!el || devBusy) return;
-  setMsg('msg-debug', '正在下发…', false);
-  try {
-    const j = await postJSON('/api/debug', { on: el.checked });
-    devResult(j, el.checked ? '调试模式已开' : '调试模式已关', 'msg-debug');
-  } catch(e) {
-    setMsg('msg-debug', '失败: ' + e, true);
-  }
-}
 
 async function getJSON(url, opts) {
   const r = await fetch(url, Object.assign({cache:'no-store'}, opts||{}));
@@ -3329,7 +3228,6 @@ async function refresh() {
     if (dimEl && document.activeElement !== dimEl) {
       dimEl.value = String(100 - (j.dim || 0));
     }
-    const dbgEl = document.getElementById('disp-debug');
     if (dbgEl && document.activeElement !== dbgEl) {
       dbgEl.checked = !!j.debug;
     }
@@ -3860,7 +3758,6 @@ async function shutdownApp() {
 
 loadTouch();
 loadDim();
-loadDebug();
 loadDevices();
 setBgSource();
 loadPages();

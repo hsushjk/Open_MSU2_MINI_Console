@@ -252,6 +252,18 @@ class MiniProtocol:
         return MiniProtocol._frame(0x0A, 0x0A, 0, 0, 0, 0)
 
     @staticmethod
+    def boot_trace():
+        return MiniProtocol._frame(0x0A, 0x0D, 0, 0, 0, 0)
+
+    @staticmethod
+    def asset_verify(kind, slot):
+        return MiniProtocol._frame(0x0A, 0x0E, kind, slot, 0, 0)
+
+    @staticmethod
+    def anim_probe(n):
+        return MiniProtocol._frame(0x0A, 0x10, n, 0, 0, 0)
+
+    @staticmethod
     def asset_boot_hold(secs):
         """开机画面停留秒数：`0A 09 secs`"""
         return MiniProtocol._frame(0x0A, 0x09, int(secs) & 0xFF, 0, 0, 0)
@@ -629,6 +641,64 @@ class SerialTransport:
             if chunk:
                 return chunk[0]
             time.sleep(0.005)
+        return None
+
+    def nor_read(self, addr, n=16, timeout=1.2):
+        """读板载 NOR 原始字节（固件 v52 起，命令 0A 0C），用于自检抽查。"""
+        n = max(1, min(int(n), 48))
+        self._ser.reset_input_buffer()
+        self._ser.write(MiniProtocol._frame(0x0A, 0x0C,
+                                            (addr >> 16) & 0xFF,
+                                            (addr >> 8) & 0xFF,
+                                            addr & 0xFF, n))
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x0c")
+            if i >= 0 and len(buf) >= i + 3 + buf[i + 2] + 1:
+                return buf[i + 3:i + 3 + buf[i + 2]]
+        return None
+
+    def boot_trace(self, timeout=1.2):
+        """复位面包屑（固件 v53 起）：上次停在哪一步、累计复位次数。"""
+        self._ser.reset_input_buffer()
+        self._ser.write(MiniProtocol.boot_trace())
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x0d")
+            if i >= 0 and len(buf) >= i + 6:
+                return {"stage": buf[i + 2],
+                        "boots": buf[i + 3] | (buf[i + 4] << 8)}
+        return None
+
+    def asset_verify_check(self, kind, slot, timeout=8.0):
+        """让设备把槽里的图回读一遍算 CRC（固件 v53 起），返回 (ok, crc16)。"""
+        self._ser.reset_input_buffer()
+        self._ser.write(MiniProtocol.asset_verify(kind, slot))
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x0e")
+            if i >= 0 and len(buf) >= i + 6:
+                return (buf[i + 2] == 0x06, buf[i + 3] | (buf[i + 4] << 8))
+        return (False, 0)
+
+    def anim_probe(self, n=10, timeout=20.0):
+        """让设备自己跑 n 次待机心跳（固件 v53 起），用来验证动画不会卡死。"""
+        self._ser.reset_input_buffer()
+        t0 = time.monotonic()
+        self._ser.write(MiniProtocol.anim_probe(n))
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x10")
+            if i >= 0 and len(buf) >= i + 6:
+                return time.monotonic() - t0
         return None
 
     def asset_draw(self, kind, slot, timeout=4.0):
@@ -1278,6 +1348,18 @@ class MiniDevice:
 
     def asset_wipe(self):
         return self.transport.asset_wipe()
+
+    def boot_trace(self):
+        return self.transport.boot_trace()
+
+    def nor_read(self, addr, n=16):
+        return self.transport.nor_read(addr, n)
+
+    def asset_verify_check(self, kind, slot):
+        return self.transport.asset_verify_check(kind, slot)
+
+    def anim_probe(self, n=10):
+        return self.transport.anim_probe(n)
 
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
@@ -5432,6 +5514,71 @@ def cmd_selftest(port=None):
         _console("  整屏噪点 3 帧：成功 %d，最近一次 %d ms / %d B"
                  % (ok_full, int(getattr(dev, "tx_ms", 0) or 0),
                     int(getattr(dev, "frame_bytes", 0) or 0)))
+
+        # 3) 复位面包屑（v53 起）
+        fwmaj = (fw[0] if fw else 0)
+        if fwmaj >= 53:
+            tr_ = tr.boot_trace()
+            names_ = {0: "刚上电", 1: "main 开始", 2: "usb_init 完成", 3: "开机画面",
+                      4: "主循环", 5: "收像素", 6: "写资产", 7: "淡入淡出",
+                      8: "整片擦除", 9: "待机动画"}
+            if tr_:
+                _console("  复位面包屑：上次停在「%s」，累计复位 %d 次"
+                         % (names_.get(tr_["stage"], "阶段 %d" % tr_["stage"]),
+                            tr_["boots"]))
+            else:
+                _console("  [WARN] 复位面包屑没有回应")
+
+            # 4) NOR 抽查：整片擦除后这里应该全是 FF
+            spots = [0x000000, 0x008000, 0x010000, 0x040000, 0x080000, 0x0C0000, 0x0FF000]
+            ff = 0
+            total = 0
+            detail = []
+            for a in spots:
+                raw = tr.nor_read(a, 8)
+                if raw is None:
+                    detail.append("%06X:?" % a)
+                    continue
+                total += len(raw)
+                ff += sum(1 for b in raw if b == 0xFF)
+                detail.append("%06X:%s" % (a, raw[:4].hex()))
+            if total:
+                _console("  NOR 抽查 %d 处：FF 占比 %d/%d %s"
+                         % (len(spots), ff, total, "（已抹干净）" if ff == total else ""))
+                _console("    " + " ".join(detail))
+
+        # 5) 资产 CRC 回读（v53 起）：设备把槽里的图重读一遍算 CRC
+        info2 = tr.asset_info()
+        if fwmaj >= 53 and info2:
+            slots = []
+            if info2.get("boot_valid"):
+                slots.append((0, 0, "开机图"))
+            mask = info2.get("standby_mask") or 0
+            for i in range(8):
+                if mask & (1 << i):
+                    slots.append((1, i, "待机图槽 %d" % (i + 1)))
+            if slots:
+                good = 0
+                for kind, idx, label in slots:
+                    okc, c = tr.asset_verify_check(kind, idx)
+                    good += 1 if okc else 0
+                    _console("    %s：%s（CRC 低 16 位 %04X）"
+                             % (label, "校验通过" if okc else "[FAIL] 校验不一致", c))
+                    bad += 0 if okc else 1
+                _console("  资产回读 %d 张：通过 %d" % (len(slots), good))
+            else:
+                _console("  资产回读：设备上没有存图")
+
+        # 6) 待机动画逐帧（v53 起）：让设备自己跑 10 次心跳
+        if fwmaj >= 53:
+            st = tr.asset_settings(0, 3, 8, 3, boot_hold=3)
+            dur = tr.anim_probe(10)
+            if dur is None:
+                _console("  [WARN] 动画探针没有回应")
+            else:
+                _console("  待机动画 10 步：%.0f ms（每步约 %.1f ms）"
+                         % (dur * 1000.0, dur * 100.0))
+            tr.asset_settings(0, 1, 8, 3, boot_hold=3)
 
         if ok == 4 and ok_full == 3:
             _console("  [PASS] 链路与回执正常")

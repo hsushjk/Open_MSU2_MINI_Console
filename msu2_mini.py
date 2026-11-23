@@ -264,6 +264,10 @@ class MiniProtocol:
         return MiniProtocol._frame(0x0A, 0x10, n, 0, 0, 0)
 
     @staticmethod
+    def tile_check():
+        return MiniProtocol._frame(0x0A, 0x11, 0, 0, 0, 0)
+
+    @staticmethod
     def asset_boot_hold(secs):
         """开机画面停留秒数：`0A 09 secs`"""
         return MiniProtocol._frame(0x0A, 0x09, int(secs) & 0xFF, 0, 0, 0)
@@ -682,6 +686,35 @@ class SerialTransport:
                         "boots": buf[i + 3] | (buf[i + 4] << 8)}
         return None
 
+    def tile_check(self, sigs, timeout=2.5):
+        """分块签名核对（固件 v56）：返回 50 位掩码，bit=1 表示这一块没画对。"""
+        if self._ser is None or len(sigs) != TILE_N * 2:
+            return None
+        self._ser.reset_input_buffer()
+        self._ser.write(MiniProtocol.tile_check())
+        end = time.monotonic() + timeout
+        buf = b""
+        base = 0
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x11")
+            if i >= 0 and len(buf) >= i + 6:
+                base = i + 6
+                break
+        else:
+            return None
+        self._ser.write(sigs)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            i = buf.find(b"\x0a\x11", base)
+            if i >= 0 and len(buf) >= i + 9 and buf[i + 8] == 0xAA:
+                mask = 0
+                for k in range(7):
+                    mask |= buf[i + 2 + k] << (8 * k)
+                return mask
+        return None
+
     def asset_verify_check(self, kind, slot, timeout=8.0):
         """让设备把槽里的图回读一遍算 CRC（固件 v53 起），返回 (ok, crc16)。"""
         self._ser.reset_input_buffer()
@@ -1047,6 +1080,46 @@ class SerialTransport:
             time.sleep(0.01)
         return False
 
+TILE_N = 50          # 160x80 屏 = 10x5 个 16x16 块（固件 v56 的 0A 11 核对用）
+
+
+def _tile_signatures(raw):
+    """按固件的算法算 50 个块的签名：sum(hi*3+lo+1) ^ xor(hi<<8|lo)，折成 16 位。"""
+    sig = bytearray(TILE_N * 2)
+    w = SCREEN_W * 2
+    for ty in range(SCREEN_H // 16):
+        for tx in range(SCREEN_W // 16):
+            ssum = 0
+            sxor = 0
+            for y in range(ty * 16, ty * 16 + 16):
+                base = y * w + tx * 32
+                row = raw[base:base + 32]
+                ssum += 3 * sum(row[0::2]) + sum(row[1::2]) + 16
+                for k in range(0, 32, 2):
+                    sxor ^= (row[k] << 8) | row[k + 1]
+            v = (ssum ^ sxor) & 0xFFFF
+            t = ty * (SCREEN_W // 16) + tx
+            sig[t * 2] = v & 0xFF
+            sig[t * 2 + 1] = (v >> 8) & 0xFF
+    return bytes(sig)
+
+
+def _tile_frame(raw, tx, ty):
+    """只画一个 16x16 块的帧：整块 512 字节，一次段事务。"""
+    rows = bytearray()
+    w = SCREEN_W * 2
+    for y in range(ty, ty + 16):
+        base = y * w + tx * 2
+        rows += raw[base:base + 32]
+    out = bytearray()
+    out += MiniProtocol.lcd_set_xy(tx, ty)
+    out += MiniProtocol.lcd_set_size(tx + 16, ty + 16)
+    out += MiniProtocol.lcd_enter_direct_mode()
+    out += lcd_segment_payload(bytes(rows))
+    out += MiniProtocol.lcd_raw_end()
+    return bytes(out)
+
+
 class FrameEncoder:
     SEG = 256
     TILE = 16                   # 高清模式的差分块，16×16 像素 = 512 字节 RGB565
@@ -1057,11 +1130,15 @@ class FrameEncoder:
         self._last_tile_raw = None
         self.last_full = False
         self._force_full = True
+        self.last_raw = None
+        self.last_tile_sig = None
 
     def reset(self):
         self._last_raw = None
         self._last_tile_raw = None
         self._force_full = True
+        self.last_raw = None
+        self.last_tile_sig = None
 
     @staticmethod
     def _to_rgb565(img):
@@ -1105,6 +1182,8 @@ class FrameEncoder:
             self._force_full = False
             self._last_tile_raw = raw
             self.last_full = True
+            self.last_raw = raw
+            self.last_tile_sig = _tile_signatures(raw)
             return bytes(out + self._encode_full(raw))
 
         total = len(raw)
@@ -1211,6 +1290,10 @@ class MiniDevice:
         # 学到的安全上限：撞过一次 0x15 就把上限压到失败速率的 85%，
         # 之后慢慢往上试，但不再直接冲回失败过的那个速率。
         self._pace_max = 240000.0
+        # 分块自检（固件 v56）：每帧发完让设备回一张“哪些块没画对”的掩码，
+        # 只补画坏块。整帧重绘要 25 KB，补一块只要 0.5 KB。
+        self.tile_repairs = 0
+        self._tiles_ok = True
 
     def open(self):
         ok = self.transport.open()
@@ -1304,7 +1387,43 @@ class MiniDevice:
         self._ack_fails = 0
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
+        self._repair_tiles()
         return True
+
+    def _repair_tiles(self, rounds=2):
+        """分块自检：让设备报出没画对的 16x16 块，只补画这些块。
+
+        为什么需要它：整帧 25 KB 走串口，偶发丢字节会被裁决字节抓到（整帧重发）；
+        但屏那一侧（SPI + DMA）偶尔也会漏像素，这种情况点数是对的、画面却是错的，
+        只有逐块对账才发现得了。坏了就地补一块，不用整屏刷。
+        """
+        if not self._tiles_ok:
+            return
+        fw = getattr(self.transport, "fw_version", None)
+        if not fw or fw < (56, 0):
+            return
+        if not getattr(self.encoder, "last_full", False):
+            return
+        raw = getattr(self.encoder, "last_raw", None)
+        sig = getattr(self.encoder, "last_tile_sig", None)
+        if not raw or not sig:
+            return
+        for _round in range(max(1, int(rounds))):
+            mask = self.transport.tile_check(sig)
+            if mask is None or mask == 0:
+                return
+            fixed = 0
+            for bit in range(TILE_N):
+                if not (mask >> bit) & 1:
+                    continue
+                tx = (bit % (SCREEN_W // 16)) * 16
+                ty = (bit // (SCREEN_W // 16)) * 16
+                if not self.transport.write(_tile_frame(raw, tx, ty)):
+                    return
+                fixed += 1
+            self.tile_repairs += 1
+            log.info("分块自检：补画 %d 块（掩码 %07x）", fixed, mask)
+            time.sleep(0.01)
 
     def _recover(self):
         """设备可能停在“等像素”里：等它自己的 400 ms 看门狗作废该段，
@@ -5522,6 +5641,20 @@ def cmd_selftest(port=None):
         _console("  整屏噪点 3 帧：成功 %d，最近一次 %d ms / %d B"
                  % (ok_full, int(getattr(dev, "tx_ms", 0) or 0),
                     int(getattr(dev, "frame_bytes", 0) or 0)))
+
+        # 2.5) 分块签名核对（v56 起）：刚才最后一帧的 50 个块，设备认为有几块没画对
+        fwmaj0 = (fw[0] if fw else 0)
+        if fwmaj0 >= 56:
+            sig0 = getattr(getattr(dev, "encoder", None), "last_tile_sig", None)
+            mask0 = tr.tile_check(sig0) if sig0 else None
+            if mask0 is None:
+                _console("  [WARN] 分块签名：没有回应")
+            elif mask0 == 0:
+                _console("  分块签名：50 块全部对上")
+            else:
+                _console("  分块签名：%d 块没画对（掩码 %07x，已补画 %d 轮）"
+                         % (bin(mask0).count("1"), mask0,
+                            int(getattr(dev, "tile_repairs", 0) or 0)))
 
         # 3) 复位面包屑（v53 起）
         fwmaj = (fw[0] if fw else 0)

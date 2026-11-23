@@ -274,7 +274,7 @@ class SerialTransport:
                 try:
                     self._ser = serial.Serial(self.port, self.baud,
                                               timeout=self.timeout,
-                                              write_timeout=2.0)
+                                              write_timeout=None)
                 except PermissionError:
                     if sys.platform == "win32":
                         self.last_error = f"{self.port} 被其它程序占用"
@@ -854,10 +854,6 @@ class MiniDevice:
         # 每 1.5 秒强制一次整屏重绘。差分帧只重画变化的块，一旦某帧在中途
         # 被打断（设备判死、USB 卡顿、掉线重连），画面上就会留下再也补不回来
         # 的残影。整屏重绘是唯一能把残影抹掉的低成本办法。
-        now = time.monotonic()
-        if now - getattr(self, "_last_full_t", 0.0) > 1.5:
-            self.encoder.reset()
-            self._last_full_t = now
         if fast != getattr(self, "_last_fast", None):
             # 换画质模式时缓存里存的不是同一种编码，必须整帧重发一次。
             self.encoder.reset()
@@ -872,7 +868,14 @@ class MiniDevice:
         # 整帧一次写：分段写会让别的线程（触摸轮询）把请求字节插进帧中间，
         # 设备按“上一段的剩余字节数”消费，从此整条流错位。
         payload = frame
-        ok = self.transport.write(payload)
+        # 按 8192 字节分块写（与存档点一致）：一旦某一块写不进去，
+        # 立即停下来，不会出现“写了一半、剩下的在超时后才报错”。
+        ok = True
+        seg_write = 8192
+        for i in range(0, len(payload), seg_write):
+            if not self.transport.write(payload[i:i + seg_write]):
+                ok = False
+                break
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
             # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。

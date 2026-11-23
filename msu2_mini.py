@@ -615,9 +615,12 @@ class FrameEncoder:
             return bytes(out + self._encode_indexed(img))
 
         if raw_mode:
-            # 高清：真彩 RGB565（65536 色），只发变化的 16×16 块。
-            # 这是投屏改造之前的老路径，背景图/照片靠它才不失真。
-            return bytes(out + self._encode_tiles(raw))
+            # v23: one full-screen 0x09 per frame, device answers one verdict
+            # byte and we only send the next frame after reading it. Tile deltas
+            # leave a broken tile broken forever - that is why tearing stuck.
+            self._last_tile_raw = None
+            self.last_full = True
+            return bytes(out + self._encode_full(raw))
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -888,6 +891,27 @@ class MiniDevice:
             return False
         fw = getattr(self.transport, "fw_version", None)
         raw = bool(getattr(self.transport, "raw_mode", False))
+        if raw and fw is not None and fw >= (23, 0):
+            # Full frame written; wait for the device verdict byte. 0x06 = all
+            # 12800 pixels arrived, 0x15 = short. We never send the next frame
+            # before the ack, so the receive ring can never overflow.
+            ok_ack, got = self.transport.read_verdicts(1, 1.5)
+            if ok_ack:
+                self.self_paced = True
+                self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
+                self.frame_bytes = len(frame)
+                return True
+            self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
+            if self._ack_fails in (1, 3, 10, 30):
+                log.warning("device did not confirm the frame (attempt %d, got %d "
+                            "verdict bytes), resending the full frame",
+                            self._ack_fails, got)
+            self.encoder.reset()
+            try:
+                self.transport.resync()
+            except Exception:
+                pass
+            return False
         # 裁决字节默认关闭：v13~v19 的事实是，任何往像素流附近加的东西
         # （栅栏前缀、空闲探询、逐帧回执）都会引入新的错帧，而它对可见
         # 故障的贡献是零。需要定位问题时再设 MSU2_VERDICT=1 打开。

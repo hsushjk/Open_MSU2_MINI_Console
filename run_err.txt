@@ -1,0 +1,12 @@
+07:42:42 [INFO] msu2: 使用当前目录的配置文件: config.json
+07:42:42 [INFO] msu2: 字体目录: ['C:\\WINDOWS\\TEMP\\_MEI393482\\assets\\fonts', 'C:\\Users\\hsush\\Desktop\\MSU2_MINI\\Open_MSU2_MINI_Console\\dist\\assets\\fonts']
+07:42:42 [INFO] msu2: 常规字重: {'name': 'NotoSansMonoCJKsc-Regular.otf', 'path': 'C:\\WINDOWS\\TEMP\\_MEI393482\\assets\\fonts\\NotoSansMonoCJKsc-Regular.otf'}
+07:42:42 [INFO] msu2: 粗体字重: {'name': 'NotoSansMonoCJKsc-Bold.otf', 'path': 'C:\\WINDOWS\\TEMP\\_MEI393482\\assets\\fonts\\NotoSansMonoCJKsc-Bold.otf'}
+07:42:42 [INFO] msu2: 已注册插件: ['anniversary', 'app_usage', 'calendar', 'clipboard', 'clock', 'countdown', 'crypto', 'disk_io', 'gif', 'holiday', 'keyboard_stats', 'mouse_mileage', 'music', 'network_detail', 'pcstats', 'process_top', 'todo']
+07:42:42 [INFO] msu2.widgets.music: 音乐插件: PowerShell SMTC (c:\windows\system32\windowspowershell\v1.0\powershell.exe)
+07:42:42 [INFO] msu2.widgets.todo: todo 文件已写入 C:\Users\hsush\Desktop\MSU2_MINI\Open_MSU2_MINI_Console\dist\todo.md（1 条）
+07:42:42 [INFO] msu2: 已加载 17 个插件: ['clock', 'calendar', 'countdown', 'holiday', 'anniversary', 'pcstats', 'network_detail', 'process_top', 'disk_io', 'music', 'todo', 'crypto', 'clipboard', 'app_usage', 'keyboard_stats', 'mouse_mileage', 'gif'] (当前: clock)
+07:42:42 [INFO] msu2: 设备 dev1 -> auto
+07:42:42 [INFO] msu2: Scheduler 启动, 17 页, 朝向 landscape, 翻转 False
+07:42:43 [INFO] msu2: Web UI 已启动: http://0.0.0.0:8765
+07:42:46 [WARNING] msu2.widgets.music: SMTC 连续 3 次无结果 (PowerShell: c:\windows\system32\windowspowershell\v1.0\powershell.exe): smtc: 使用“1”个参数调用“Wait”时发生异常:“发生一个或多个错误。”

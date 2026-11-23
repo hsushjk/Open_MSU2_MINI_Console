@@ -29,6 +29,26 @@ python msu2_mini.py
 build.bat
 ```
 
+## 插件依赖
+
+外部插件可以自带 `requirements.txt`，缺包时控制台会自动补上，不用重新打包：
+
+- 单文件插件 `widgets\foo.py` → 依赖写 `widgets\foo.requirements.txt`，或同目录的 `requirements.txt`
+- 目录插件 `widgets\foo\` → 依赖写 `widgets\foo\requirements.txt`
+
+装到哪里、怎么装：
+
+1. 有系统 Python 时用 `pip install --target widgets\_deps -r ...`
+2. 没有 Python 时直接从 PyPI 下载 wheel（优先同一解释器 ABI，其次纯 Python 包）解压到 `widgets\_deps`
+3. `widgets\_deps` 与每个插件目录下的 `_deps` 会自动加入 `sys.path`
+
+注意：打包成 exe 的解释器只带主程序用到的标准库。插件如果用到冷门标准库模块（例如 `http.cookies`、`tkinter`），打包版会报缺模块并给出提示，这种情况请用源码方式运行：
+
+```bash
+pip install -r requirements.txt
+python msu2_mini.py
+```
+
 ## 许可
 
 MIT，见 `LICENSE`。上游的界面、插件框架与大部分 widget 由原作者编写，本仓库在其上做了协议层与发送路径的修改。

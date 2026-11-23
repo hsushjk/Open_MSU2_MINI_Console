@@ -268,6 +268,23 @@ class MiniProtocol:
         return MiniProtocol._frame(0x0A, 0x11, 0, 0, 0, 0)
 
     @staticmethod
+    def flash_begin(total):
+        return MiniProtocol._frame(0x0A, 0x12, 0x01, (total >> 8) & 0xFF, total & 0xFF, 0)
+
+    @staticmethod
+    def flash_window(n):
+        return MiniProtocol._frame(0x0A, 0x12, 0x02, (n >> 8) & 0xFF, n & 0xFF, 0)
+
+    @staticmethod
+    def flash_commit(crc):
+        return MiniProtocol._frame(0x13, (crc >> 24) & 0xFF, (crc >> 16) & 0xFF,
+                                   (crc >> 8) & 0xFF, crc & 0xFF, 0)
+
+    @staticmethod
+    def flash_apply():
+        return MiniProtocol._frame(0x14, 0, 0, 0, 0, 0)
+
+    @staticmethod
     def asset_boot_hold(secs):
         """开机画面停留秒数：`0A 09 secs`"""
         return MiniProtocol._frame(0x0A, 0x09, int(secs) & 0xFF, 0, 0, 0)
@@ -646,6 +663,53 @@ class SerialTransport:
                 return chunk[0]
             time.sleep(0.005)
         return None
+
+    def _reply_byte(self, cls_byte, sub, timeout=3.0):
+        """Scan for a short reply frame ``cls sub status``; returns status or None."""
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            if self._ser is None:
+                return None
+            chunk = self._ser.read(self._ser.in_waiting or 1)
+            if chunk:
+                buf += chunk
+                for i in range(len(buf) - 2):
+                    if buf[i] == cls_byte and buf[i + 1] == sub:
+                        return buf[i + 2]
+            else:
+                time.sleep(0.005)
+        return None
+
+    def flash_firmware(self, data, progress=None, chunk=1024):
+        """Upload ``data`` (raw firmware image) into the device and reboot it."""
+        total = len(data)
+        if total <= 0 or total > 48000:
+            return False, "image size out of range (%d bytes)" % total
+        self._ser.reset_input_buffer()
+        self._ser.write(MiniProtocol.flash_begin(total))
+        r = self._reply_byte(0x0A, 0x12, 3.0)
+        if r != 0x06:
+            return False, "device refused the upload (0x%02X)" % (r if r is not None else 0)
+        pos = 0
+        while pos < total:
+            part = data[pos:pos + chunk]
+            self._ser.write(MiniProtocol.flash_window(len(part)))
+            self._ser.write(part)
+            r = self._reply_byte(0x0A, 0x12, 6.0)
+            if r != 0x06:
+                return False, "device did not confirm at byte %d (0x%02X)" % (pos, r if r is not None else 0)
+            pos += len(part)
+            if progress:
+                progress(pos, total)
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        self._ser.write(MiniProtocol.flash_commit(crc))
+        r = self._reply_byte(0x13, 0x00, 8.0)
+        if r != 0x06:
+            return False, "CRC check failed on the device (0x%02X)" % (r if r is not None else 0)
+        self._ser.write(MiniProtocol.flash_apply())
+        time.sleep(0.2)
+        return True, "uploaded %d bytes, device is rebooting" % total
 
     def nor_read(self, addr, n=16, timeout=1.2):
         """读板载 NOR 原始字节（固件 v52 起，命令 0A 0C），用于自检抽查。"""
@@ -1482,6 +1546,10 @@ class MiniDevice:
     def asset_wipe(self):
         return self.transport.asset_wipe()
 
+
+    def flash_firmware(self, data, progress=None):
+        return self.transport.flash_firmware(data, progress=progress)
+
     def boot_trace(self):
         return self.transport.boot_trace()
 
@@ -2202,6 +2270,30 @@ class Scheduler(threading.Thread):
 
     def asset_erase_safe(self, kind, slot):
         return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
+
+    def flash_firmware_safe(self, path):
+        """Upload a firmware image into the device NOR and reboot it."""
+        try:
+            data, note = _load_firmware_image(path)
+        except Exception as exc:
+            return False, "读不了固件：%s" % (exc,)
+        if len(data) > 48000:
+            return False, "固件太大（%d 字节，上限 48000）" % len(data)
+        fw = getattr(self.device.transport, "fw_version", None) or getattr(
+            self.device, "fw_version", None)
+        if fw is not None and fw < (60, 0):
+            return False, "设备固件 %d.%d 不支持自更新，请先用 ISP 刷一次 v60" % fw
+        log.info("固件升级：写入 %d 字节", len(data))
+
+        def _run():
+            return self.device.flash_firmware(data)
+
+        ok, why = self._asset_idle(_run, pause=60.0)
+        if ok:
+            log.info("固件升级：%s", why)
+        else:
+            log.error("固件升级失败：%s", why)
+        return bool(ok), str(why)
 
     def asset_wipe_safe(self):
         return self._asset_idle(lambda: self.device.asset_wipe(), pause=1.0)
@@ -3551,6 +3643,19 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   </div>
 </div>
 
+      <div class="card">
+        <h3>固件升级</h3>
+        <p class="hint">把新的 .hex 写进设备的板载 NOR，写完自动重启。
+          <b>v60 及以上</b>支持；第一次升级需要先用 ISP 刷一次 v60。</p>
+        <div class="row" style="align-items:center; gap:8px">
+          <button onclick="pickFirmware()">选择固件…</button>
+          <input id="fw-file" type="file" accept=".hex,.bin" style="display:none"
+                 onchange="firmwarePicked(event)">
+          <span id="fw-name" class="hint"></span>
+        </div>
+        <div class="hint" id="msg-flash"></div>
+      </div>
+
 <div class="card shutdown-card">
   <h2>关闭程序</h2>
   <div style="color:#666; font-size:12px; margin-bottom:.6em">
@@ -4551,6 +4656,35 @@ async function eraseAsset(kind, slot) {
   refreshAsset();
 }
 
+async function pickFirmware() {
+  document.getElementById('fw-file').click();
+}
+
+async function firmwarePicked(ev) {
+  const files = ev.target.files || [];
+  const f = files[0];
+  if (!f) return;
+  setMsg('msg-flash', '正在把文件传到本机…', false);
+  const up = await uploadFileToServer(f);
+  if (!up || !up.ok) {
+    setMsg('msg-flash', '上传失败：' + ((up && up.err) || '未知原因'), true);
+    return;
+  }
+  document.getElementById('fw-name').textContent = f.name;
+  if (!confirm('确定把 ' + f.name + ' 写进设备并重启吗？\n\n' +
+               '写入大约 10–40 秒，期间不要关窗口、不要拔线。')) {
+    setMsg('msg-flash', '已取消', false);
+    return;
+  }
+  setMsg('msg-flash', '正在写入设备…（别关窗口）', false);
+  const j = await postJSON('/api/flash', { path: up.path });
+  if (j && j.ok) {
+    setMsg('msg-flash', '已写入：' + (j.msg || '设备正在重启'), false);
+  } else {
+    setMsg('msg-flash', '失败：' + ((j && j.err) || '未知原因'), true);
+  }
+}
+
 async function wipeAsset() {
   if (!confirm('确定要抹掉设备板载 NOR 吗？\n\n会删掉全部开机图、待机图，并把画面设置恢复默认（不画开机图 / 四角方块 / 停留 3 秒）。\n此操作不可撤销。')) {
     return;
@@ -5221,6 +5355,15 @@ class WebUI(threading.Thread):
                                             "size": len(data)})
                             except Exception as exc:
                                 self._json({"ok": False, "err": "保存失败：%s" % (exc,)})
+                    elif self.path == "/api/flash":
+                        body = self._read_json()
+                        path = str(body.get("path", "") or "")
+                        if not path:
+                            self._json({"ok": False, "err": "没有选择固件文件"})
+                        else:
+                            ok, why = sched.flash_firmware_safe(path)
+                            self._json({"ok": ok, "msg": "" if not ok else why,
+                                        "err": "" if ok else why})
                     elif self.path == "/api/asset/wipe":
                         ok, why = sched.asset_wipe_safe()
                         self._json({"ok": ok, "err": "" if ok else why})
@@ -5575,6 +5718,90 @@ def run_offline_window(manager, stop_event, device_id=None):
     return 0
 
 
+def _load_firmware_image(path):
+    """Load an Intel HEX or raw binary firmware image; returns (data, note)."""
+    raw = open(path, "rb").read()
+    if raw.lstrip()[:1] == b":":
+        mem = {}
+        hi = 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith(b":"):
+                continue
+            rec = bytes.fromhex(line[1:].decode("ascii"))
+            n = rec[0]
+            addr = (rec[1] << 8) | rec[2]
+            typ = rec[3]
+            data = rec[4:4 + n]
+            if typ == 0x00:
+                for i, b in enumerate(data):
+                    mem[hi + addr + i] = b
+            elif typ == 0x02:
+                hi = ((data[0] << 8) | data[1]) << 4
+            elif typ == 0x04:
+                hi = ((data[0] << 8) | data[1]) << 16
+        if not mem:
+            raise ValueError("hex 文件里没有数据记录")
+        lo, hi_a = min(mem), max(mem)
+        buf = bytearray(b"\xff" * (hi_a - lo + 1))
+        for a, b in mem.items():
+            buf[a - lo] = b
+        return bytes(buf), "Intel HEX，起始 0x%06X" % lo
+    return raw, "raw binary"
+
+
+def cmd_flash(path, port=None):
+    """--flash：把固件写进设备板载 NOR 并重启（需要固件 v60 及以上）。"""
+    try:
+        data, note = _load_firmware_image(path)
+    except Exception as e:
+        _console("读不了固件: %s" % e)
+        return 2
+    _console("固件 %s: %d 字节（%s）" % (os.path.basename(path), len(data), note))
+    names = [port] if port else [p.device for p in serial.tools.list_ports.comports()]
+    if not names:
+        _console("没有找到串口设备")
+        return 2
+    for name in names:
+        dev = MiniDevice(name)
+        if not dev.open():
+            _console("  %s: 打不开或握手失败" % name)
+            continue
+        tr = dev.transport
+        fw = tr.fw_version
+        _console("  已连接 %s，当前固件 %s"
+                 % (name, ("%d.%d" % fw) if fw else "未知"))
+        if not fw or fw < (60, 0):
+            _console("  [FAIL] 设备固件 %s 不支持自更新，请先用 ISP 刷一次 v60"
+                     % (("%d.%d" % fw) if fw else "未知"))
+            tr.close()
+            continue
+
+        def _prog(pos, total):
+            pct = pos * 100 // max(1, total)
+            sys.stderr.write("\r  写入 %3d%%（%d/%d 字节）" % (pct, pos, total))
+            sys.stderr.flush()
+
+        _console("  开始写入…")
+        ok, why = tr.flash_firmware(data, progress=_prog)
+        sys.stderr.write("\n")
+        tr.close()
+        if not ok:
+            _console("  [FAIL] %s" % why)
+            continue
+        _console("  [OK] %s" % why)
+        time.sleep(1.5)
+        dev2 = MiniDevice(name)
+        if dev2.open():
+            fw2 = dev2.transport.fw_version
+            _console("  重启后固件 %s" % (("%d.%d" % fw2) if fw2 else "未知"))
+            dev2.transport.close()
+            return 0
+        _console("  重启后没有回应（可能还在重启，等两秒再跑 --selftest 看看）")
+        return 1
+    return 1
+
+
 def cmd_selftest(port=None):
     """--selftest：不开界面，直接体检设备（握手 / 版本 / 触摸 / 整帧链路 / 逐帧回执）。"""
     names = [port] if port else [p.device for p in serial.tools.list_ports.comports()]
@@ -5838,6 +6065,8 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--selftest", action="store_true",
                     help="连上设备做自检（握手/版本/触摸/整帧链路/回执）后退出")
+    ap.add_argument("--flash", default=None,
+                    help="\u628a\u56fa\u4ef6\u5199\u8fdb\u8bbe\u5907\u677f\u8f7d NOR\uff08\u56fa\u4ef6 v60\uff09")
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)
@@ -5854,6 +6083,8 @@ def main(argv=None):
         return cmd_new_widget(args.new_widget)
     if args.selftest:
         return cmd_selftest(args.port)
+    if args.flash:
+        return cmd_flash(args.flash, args.port)
 
     stream = sys.stderr
     if stream is None:

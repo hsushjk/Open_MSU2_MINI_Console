@@ -840,6 +840,9 @@ class MiniDevice:
         # 发送限速（字节/秒）。设备的消费者是主循环 + 屏 DMA，实测能吃下
         # 180–230 KB/s。默认 180 KB/s：丢了就降速，连续收齐再慢慢抬头。
         self._pace_bps = 140000.0
+        # 学到的安全上限：撞过一次 0x15 就把上限压到失败速率的 85%，
+        # 之后慢慢往上试，但不再直接冲回失败过的那个速率。
+        self._pace_max = 240000.0
 
     def open(self):
         ok = self.transport.open()
@@ -913,7 +916,7 @@ class MiniDevice:
             ok_ack, got = self.transport.read_verdicts(1, 1.5)
             if ok_ack:
                 self.self_paced = True
-                self._pace_bps = min(240000.0,
+                self._pace_bps = min(getattr(self, "_pace_max", 240000.0),
                                      getattr(self, "_pace_bps", 140000.0) * 1.04)
                 self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
                 self.frame_bytes = len(frame)
@@ -945,6 +948,8 @@ class MiniDevice:
             self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
             # 设备说像素不够：字节在路上真丢了。降速重发。
             self._pace_bps = max(40000.0, getattr(self, "_pace_bps", 140000.0) * 0.6)
+            self._pace_max = max(60000.0, min(getattr(self, "_pace_max", 240000.0),
+                                            getattr(self, "_pace_bps", 140000.0) * 0.85))
             _st = getattr(self.transport, "last_status", None)
             if _st:
                 log.warning("device saw px=%d win=%d drop=%d (%.1f KB missing)",

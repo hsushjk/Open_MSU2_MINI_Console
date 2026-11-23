@@ -734,15 +734,13 @@ class FrameEncoder:
         out += MiniProtocol.lcd_enter_direct_mode()
 
         if raw_mode:
-            # 差分优先：每帧只发变化的 16x16 块（几百字节到 2 KB）。
-            # 整帧 25.6 KB 对设备是重负荷，链路一丢就是永久残影；
-            # 只有首帧、纠错、定时刷新和变化块过多时才发整帧。
-            if self._force_full:
-                self._force_full = False
-                self._last_tile_raw = raw
-                self.last_full = True
-                return bytes(out + self._encode_full(raw))
-            return bytes(out + self._encode_tiles(raw))
+            # 整帧发送：每帧都是一个完整的 0x07..0x09 事务，设备对
+            # 每一帧都给裁决字节。v28 的长测证明这条路是稳的；差分
+            # 一旦某块丢失就永久残留，比多花几毫秒糟得多。
+            self._force_full = False
+            self._last_tile_raw = raw
+            self.last_full = True
+            return bytes(out + self._encode_full(raw))
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -879,9 +877,6 @@ class MiniDevice:
 
     def _show_image_once(self, img):
         t0 = time.perf_counter()
-        if time.monotonic() - getattr(self, "_last_full_t", 0.0) > 3.0:
-            self.encoder._force_full = True
-            self._last_full_t = time.monotonic()
         frame = self.encoder.encode(
             img, raw_mode=getattr(self.transport, "raw_mode", False))
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
@@ -1697,75 +1692,24 @@ class Scheduler(threading.Thread):
 
     # ---------- 设备端配置存档（v30 起：板载 NOR 记住亮度/朝向/翻转/页） ----------
     def _devcfg_boot_sync(self):
-        """连上设备后先读一眼它记的东西（只是日志），然后以上位机为准把值写进去。
-
-        设备存档的意义是“不接上位机时它也懂自己该什么亮度/朝向”，
-        一旦连上上位机，显示相关的一切听上位机的。
-        """
-        if not getattr(self, "_devcfg_supported", True):
-            return
-        try:
-            info = self.device.devcfg_info()
-        except Exception:
-            info = None
-        if not info:
-            log.info("设备存档不可用（v31 之前，或 NOR 读不到）")
-            self._devcfg_supported = False
-            self._devcfg_dirty = False
-            return
-        log.info("设备存档: NOR=%s 有效=%s 亮度=%d%% 朝向=%s 翻转=%s 调试=%s",
-                 info["flash_id"], "是" if info["valid"] else "否",
-                 100 - info["dim"], "竖屏" if info["orient"] else "横屏",
-                 "开" if info["reverse"] else "关",
-                 "开" if (info.get("flags") or 0) & 1 else "关")
-        if not info["valid"]:
-            log.info("设备存档无效，按上位机的配置初始化设备")
-            self._devcfg_dirty = True     # 让主循环把上位机的值写进设备
-            return
-
-        # 亮度 / 朝向 / 翻转 / 调试 是“设备全局设置”：不接上位机也按它亮，
-        # 所以连上以后以设备为准（上位机的 config.json 只是没设备时的备份）。
-        before = (self._dim, self.orientation, self.reverse, self._debug)
-        self._dim = _coerce_int(info["dim"], self._dim, 0, 90)
-        self.orientation = PORTRAIT if info["orient"] else LANDSCAPE
-        self.reverse = bool(info["reverse"])
-        self._debug = bool((info.get("flags") or 0) & 1)
-        if self._debug:
-            # v36 及更早会把调试模式写进 NOR。调试模式下每个收流帧回的是 11 字节
-            # 详情帧而不是 1 字节裁决，老上位机会误判“没回执”，所以连上就关掉它。
-            log.info("设备存档里调试模式是开的，先关掉（排错开关不跨上电）")
-            self._debug = False
-            try:
-                self.device.set_debug(False)
-            except Exception:
-                pass
-        self.config.setdefault("display", {})["dim"] = self._dim
-        self.config.setdefault("display", {})["debug"] = self._debug
-        self.config["orientation"] = self.orientation
-        self.config["reverse"] = self.reverse
-        self._save_config(delay=0.5)
+        # v38 起：亮度/朝向/翻转只在上位机里，设备不自动读写 NOR。
+        # NOR 存档能力保留在固件（class 9）里，留给以后需要断电记忆时用。
         self._devcfg_dirty = False
-        if (self._dim, self.orientation, self.reverse, self._debug) != before:
-            log.info("已按设备设置同步：亮度 %d%% 朝向 %s 翻转 %s 调试 %s",
-                     100 - self._dim, self.orientation,
-                     "开" if self.reverse else "关",
-                     "开" if self._debug else "关")
-            self._ensure_supported()
-            self._switch.set()
-            self._force_send = True
+        # 调试模式只用于现场排查：连上先关掉，免得 0x09 回详情帧、
+        # 上位机把 11 字节当成裁决字节读不到。
+        try:
+            if getattr(self.device, "connected", False):
+                self.device.set_debug(False)
+        except Exception:
+            pass
+        self._debug = False
+        return
 
     def stage_devcfg(self):
-        """申请一次“写设备存档”，返回一个 Event；设备真写完（成功或失败）才会被 set。
-
-        顺便把发帧暂停 0.9 秒：写 NOR 要二三十毫秒，必须等链路安静，否则会和
-        像素流抢主循环。界面在这段时间里锁住相关控件。
-        """
+        import threading
         ev = threading.Event()
-        self._devcfg_ack = ev
-        self._devcfg_dirty = True
-        self._devcfg_pause_until = time.monotonic() + 0.9
+        ev.set()
         return ev
-
     def _devcfg_finish(self, ok):
         """设备已经给出结论：唤醒等待的请求线程。"""
         self._devcfg_ack_ok = bool(ok)
@@ -1775,26 +1719,7 @@ class Scheduler(threading.Thread):
             ev.set()
 
     def _flush_devcfg(self):
-        """把当前配置写进设备 NOR。只在主循环的空档调用——绝不能和发帧抢串口。"""
-        ok = False
-        try:
-            ok = self.device.devcfg_write(
-                _coerce_int(self._dim, 0, 0, 90),
-                1 if self.orientation == PORTRAIT else 0,
-                1 if self.reverse else 0,
-                0)
-        except Exception as e:
-            log.warning("写设备存档异常: %s", e)
         self._devcfg_dirty = False
-        if ok:
-            log.info("亮度 %d%% 朝向 %s 翻转 %s 调试 %s",
-                     100 - self._dim, self.orientation,
-                     "开" if self.reverse else "关",
-                     "开" if self._debug else "关")
-        else:
-            log.warning("设备存档写入失败（下次改设置时会重试）")
-        self._devcfg_finish(ok)
-
     def find_widget(self, name):
         for w in self._widgets:
             if w.name == name:

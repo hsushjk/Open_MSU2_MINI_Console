@@ -263,7 +263,8 @@ class SerialTransport:
             if self._ser is None:
                 try:
                     self._ser = serial.Serial(self.port, self.baud,
-                                              timeout=self.timeout)
+                                              timeout=self.timeout,
+                                              write_timeout=2.0)
                 except PermissionError:
                     if sys.platform == "win32":
                         self.last_error = f"{self.port} 被其它程序占用"
@@ -695,7 +696,16 @@ class MiniDevice:
         ok = self.transport.write(frame)
         if not ok:
             # 写失败/截断时清掉帧缓存，下一轮强制整帧重发，避免屏幕停在半帧。
+            # 再补一个收流命令，让设备丢掉段中间残留的状态（raw_left / stage），
+            # 否则下一次整帧会从错位的位置开始画。
             self.encoder.reset()
+            try:
+                if getattr(self.transport, "connected", False):
+                    self.transport.write(MiniProtocol.lcd_raw_end())
+                    time.sleep(0.05)
+                    self.transport.read_all()
+            except Exception:
+                pass
             return False
         self.transport.read_all()
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
@@ -1165,6 +1175,8 @@ class Scheduler(threading.Thread):
         self._last_entered = None
         self._last_imgs = {}
         self._force_send = False
+        self._send_gap = 0.0
+        self._last_frame_mono = 0.0
         self._stop = threading.Event()
         self._switch = threading.Event()
         self._ops = collections.deque()
@@ -1521,6 +1533,16 @@ class Scheduler(threading.Thread):
 
     def _count_frame(self, mono):
         self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
+        # 链路预算：按上一帧的实际传输时间给下一帧留出间隔。高清整帧有 25 KB，
+        # 每秒能发的帧数是有上限的；连续排帧会把数据压在设备侧，帧中间断流
+        # 就表现为花屏、错位（尤其是动画背景图这种每帧全屏都变的场景）。
+        try:
+            tx = float(getattr(self.device, "tx_ms", 0.0) or 0.0)
+        except Exception:
+            tx = 0.0
+        if tx > 0.0:
+            self._send_gap = min(0.6, tx / 1000.0 * 1.15)
+        self._last_frame_mono = mono
         total = 0
         try:
             total = int(getattr(self.device.transport, "bytes_written", 0))
@@ -1804,6 +1826,14 @@ class Scheduler(threading.Thread):
                            mono - last_bg_ts >= 0.1)
                 need_heartbeat = (not need_render and not need_bg and
                                   mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
+
+                # 上一帧还在链路上就不要排下一帧。设备侧环缓冲只有 8 KB，
+                # 25 KB 的高清整帧必须让它在两帧之间排空，否则帧中间断流
+                # 会留下半帧像素，表现为错位花屏。
+                if self._send_gap > 0.0 and mono - self._last_frame_mono < self._send_gap:
+                    need_render = False
+                    need_bg = False
+                    need_heartbeat = False
 
                 if self._overlay is not None:
                     if mono >= self._overlay_until:
@@ -2193,7 +2223,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>MSU2_MINI_Console</title>
+<title>Open_MSU2_MINI_Console</title>
 <style>
 body { font-family: Consolas, Menlo, monospace; max-width: 820px;
        margin: 2em auto; padding: 0 1em; color: #222; font-size: 14px;
@@ -2276,7 +2306,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 </head>
 <body>
 
-<h1>MSU2_MINI_Console</h1>
+<h1>Open_MSU2_MINI_Console</h1>
 
 <div class="card">
   <h2>设备</h2>
@@ -2331,14 +2361,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <select id="tk-long" onchange="updateArgVisibility()"></select>
     <input type="text" id="tk-macro-long" placeholder="宏，例: ctrl+shift+s">
     <input type="text" id="tk-program-long" placeholder="程序路径">
-  </div>
-  <div style="margin-top:8px;font-size:13px">
-    <label>灵敏度
-      <input type="range" id="tk-thresh" min="5" max="300" step="5" value="60"
-             oninput="setThreshLabel()">
-      <span id="tk-thresh-v" class="tiny">60</span>
-    </label>
-    <span class="tiny">数越小越灵敏（轻触就算按下）；贴了膜或隔空点不动时往下调，误触多时往上调。</span>
   </div>
   <div style="margin-top:8px">
     <button onclick="saveTouch()">应用触控</button>
@@ -2522,9 +2544,6 @@ async function loadTouch() {
     document.getElementById('tk-program-single').value = j.values.program_single || '';
     document.getElementById('tk-program-double').value = j.values.program_double || '';
     document.getElementById('tk-program-long').value = j.values.program_long || '';
-    const thr = parseInt(j.values.threshold || 60, 10);
-    document.getElementById('tk-thresh').value = thr;
-    setThreshLabel();
     updateArgVisibility();
   } catch(e) {
     console.error(e);
@@ -2542,7 +2561,6 @@ async function saveTouch() {
     program_single: document.getElementById('tk-program-single').value.trim(),
     program_double: document.getElementById('tk-program-double').value.trim(),
     program_long: document.getElementById('tk-program-long').value.trim(),
-    threshold: parseInt(document.getElementById('tk-thresh').value || '60', 10),
   };
   setMsg('msg-touch', '保存中...', false);
   try {
@@ -2558,11 +2576,6 @@ async function saveTouch() {
   }
 }
 
-function setThreshLabel() {
-  const v = document.getElementById('tk-thresh').value;
-  const el = document.getElementById('tk-thresh-v');
-  if (el) el.textContent = v;
-}
 
 async function loadQuality() {
   try {

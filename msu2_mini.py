@@ -870,8 +870,11 @@ class MiniDevice:
         if verify:
             # 每个收流命令设备都回一个裁决字节：数目对不上或出现 0x15，
             # 说明中间丢了字节/超时作废，必须先同步再整帧重发。
-            want = frame.count(END_FRAME)
-            ok_ack, got = self.transport.read_verdicts(want, 0.4)
+            # 只有整屏帧才有唯一的收流命令（一条 0x09）。分块帧一条 0x09
+            # 就有一个裁决字节，设备 EP3 只有一笔在途、主机又在写下一帧，
+            # 连着发的裁决会被覆盖，反倒制造假的“没回执”。所以只校验整屏帧。
+            want = frame.count(END_FRAME) if getattr(self.encoder, "last_full", False) else 0
+            ok_ack, got = (True, want) if want == 0 else self.transport.read_verdicts(want, 0.4)
             if not ok_ack:
                 log.debug("收流裁决不全: %d/%d", got, want)
                 self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1

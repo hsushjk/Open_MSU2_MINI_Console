@@ -1242,6 +1242,8 @@ class Scheduler(threading.Thread):
         self.shared = shared if isinstance(shared, dict) else {}
         self._on_config_changed = on_config_changed
         self._on_shutdown = on_shutdown
+        self._save_timer = None
+        self._save_timer_lock = threading.Lock()
 
         self.orientation = config.get("orientation", LANDSCAPE)
         self.reverse = bool(config.get("reverse", False))
@@ -1473,7 +1475,22 @@ class Scheduler(threading.Thread):
                  self._widgets[self._current].name if self._widgets else "-")
         self._ensure_supported()
 
-    def _save_config(self):
+    def _save_config(self, delay=0.0):
+        """写配置。拖滑块这类高频调用传 delay>0，合并成一次落盘。"""
+        if delay <= 0.0:
+            self._save_flush()
+            return
+        with self._save_timer_lock:
+            if self._save_timer is not None:
+                self._save_timer.cancel()
+            t = threading.Timer(delay, self._save_flush)
+            t.daemon = True
+            self._save_timer = t
+            t.start()
+
+    def _save_flush(self):
+        with self._save_timer_lock:
+            self._save_timer = None
         if self._on_config_changed:
             try: self._on_config_changed()
             except Exception as e:
@@ -1570,7 +1587,7 @@ class Scheduler(threading.Thread):
             return True
         self._dim = v
         self.config.setdefault("display", {})["dim"] = v
-        self._save_config()
+        self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
         self._force_send = True
         log.info("暗化 -> %d%%", v)
         return True
@@ -1614,6 +1631,7 @@ class Scheduler(threading.Thread):
         if shuffle is not None:
             self._bg_shuffle = bool(shuffle)
         self.post_op("background")
+        self._save_config(delay=0.8)     # 拖模糊/暗化时合并写盘
         return True
 
     def _apply_background(self):
@@ -1778,6 +1796,7 @@ class Scheduler(threading.Thread):
 
     def stop(self):
         self._stop.set()
+        self._save_flush()      # 退出前把还没落盘的改动补上
 
     def _poll_touch(self, now):
         v = self.device.read_touch()
@@ -2334,6 +2353,47 @@ def ensure_config_file(path=None):
 
 def save_config(cfg, path=None):
     _write_config_raw(cfg, path or DEFAULT_CONFIG_PATH)
+
+
+_save_timers = {}
+_save_timers_lock = threading.Lock()
+
+
+def save_config_soon(cfg, path=None, delay=0.8):
+    """合并高频写盘：滑块拖动每挪一格都会 POST 一次，没必要每次都落盘。
+    延迟 delay 秒后写一次最新内容；期间再有调用就把计时器重置。"""
+    key = str(path or DEFAULT_CONFIG_PATH)
+
+    def _flush():
+        with _save_timers_lock:
+            _save_timers.pop(key, None)
+        try:
+            save_config(cfg, path)
+        except Exception as e:
+            log.warning("保存配置失败: %s", e)
+
+    with _save_timers_lock:
+        old = _save_timers.get(key)
+        if old is not None:
+            old.cancel()
+        t = threading.Timer(delay, _flush)
+        t.daemon = True
+        _save_timers[key] = t
+        t.start()
+    return True
+
+
+def flush_config_saves():
+    """退出前把挂着的延迟写盘立刻执行掉。"""
+    with _save_timers_lock:
+        timers = list(_save_timers.items())
+        _save_timers.clear()
+    for _, t in timers:
+        t.cancel()
+        try:
+            t.function()
+        except Exception:
+            pass
 
 def discover_and_open():
     ports = list(serial.tools.list_ports.comports())
@@ -3893,7 +3953,7 @@ class WebUI(threading.Thread):
                             disp = {}
                             dcfg["display"] = disp
                         disp["dim"] = sched._dim
-                        save_config(outer.cfg, cfg_path)
+                        save_config_soon(outer.cfg, cfg_path)   # 拖动时合并写盘
                         self._json({"ok": True, "dim": sched._dim})
                     elif self.path == "/api/pages":
                         body = self._read_json()
@@ -3951,7 +4011,7 @@ class WebUI(threading.Thread):
                         bg["source"] = sched._bg_source
                         bg["interval"] = int(sched._bg_interval)
                         bg["shuffle"] = bool(sched._bg_shuffle)
-                        save_config(outer.cfg, cfg_path)
+                        save_config_soon(outer.cfg, cfg_path)   # 拖动模糊时合并写盘
                         self._json({"ok": True, "enabled": enabled, "path": path,
                                     "paths": list(sched._bg_paths),
                                     "mode": bg.get("mode", "fit"),
@@ -4463,6 +4523,8 @@ def main(argv=None):
             time.sleep(0.2)
     finally:
         log.info("正在退出…")
+        try: flush_config_saves()
+        except Exception: pass
         try: _save()
         except Exception: pass
         manager.stop()

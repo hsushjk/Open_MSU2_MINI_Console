@@ -379,7 +379,7 @@ class SerialTransport:
                 # 满一帧（整屏 25 600 像素 → 最多 25 600 字节帧头计数）。
                 blob = END_FRAME * 4300         # 25 800 B
                 self._ser.write(blob)
-                time.sleep(max(0.08, len(blob) / 180000.0))
+                time.sleep(max(0.08, len(blob) / 140000.0))
                 self._ser.reset_input_buffer()
                 return True
             except Exception:
@@ -837,6 +837,9 @@ class MiniDevice:
         self.transport = SerialTransport(port)
         self.encoder = FrameEncoder()
         self.screen_reversed = False
+        # 发送限速（字节/秒）。设备的消费者是主循环 + 屏 DMA，实测能吃下
+        # 180–230 KB/s。默认 180 KB/s：丢了就降速，连续收齐再慢慢抬头。
+        self._pace_bps = 140000.0
 
     def open(self):
         ok = self.transport.open()
@@ -883,12 +886,14 @@ class MiniDevice:
         # burst. This costs ~25 ms per frame and removes the overflow entirely.
         ok = True
         seg_write = 2048
+        rate = max(40000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
+        gap = seg_write / rate
         for i in range(0, len(payload), seg_write):
             if not self.transport.write(payload[i:i + seg_write]):
                 ok = False
                 break
             if i + seg_write < len(payload):
-                time.sleep(0.002)
+                time.sleep(gap)
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
             # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。
@@ -908,6 +913,8 @@ class MiniDevice:
             ok_ack, got = self.transport.read_verdicts(1, 1.5)
             if ok_ack:
                 self.self_paced = True
+                self._pace_bps = min(240000.0,
+                                     getattr(self, "_pace_bps", 140000.0) * 1.04)
                 self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
                 self.frame_bytes = len(frame)
                 return True
@@ -936,10 +943,12 @@ class MiniDevice:
                     self.encoder.reset()
                 return True
             self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
+            # 设备说像素不够：字节在路上真丢了。降速重发。
+            self._pace_bps = max(40000.0, getattr(self, "_pace_bps", 140000.0) * 0.6)
             if self._ack_fails in (1, 3, 10, 30):
                 log.warning("device did not confirm the frame (attempt %d, got %d "
-                            "verdict bytes), resending the full frame",
-                            self._ack_fails, got)
+                            "verdict bytes), resending at %.0f KB/s",
+                            self._ack_fails, got, self._pace_bps / 1000.0)
             self.encoder.reset()
             try:
                 self.transport.resync()

@@ -614,7 +614,8 @@ class SerialTransport:
         self.write(MiniProtocol.asset_boot_hold(boot_hold))
         st = self._asset_reply(0x09, timeout)
         if st != 0x06:
-            return False, "设备没有确认开机停留时间（回 %r）" % (st,)
+            # v37 之前没有这条命令：画面设置已经存进去了，只是停留秒数不生效
+            return True, "画面设置已保存；开机停留秒数需要固件 v37 及以上"
         return True, "ok"
 
     def wait_idle(self, timeout=0.8):
@@ -4088,7 +4089,8 @@ async function refreshAsset() {
   const slots = [];
   for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
   document.getElementById('asset-state').textContent =
-    '设备上：开机图 ' + (d.boot_valid ? '有' : '无') +
+    '设备固件 v' + (d.fw || '?') +
+    '；开机图 ' + (d.boot_valid ? '有' : '无') +
     '；待机图 ' + (slots.length ? ('第 ' + slots.join('/') + ' 张') : '无') +
     '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
 }

@@ -404,6 +404,8 @@ class SerialTransport:
 
 class FrameEncoder:
     SEG = 256
+    TILE = 16                   # 高清模式的差分块，16×16 像素 = 512 字节 RGB565
+    TILE_FULL_THRESHOLD = 32    # 变化块超过这个数就直接整帧发
 
     def __init__(self):
         self._last_raw = None
@@ -438,7 +440,7 @@ class FrameEncoder:
             raw[2 * k + 1] = v & 0xFF
         return bytes(raw)
 
-    def encode(self, img, raw_mode=False):
+    def encode(self, img, raw_mode=False, fast=False):
         if img.size != (SCREEN_W, SCREEN_H):
             img = img.resize((SCREEN_W, SCREEN_H))
         if img.mode != "RGB":
@@ -453,13 +455,15 @@ class FrameEncoder:
         out += MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
         out += MiniProtocol.lcd_enter_direct_mode()
 
-        if raw_mode and self.color4:
+        if raw_mode and fast and self.color4:
             import os as _os
             if _os.environ.get("MSU2_TILES", "0") == "1":
                 return bytes(out + self._encode_indexed_tiles(img))
             return bytes(out + self._encode_indexed(img))
 
         if raw_mode:
+            # 高清：真彩 RGB565（65536 色），只发变化的 16×16 块。
+            # 这是投屏改造之前的老路径，背景图/照片靠它才不失真。
             return bytes(out + self._encode_tiles(raw))
 
         total = len(raw)
@@ -674,10 +678,15 @@ class MiniDevice:
     @property
     def connected(self): return self.transport.connected
 
-    def show_image(self, img):
+    def show_image(self, img, fast=False):
+        if fast != getattr(self, "_last_fast", None):
+            # 换画质模式时缓存里存的不是同一种编码，必须整帧重发一次。
+            self.encoder.reset()
+            self._last_fast = fast
         t0 = time.perf_counter()
         frame = self.encoder.encode(
-            img, raw_mode=getattr(self.transport, "raw_mode", False))
+            img, raw_mode=getattr(self.transport, "raw_mode", False),
+            fast=bool(fast))
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
         if not frame:
             return True
@@ -1097,6 +1106,10 @@ class Scheduler(threading.Thread):
         self.orientation = config.get("orientation", LANDSCAPE)
         self.reverse = bool(config.get("reverse", False))
         self.portrait_rotate = _coerce_int(config.get("portrait_rotate", -90), -90)
+        disp = config.get("display")
+        if not isinstance(disp, dict):
+            disp = {}
+        self.quality = disp.get("quality") if disp.get("quality") in ("high", "fast") else "high"
 
         bg = config.get("background")
         if not isinstance(bg, dict):
@@ -1407,6 +1420,32 @@ class Scheduler(threading.Thread):
         self._switch.set()
         log.info("朝向 -> %s", self.orientation)
         return True
+
+    def set_quality(self, quality):
+        """切换画质：high = 真彩 RGB565（照片/背景图不失真），fast = 8 位 216 色。"""
+        quality = "fast" if str(quality) == "fast" else "high"
+        if quality == self.quality:
+            return True
+        self.quality = quality
+        self.config.setdefault("display", {})["quality"] = quality
+        self._save_config()
+        try:
+            self.device.encoder.reset()
+        except Exception:
+            pass
+        self._force_send = True
+        log.info("画质 -> %s（%s）", quality,
+                 "真彩 65536 色" if quality == "high" else "8 位 216 色，省流量")
+        return True
+
+    def _fast_frame(self, widget=None):
+        """本帧是否走省流编码。全局设了 fast，或插件自己声明 FAST_FRAME。"""
+        if self.quality == "fast":
+            return True
+        if widget is None:
+            return False
+        return bool(getattr(widget, "fast_frame", False) or
+                    getattr(type(widget), "FAST_FRAME", False))
 
     def toggle_lock(self, from_touch=False):
         self._locked = not self._locked
@@ -1781,7 +1820,8 @@ class Scheduler(threading.Thread):
                     key = id(overlay)
                     if key != self._overlay_seen or self._force_send:
                         self._overlay_seen = key
-                        if self.device.show_image(self._composite(overlay, mono)):
+                        if self.device.show_image(self._composite(overlay, mono),
+                                                  fast=self._fast_frame(w)):
                             self._last_send_mono = mono
                             self._count_frame(mono)
                             self._force_send = False
@@ -1807,7 +1847,8 @@ class Scheduler(threading.Thread):
                     if img is not None or need_bg or self._force_send:
                         frame = img if img is not None else self._last_imgs.get(w.name)
                         if frame is not None or need_bg:
-                            if self.device.show_image(self._composite(frame, mono)):
+                            if self.device.show_image(self._composite(frame, mono),
+                                                      fast=self._fast_frame(w)):
                                 self._last_send_mono = mono
                                 self._count_frame(mono)
                                 self._force_send = False
@@ -1818,7 +1859,8 @@ class Scheduler(threading.Thread):
                 elif need_bg:
                     last_bg_ts = mono
                     if self.device.show_image(
-                            self._composite(self._last_imgs.get(w.name), mono)):
+                            self._composite(self._last_imgs.get(w.name), mono),
+                            fast=self._fast_frame(w)):
                         self._last_send_mono = mono
                         self._count_frame(mono)
                     else:
@@ -2185,6 +2227,14 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         border-radius: 6px; padding: 6px 8px; margin: 0 0 10px; display: none; }
 .tiny { font-size: 11px; color: #999; margin: 4px 0 0; }
 .msg.err { color: #c00; }
+.foot { max-width: 900px; margin: 18px auto 30px; padding: 10px 12px;
+        border-top: 1px solid #ddd; color: #777; font-size: 12px;
+        line-height: 1.7; text-align: center; }
+.foot-warn { color: #a33; background: #fff6f6; border: 1px solid #f0d5d5;
+             border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; }
+.foot b { color: #c0392b; }
+.foot a { color: #2b5fd9; text-decoration: none; }
+.foot a:hover { text-decoration: underline; }
 .plist { border: 1px solid #ddd; background: #fff; border-radius: 3px;
          padding: 4px 6px; }
 .pitem { padding: 3px 2px; border-bottom: 1px solid #eee;
@@ -2227,7 +2277,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <body>
 
 <h1>MSU2_MINI_Console</h1>
-<h3>本项目开源，采用 MIT 许可证 </h3>
 
 <div class="card">
   <h2>设备</h2>
@@ -2247,6 +2296,15 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <button id="btn-orient" onclick="post('/api/orientation')">切换朝向</button>
   <button id="btn-rev" onclick="post('/api/reverse')">上下翻转</button>
   <span class="msg" id="msg-display"></span>
+  <div style="margin-top:8px;font-size:13px">
+    <label>画质
+      <select id="disp-quality" onchange="setQuality()">
+        <option value="high">高清 · 真彩 65536 色（照片、背景图推荐）</option>
+        <option value="fast">流畅 · 8 位 216 色（投屏、动画省流量）</option>
+      </select>
+    </label>
+    <span class="tiny" id="quality-hint">高清模式每帧约 25 KB，只在画面变化时发送变化的区块。</span>
+  </div>
 </div>
 
 <div class="card">
@@ -2273,6 +2331,14 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <select id="tk-long" onchange="updateArgVisibility()"></select>
     <input type="text" id="tk-macro-long" placeholder="宏，例: ctrl+shift+s">
     <input type="text" id="tk-program-long" placeholder="程序路径">
+  </div>
+  <div style="margin-top:8px;font-size:13px">
+    <label>灵敏度
+      <input type="range" id="tk-thresh" min="5" max="300" step="5" value="60"
+             oninput="setThreshLabel()">
+      <span id="tk-thresh-v" class="tiny">60</span>
+    </label>
+    <span class="tiny">数越小越灵敏（轻触就算按下）；贴了膜或隔空点不动时往下调，误触多时往上调。</span>
   </div>
   <div style="margin-top:8px">
     <button onclick="saveTouch()">应用触控</button>
@@ -2374,6 +2440,17 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <span class="msg" id="msg-shutdown"></span>
 </div>
 
+<footer class="foot">
+  <div class="foot-warn">
+    禁止倒卖：本项目仅供个人学习与非商业使用，<b>禁止任何形式的转售、收费分发或捆绑销售</b>。
+    如果你为它付过钱，那是有人在倒卖，请退款并向平台举报。
+  </div>
+  <div>
+    项目地址：<a href="https://github.com/hsushjk/Open_MSU2_MINI_Console"
+      target="_blank" rel="noopener">https://github.com/hsushjk/Open_MSU2_MINI_Console</a>
+  </div>
+</footer>
+
 <script>
 let currentPages = [];
 let allWidgets = {};
@@ -2445,6 +2522,9 @@ async function loadTouch() {
     document.getElementById('tk-program-single').value = j.values.program_single || '';
     document.getElementById('tk-program-double').value = j.values.program_double || '';
     document.getElementById('tk-program-long').value = j.values.program_long || '';
+    const thr = parseInt(j.values.threshold || 60, 10);
+    document.getElementById('tk-thresh').value = thr;
+    setThreshLabel();
     updateArgVisibility();
   } catch(e) {
     console.error(e);
@@ -2462,6 +2542,7 @@ async function saveTouch() {
     program_single: document.getElementById('tk-program-single').value.trim(),
     program_double: document.getElementById('tk-program-double').value.trim(),
     program_long: document.getElementById('tk-program-long').value.trim(),
+    threshold: parseInt(document.getElementById('tk-thresh').value || '60', 10),
   };
   setMsg('msg-touch', '保存中...', false);
   try {
@@ -2474,6 +2555,38 @@ async function saveTouch() {
     else setMsg('msg-touch', j.err || '保存失败', true);
   } catch(e) {
     setMsg('msg-touch', '失败: ' + e, true);
+  }
+}
+
+function setThreshLabel() {
+  const v = document.getElementById('tk-thresh').value;
+  const el = document.getElementById('tk-thresh-v');
+  if (el) el.textContent = v;
+}
+
+async function loadQuality() {
+  try {
+    const j = await getJSON('/api/quality');
+    const sel = document.getElementById('disp-quality');
+    if (sel && j.quality) sel.value = j.quality;
+  } catch(e) {}
+}
+
+async function setQuality() {
+  const q = document.getElementById('disp-quality').value;
+  const hint = document.getElementById('quality-hint');
+  try {
+    const j = await postJSON('/api/quality', { quality: q });
+    if (j.ok) {
+      setMsg('msg-display', '画质已切换：' + (q === 'high' ? '高清' : '流畅'), false);
+      if (hint) hint.textContent = (q === 'high')
+        ? '高清模式每帧约 25 KB，只在画面变化时发送变化的区块。'
+        : '流畅模式每帧约 13 KB，216 色，适合投屏和动画。';
+    } else {
+      setMsg('msg-display', j.err || '切换失败', true);
+    }
+  } catch(e) {
+    setMsg('msg-display', '失败: ' + e, true);
   }
 }
 
@@ -3137,6 +3250,7 @@ async function shutdownApp() {
 }
 
 loadTouch();
+loadQuality();
 loadDevices();
 setBgSource();
 loadPages();
@@ -3232,7 +3346,7 @@ class OfflineDevice:
     def close(self):
         self.connected = False
 
-    def show_image(self, img):
+    def show_image(self, img, fast=False):
         self.last = img.copy()
         self.frames += 1
         self.transport.bytes_written += img.size[0] * img.size[1] * 2
@@ -3581,6 +3695,11 @@ class WebUI(threading.Thread):
                         vals[k] = tk.get(k, dv)
                     self._json({"ok": True, "values": vals}); return
 
+                if path == "/api/quality":
+                    self._json({"ok": True,
+                                "quality": getattr(sched, "quality", "high")
+                                if sched else "high"}); return
+
                 self.send_error(404)
 
             def do_POST(self):
@@ -3622,6 +3741,17 @@ class WebUI(threading.Thread):
                             save_config(outer.cfg, cfg_path)
                         self._json({"ok": ok, "orientation": sched.orientation,
                                     "err": "" if ok else "冷却中"})
+                    elif self.path == "/api/quality":
+                        body = self._read_json()
+                        q = "fast" if str(body.get("quality", "")) == "fast" else "high"
+                        sched.set_quality(q)
+                        disp = dcfg.get("display")
+                        if not isinstance(disp, dict):
+                            disp = {}
+                            dcfg["display"] = disp
+                        disp["quality"] = q
+                        save_config(outer.cfg, cfg_path)
+                        self._json({"ok": True, "quality": q})
                     elif self.path == "/api/pages":
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])

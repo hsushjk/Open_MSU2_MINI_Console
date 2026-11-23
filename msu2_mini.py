@@ -1386,7 +1386,7 @@ class Scheduler(threading.Thread):
         if not isinstance(disp, dict):
             disp = {}
         self._dim = _coerce_int(disp.get("dim"), 0, 0, 90)
-        self._debug = bool(disp.get("debug", False))   # 屏上调试标记，设备自己也会记住
+        self._debug = False   # 调试模式已废弃（会跟看门狗打架），永远关闭
 
         bg = config.get("background")
         if not isinstance(bg, dict):
@@ -1644,13 +1644,6 @@ class Scheduler(threading.Thread):
         # v38 起：亮度/朝向/翻转只在上位机里，设备不自动读写 NOR。
         # NOR 存档能力保留在固件（class 9）里，留给以后需要断电记忆时用。
         self._devcfg_dirty = False
-        # 调试模式只用于现场排查：连上先关掉，免得 0x09 回详情帧、
-        # 上位机把 11 字节当成裁决字节读不到。
-        try:
-            if getattr(self.device, "connected", False):
-                self.device.set_debug(False)
-        except Exception:
-            pass
         self._debug = False
         return
 
@@ -2070,7 +2063,6 @@ class Scheduler(threading.Thread):
                                   program)
         elif action == "shutdown":
             log.info("触摸触发关闭上位机")
-            self.notify("上位机正在被关闭…", 2.0)
             if callable(self._on_shutdown):
                 self._on_shutdown()
         elif action == "dim_up":
@@ -4928,6 +4920,14 @@ def main(argv=None):
             time.sleep(0.2)
     finally:
         log.info("正在退出…")
+        # 不管从哪条路退出（触控、网页、窗口叉、Ctrl+C），都在小屏上留一句，
+        # 让用户知道是“被关掉”而不是死机。
+        try:
+            for _did in manager.order:
+                manager.schedulers[_did].notify("上位机正在被关闭…", 1.5)
+            time.sleep(0.6)
+        except Exception:
+            pass
         try: flush_config_saves()
         except Exception: pass
         try: _save()

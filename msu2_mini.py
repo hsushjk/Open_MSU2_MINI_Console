@@ -876,8 +876,14 @@ class MiniDevice:
                 log.debug("收流裁决不全: %d/%d", got, want)
                 self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
                 if self._ack_fails in (3, 30):
-                    log.warning("设备连续 %d 帧没有回执：可能卡死了，请拔插一次 USB",
+                    log.warning("设备连续 %d 帧没有回执，正在重新打开串口恢复",
                                 self._ack_fails)
+                    try:
+                        self.transport.close()
+                        time.sleep(0.2)
+                        self.open()          # 重开串口 + 清空编码缓存 => 整屏重画
+                    except Exception:
+                        pass
                 if got == 0:
                     self._zero_acks = int(getattr(self, "_zero_acks", 0)) + 1
                     if self._zero_acks >= 3 and not (fw and fw >= (13, 0)):

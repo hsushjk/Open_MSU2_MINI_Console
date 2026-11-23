@@ -179,6 +179,10 @@ class MiniProtocol:
         return MiniProtocol._frame(0x09, 0x03, 0, 0, 0, 0)
 
     @staticmethod
+    def set_debug(on):
+        return MiniProtocol._frame(0x00, 0x5A, 1 if on else 0, 0, 0, 0)
+
+    @staticmethod
     def lcd_set_xy(x, y):
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_SET_XY,
                                    (x >> 8) & 0xFF, x & 0xFF,
@@ -522,6 +526,25 @@ class SerialTransport:
             except Exception as e:
                 log.warning("写设备存档失败: %s", e)
             return False
+
+    def set_debug(self, on):
+        """开/关屏上调试标记；设备会自己写进 NOR，掉电也记得。"""
+        with self._lock:
+            if not self._connected or not self._ser:
+                return False
+            try:
+                self._ser.write(MiniProtocol.set_debug(on))
+                time.sleep(0.02)
+                tmp = bytearray()
+                while True:
+                    n = self._ser.in_waiting
+                    if not n:
+                        break
+                    tmp.extend(self._ser.read(n))
+                return True
+            except Exception as e:
+                log.warning("设置调试模式失败: %s", e)
+                return False
 
     def read_status(self, timeout=0.12):
         """收流后设备回的 16 字节状态帧（0x55 ... 0xAA）。
@@ -941,6 +964,9 @@ class MiniDevice:
     def devcfg_write(self, dim, orient, reverse, flags=0):
         return self.transport.devcfg_write(dim, orient, reverse, flags)
 
+    def set_debug(self, on):
+        return self.transport.set_debug(on)
+
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
             return None
@@ -1337,6 +1363,7 @@ class Scheduler(threading.Thread):
         if not isinstance(disp, dict):
             disp = {}
         self._dim = _coerce_int(disp.get("dim"), 0, 0, 90)
+        self._debug = bool(disp.get("debug", False))   # 屏上调试标记，设备自己也会记住
 
         bg = config.get("background")
         if not isinstance(bg, dict):
@@ -1612,14 +1639,32 @@ class Scheduler(threading.Thread):
                  100 - info["dim"], "竖屏" if info["orient"] else "横屏",
                  "开" if info["reverse"] else "关",
                  "开" if (info.get("flags") or 0) & 1 else "关")
-        stored = (100 - info["dim"],
-                  1 if info["orient"] else 0,
-                  1 if info["reverse"] else 0)
-        mine = (100 - self._dim,
-                1 if self.orientation == PORTRAIT else 0,
-                1 if self.reverse else 0)
-        if not info["valid"] or stored != mine:
-            self._devcfg_dirty = True     # 让主循环把上位机的值盖上去
+        if not info["valid"]:
+            log.info("设备存档无效，按上位机的配置初始化设备")
+            self._devcfg_dirty = True     # 让主循环把上位机的值写进设备
+            return
+
+        # 亮度 / 朝向 / 翻转 / 调试 是“设备全局设置”：不接上位机也按它亮，
+        # 所以连上以后以设备为准（上位机的 config.json 只是没设备时的备份）。
+        before = (self._dim, self.orientation, self.reverse, self._debug)
+        self._dim = _coerce_int(info["dim"], self._dim, 0, 90)
+        self.orientation = PORTRAIT if info["orient"] else LANDSCAPE
+        self.reverse = bool(info["reverse"])
+        self._debug = bool((info.get("flags") or 0) & 1)
+        self.config.setdefault("display", {})["dim"] = self._dim
+        self.config.setdefault("display", {})["debug"] = self._debug
+        self.config["orientation"] = self.orientation
+        self.config["reverse"] = self.reverse
+        self._save_config(delay=0.5)
+        self._devcfg_dirty = False
+        if (self._dim, self.orientation, self.reverse, self._debug) != before:
+            log.info("已按设备设置同步：亮度 %d%% 朝向 %s 翻转 %s 调试 %s",
+                     100 - self._dim, self.orientation,
+                     "开" if self.reverse else "关",
+                     "开" if self._debug else "关")
+            self._ensure_supported()
+            self._switch.set()
+            self._force_send = True
 
     def _flush_devcfg(self):
         """把当前配置写进设备 NOR。只在主循环的空档调用——绝不能和发帧抢串口。"""
@@ -1730,6 +1775,21 @@ class Scheduler(threading.Thread):
         self._force_send = True
         log.info("亮度 -> %d%%", 100 - v)
         return True
+
+    def set_debug(self, on):
+        """开/关屏上的调试标记（联机点、完整性角标）。设备会把它写进 NOR。"""
+        on = bool(on)
+        self._debug = on
+        self.config.setdefault("display", {})["debug"] = on
+        self._save_config(delay=0.5)
+        try:
+            ok = self.device.set_debug(on)
+        except Exception as e:
+            log.warning("设置调试模式失败: %s", e)
+            return False
+        if ok:
+            log.info("调试模式 -> %s", "开" if on else "关")
+        return ok
 
     def toggle_lock(self, from_touch=False):
         self._locked = not self._locked
@@ -2677,13 +2737,34 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <button id="btn-rev" onclick="post('/api/reverse')">上下翻转</button>
   <span class="msg" id="msg-display"></span>
   <div style="margin-top:8px;font-size:13px">
-    <label>伪亮度
-      <input type="range" id="disp-dim" min="10" max="100" step="5" value="100"
-             oninput="setDimLabel()" onchange="applyDim()"
-             style="width:170px;vertical-align:middle">
-      <span id="disp-dim-v" class="tiny">100%</span>
+    <label>亮度
+      <select id="disp-dim" onchange="applyDim()" style="width:84px">
+        <option value="100">100%</option>
+        <option value="95">95%</option>
+        <option value="90">90%</option>
+        <option value="85">85%</option>
+        <option value="80">80%</option>
+        <option value="75">75%</option>
+        <option value="70">70%</option>
+        <option value="65">65%</option>
+        <option value="60">60%</option>
+        <option value="55">55%</option>
+        <option value="50">50%</option>
+        <option value="45">45%</option>
+        <option value="40">40%</option>
+        <option value="35">35%</option>
+        <option value="30">30%</option>
+        <option value="25">25%</option>
+        <option value="20">20%</option>
+        <option value="15">15%</option>
+        <option value="10">10%</option>
+      </select>
     </label>
-    <span class="tiny" id="dim-hint">100% = 原亮度；往左调越暗（整屏压暗，插件和背景一起生效）。</span>
+    <span class="tiny" id="dim-hint">100% = 原亮度（整屏压暗，插件和背景一起生效）；设备会记住这个值。</span>
+  </div>
+  <div style="margin-top:8px;font-size:13px">
+    <label><input type="checkbox" id="disp-debug" onchange="applyDebug()"> 调试模式</label>
+    <span class="tiny">在屏上画联机点和完整性角标，调试用；设备会记住这个开关。</span>
   </div>
 </div>
 
@@ -2936,16 +3017,9 @@ async function loadDim() {
     const j = await getJSON('/api/dim');
     const el = document.getElementById('disp-dim');
     if (el && document.activeElement !== el) {
-      el.value = 100 - (j.dim || 0);
-      setDimLabel();
+      el.value = String(100 - (j.dim || 0));
     }
   } catch(e) {}
-}
-
-function setDimLabel() {
-  const el = document.getElementById('disp-dim');
-  const lab = document.getElementById('disp-dim-v');
-  if (el && lab) lab.textContent = el.value + '%';
 }
 
 async function applyDim() {
@@ -2956,11 +3030,30 @@ async function applyDim() {
   try {
     const j = await postJSON('/api/dim', { dim: dim });
     if (j.ok) {
-      setDimLabel();
-      setMsg('msg-display', '伪亮度 ' + (100 - j.dim) + '%', false);
+      setMsg('msg-display', '亮度 ' + (100 - j.dim) + '%', false);
     } else {
       setMsg('msg-display', j.err || '设置失败', true);
     }
+  } catch(e) {
+    setMsg('msg-display', '失败: ' + e, true);
+  }
+}
+
+async function loadDebug() {
+  try {
+    const j = await getJSON('/api/debug');
+    const el = document.getElementById('disp-debug');
+    if (el && document.activeElement !== el) el.checked = !!j.on;
+  } catch(e) {}
+}
+
+async function applyDebug() {
+  const el = document.getElementById('disp-debug');
+  if (!el) return;
+  try {
+    const j = await postJSON('/api/debug', { on: el.checked });
+    if (j.ok) setMsg('msg-display', el.checked ? '调试模式已开' : '调试模式已关', false);
+    else setMsg('msg-display', j.err || '设置失败', true);
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
   }
@@ -3090,8 +3183,11 @@ async function refresh() {
     }
     const dimEl = document.getElementById('disp-dim');
     if (dimEl && document.activeElement !== dimEl) {
-      dimEl.value = j.dim || 0;
-      setDimLabel();
+      dimEl.value = String(100 - (j.dim || 0));
+    }
+    const dbgEl = document.getElementById('disp-debug');
+    if (dbgEl && document.activeElement !== dbgEl) {
+      dbgEl.checked = !!j.debug;
     }
     const blurEl = document.getElementById('bg-blur');
     if (blurEl && document.activeElement !== blurEl) {
@@ -3620,6 +3716,7 @@ async function shutdownApp() {
 
 loadTouch();
 loadDim();
+loadDebug();
 loadDevices();
 setBgSource();
 loadPages();
@@ -3993,6 +4090,7 @@ class WebUI(threading.Thread):
                         "orientation": sched.orientation,
                         "reverse": sched.reverse,
                         "dim": getattr(sched, "_dim", 0),
+                        "debug": bool(getattr(sched, "_debug", False)),
                         "locked": sched._locked,
                         "background_enabled": sched._bg_enabled,
                         "background_path": sched._bg_path,
@@ -4072,6 +4170,10 @@ class WebUI(threading.Thread):
                     self._json({"ok": True,
                                 "dim": getattr(sched, "_dim", 0) if sched else 0}); return
 
+                if path == "/api/debug":
+                    self._json({"ok": True,
+                                "on": bool(getattr(sched, "_debug", False)) if sched else False}); return
+
                 self.send_error(404)
 
             def do_POST(self):
@@ -4122,8 +4224,15 @@ class WebUI(threading.Thread):
                             disp = {}
                             dcfg["display"] = disp
                         disp["dim"] = sched._dim
-                        save_config_soon(outer.cfg, cfg_path)   # 拖动时合并写盘
+                        save_config_soon(outer.cfg, cfg_path)   # 连续改时合并写盘
                         self._json({"ok": True, "dim": sched._dim})
+                    elif self.path == "/api/debug":
+                        body = self._read_json()
+                        ok = sched.set_debug(bool(body.get("on")))
+                        dcfg["debug"] = bool(getattr(sched, "_debug", False))
+                        save_config_soon(outer.cfg, cfg_path)
+                        self._json({"ok": ok, "on": bool(getattr(sched, "_debug", False)),
+                                    "err": "" if ok else "设备没有回应"})
                     elif self.path == "/api/pages":
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])

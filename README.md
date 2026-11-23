@@ -27,6 +27,12 @@ msu2-console          # 或 python -m msu2_mini
 
 可选依赖：`pip install ".[extras]"`（pynput + mss），或 `pip install ".[full]"`（再加 numpy、pywin32）。
 
+`pip install .` 之后（不是打 exe）：
+
+- 插件放在 `%LOCALAPPDATA%\MSU2_MINI\widgets`，或用 `MSU2_WIDGETS_DIR` 指定；`msu2-console --new-widget foo` 会直接把骨架生成到这里
+- 插件里 `import` 任何标准库、任何第三方包都行，缺什么自己 `pip install` 即可
+- 配置默认写到 `~\.msu2_mini\config.json`（源码模式下仍在仓库根目录）
+
 从源码直接跑：
 
 ```bash

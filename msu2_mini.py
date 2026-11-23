@@ -361,6 +361,49 @@ class SerialTransport:
                 log.debug("查询固件版本失败: %s", e)
             return None
 
+    def read_status(self, timeout=0.12):
+        """收流后设备回的 16 字节状态帧（0x55 ... 0xAA）。
+
+        返回 dict（done/drop/px/win/aborts/ms/ovf）或 None。px 是本帧实际
+        画进屏的像素数，win 是这次开流声明的窗口像素数 —— 两者不等就说明
+        中间丢过字节，必须整帧重发。
+        """
+        with self._lock:
+            if not self._connected or not self._ser:
+                return None
+            t0 = time.monotonic()
+            buf = bytearray()
+            while time.monotonic() - t0 < timeout:
+                try:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                except Exception:
+                    self._connected = False; self._handshaked = False
+                    return None
+                while len(buf) >= 1:
+                    if buf[0] != 0x55:
+                        del buf[0]
+                        continue
+                    if len(buf) < 18:
+                        break
+                    if buf[17] != 0xAA:
+                        del buf[0]
+                        continue
+                    st = {
+                        "done": (buf[2] << 8) | buf[1],
+                        "drop": (buf[4] << 8) | buf[3],
+                        "px":   (buf[6] << 8) | buf[5],
+                        "win":  (buf[8] << 8) | buf[7],
+                        "aborts": (buf[10] << 8) | buf[9],
+                        "ms":   (buf[12] << 8) | buf[11],
+                        "ovf":  (buf[14] << 8) | buf[13],
+                        "tmo":  (buf[16] << 8) | buf[15],
+                    }
+                    return st
+                time.sleep(0.004)
+            return None
+
     def read_adc(self, ch, timeout=0.05):
         with self._lock:
             if not self._connected or not self._ser:
@@ -447,6 +490,7 @@ class FrameEncoder:
         if img.mode != "RGB":
             img = img.convert("RGB")
         raw = self._to_rgb565(img)
+        self.last_full = False
         if raw == self._last_raw:
             return b""
         self._last_raw = raw
@@ -458,6 +502,7 @@ class FrameEncoder:
 
         if raw_mode and fast and self.color4:
             import os as _os
+            self.last_full = True
             if _os.environ.get("MSU2_TILES", "0") == "1":
                 return bytes(out + self._encode_indexed_tiles(img))
             return bytes(out + self._encode_indexed(img))
@@ -613,6 +658,7 @@ class FrameEncoder:
 
         if prev is None or len(prev) != len(raw):
             self._last_tile_raw = raw
+            self.last_full = True
             return self._encode_full(raw)
 
         tiles = []
@@ -628,6 +674,7 @@ class FrameEncoder:
         if not tiles:
             return b""
         if len(tiles) > self.TILE_FULL_THRESHOLD:
+            self.last_full = True
             return self._encode_full(raw)
 
         out = bytearray()
@@ -680,6 +727,15 @@ class MiniDevice:
     def connected(self): return self.transport.connected
 
     def show_image(self, img, fast=False):
+        ok = self._show_image_once(img, fast)
+        if ok:
+            return True
+        # 设备报告缺像素（或整段作废）：缓存已清，立刻整帧补一次，
+        # 用户看到的是“偶尔卡一下”，而不是半屏花掉的内容。
+        log.debug("整帧校验失败，重发一次")
+        return self._show_image_once(img, fast)
+
+    def _show_image_once(self, img, fast=False):
         if fast != getattr(self, "_last_fast", None):
             # 换画质模式时缓存里存的不是同一种编码，必须整帧重发一次。
             self.encoder.reset()
@@ -707,9 +763,29 @@ class MiniDevice:
             except Exception:
                 pass
             return False
-        self.transport.read_all()
+        st = None
+        fw = getattr(self.transport, "fw_version", None)
+        if getattr(self.encoder, "last_full", False) and fw and fw >= (12, 0):
+            # 整屏帧带状态回包：px 必须等于 win，否则说明中间丢了字节。
+            st = self.transport.read_status(0.12)
+        else:
+            self.transport.read_all()
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
+        if st is not None:
+            self.last_status = st
+            bad = (st["win"] > 0 and st["px"] != st["win"])
+            if st["aborts"] != getattr(self, "_aborts_seen", st["aborts"]):
+                self._aborts_seen = st["aborts"]
+                bad = True
+            if st["tmo"] != getattr(self, "_tmo_seen", st["tmo"]):
+                self._tmo_seen = st["tmo"]
+                bad = True
+            if bad:
+                log.debug("设备收流不完整: px=%s win=%s aborts=%s ovf=%s",
+                          st["px"], st["win"], st["aborts"], st["ovf"])
+                self.encoder.reset()
+                return False
         return True
 
     def set_reverse(self, reverse):
@@ -746,8 +822,8 @@ class Background:
         self.t_last = None
 
     def configure(self, dim=0, blur=0):
-        self.dim = _coerce_int(dim, 0, 0, 90)
-        self.blur = _coerce_int(blur, 0, 0, 12)
+        self.dim = 0            # 暗化搬到全局显示设置，背景不再压暗
+        self.blur = _coerce_int(blur, 0, 0, 5)
         self.frames = [self._decorate(f) for f in self.raw]
 
     def _decorate(self, img):
@@ -758,12 +834,6 @@ class Background:
             try:
                 from PIL import ImageFilter
                 out = out.filter(ImageFilter.GaussianBlur(self.blur))
-            except Exception:
-                pass
-        if self.dim > 0:
-            try:
-                overlay = Image.new("RGB", out.size, "black")
-                out = Image.blend(out, overlay, self.dim / 100.0)
             except Exception:
                 pass
         return out
@@ -1119,7 +1189,7 @@ class Scheduler(threading.Thread):
         disp = config.get("display")
         if not isinstance(disp, dict):
             disp = {}
-        self.quality = disp.get("quality") if disp.get("quality") in ("high", "fast") else "high"
+        self._dim = _coerce_int(disp.get("dim"), 0, 0, 90)
 
         bg = config.get("background")
         if not isinstance(bg, dict):
@@ -1133,8 +1203,8 @@ class Scheduler(threading.Thread):
         self._bg_mode = bg.get("mode")
         if self._bg_mode not in Background.MODES:
             self._bg_mode = "fit"
-        self._bg_dim = _coerce_int(bg.get("dim"), 0, 0, 90)
-        self._bg_blur = _coerce_int(bg.get("blur"), 0, 0, 12)
+        self._bg_dim = 0          # 暗化已独立成全局设置，这里保留字段只为兼容旧配置
+        self._bg_blur = _coerce_int(bg.get("blur"), 0, 0, 5)
         self.background = Background()
         self.background.configure(self._bg_dim, self._bg_blur)
         if self._bg_enabled:
@@ -1433,31 +1503,17 @@ class Scheduler(threading.Thread):
         log.info("朝向 -> %s", self.orientation)
         return True
 
-    def set_quality(self, quality):
-        """切换画质：high = 真彩 RGB565（照片/背景图不失真），fast = 8 位 216 色。"""
-        quality = "fast" if str(quality) == "fast" else "high"
-        if quality == self.quality:
+    def set_dim(self, value):
+        """整屏暗化 0-90：作用在最终合成帧上，等于一个假亮度旋钮。"""
+        v = _coerce_int(value, self._dim, 0, 90)
+        if v == self._dim:
             return True
-        self.quality = quality
-        self.config.setdefault("display", {})["quality"] = quality
+        self._dim = v
+        self.config.setdefault("display", {})["dim"] = v
         self._save_config()
-        try:
-            self.device.encoder.reset()
-        except Exception:
-            pass
         self._force_send = True
-        log.info("画质 -> %s（%s）", quality,
-                 "真彩 65536 色" if quality == "high" else "8 位 216 色，省流量")
+        log.info("暗化 -> %d%%", v)
         return True
-
-    def _fast_frame(self, widget=None):
-        """本帧是否走省流编码。全局设了 fast，或插件自己声明 FAST_FRAME。"""
-        if self.quality == "fast":
-            return True
-        if widget is None:
-            return False
-        return bool(getattr(widget, "fast_frame", False) or
-                    getattr(type(widget), "FAST_FRAME", False))
 
     def toggle_lock(self, from_touch=False):
         self._locked = not self._locked
@@ -1490,7 +1546,7 @@ class Scheduler(threading.Thread):
         if dim is not None:
             self._bg_dim = _coerce_int(dim, self._bg_dim, 0, 90)
         if blur is not None:
-            self._bg_blur = _coerce_int(blur, self._bg_blur, 0, 12)
+            self._bg_blur = _coerce_int(blur, self._bg_blur, 0, 5)
         if source is not None:
             self._bg_source = source if source in ("single", "playlist") else "single"
         if interval is not None:
@@ -1760,6 +1816,11 @@ class Scheduler(threading.Thread):
             if widget_img.mode != "RGBA":
                 widget_img = widget_img.convert("RGBA")
             out = Image.alpha_composite(canvas, widget_img).convert("RGB")
+        if self._dim > 0:
+            # 伪亮度：整屏按比例压暗，对所有插件和背景一起生效。
+            k = 100 - self._dim
+            lut = [(i * k) // 100 for i in range(256)] * 3
+            out = out.point(lut)
         if self.reverse:
             out = out.rotate(180)
         return out
@@ -1850,8 +1911,7 @@ class Scheduler(threading.Thread):
                     key = id(overlay)
                     if key != self._overlay_seen or self._force_send:
                         self._overlay_seen = key
-                        if self.device.show_image(self._composite(overlay, mono),
-                                                  fast=self._fast_frame(w)):
+                        if self.device.show_image(self._composite(overlay, mono)):
                             self._last_send_mono = mono
                             self._count_frame(mono)
                             self._force_send = False
@@ -1877,8 +1937,7 @@ class Scheduler(threading.Thread):
                     if img is not None or need_bg or self._force_send:
                         frame = img if img is not None else self._last_imgs.get(w.name)
                         if frame is not None or need_bg:
-                            if self.device.show_image(self._composite(frame, mono),
-                                                      fast=self._fast_frame(w)):
+                            if self.device.show_image(self._composite(frame, mono)):
                                 self._last_send_mono = mono
                                 self._count_frame(mono)
                                 self._force_send = False
@@ -1889,8 +1948,7 @@ class Scheduler(threading.Thread):
                 elif need_bg:
                     last_bg_ts = mono
                     if self.device.show_image(
-                            self._composite(self._last_imgs.get(w.name), mono),
-                            fast=self._fast_frame(w)):
+                            self._composite(self._last_imgs.get(w.name), mono)):
                         self._last_send_mono = mono
                         self._count_frame(mono)
                     else:
@@ -2063,8 +2121,7 @@ def _sanitize_device(dev, index):
         "source": bg.get("source") if bg.get("source") in ("single", "playlist") else "single",
         "interval": _coerce_int(bg.get("interval"), 12, 2, 3600),
         "shuffle": bool(bg.get("shuffle")),
-        "dim": _coerce_int(bg.get("dim"), 0, 0, 90),
-        "blur": _coerce_int(bg.get("blur"), 0, 0, 12),
+        "blur": _coerce_int(bg.get("blur"), 0, 0, 5),
     }
     out["touch"] = _sanitize_touch(dev.get("touch"))
     return out
@@ -2327,13 +2384,13 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <button id="btn-rev" onclick="post('/api/reverse')">上下翻转</button>
   <span class="msg" id="msg-display"></span>
   <div style="margin-top:8px;font-size:13px">
-    <label>画质
-      <select id="disp-quality" onchange="setQuality()">
-        <option value="high">高清 · 真彩 65536 色（照片、背景图推荐）</option>
-        <option value="fast">流畅 · 8 位 216 色（投屏、动画省流量）</option>
-      </select>
+    <label>暗化（伪亮度）
+      <input type="range" id="disp-dim" min="0" max="90" step="5" value="0"
+             oninput="setDimLabel()" onchange="applyDim()"
+             style="width:170px;vertical-align:middle">
+      <span id="disp-dim-v" class="tiny">0%</span>
     </label>
-    <span class="tiny" id="quality-hint">高清模式每帧约 25 KB，只在画面变化时发送变化的区块。</span>
+    <span class="tiny" id="dim-hint">整屏压暗，插件和背景一起生效；0% = 原亮度。</span>
   </div>
 </div>
 
@@ -2429,13 +2486,8 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <option value="stretch">拉伸</option>
       </select>
     </label>
-    <label style="font-size:12px;color:#666;margin-left:12px">暗化
-      <input type="range" id="bg-dim" min="0" max="90" step="5" value="0"
-             oninput="setBgDimLabel()" onchange="applyBgLook()">
-      <span id="bg-dim-v" class="tiny">0%</span>
-    </label>
     <label style="font-size:12px;color:#666;margin-left:12px">模糊
-      <input type="range" id="bg-blur" min="0" max="12" step="1" value="0"
+      <input type="range" id="bg-blur" min="0" max="5" step="1" value="0"
              oninput="setBgBlurLabel()" onchange="applyBgLook()">
       <span id="bg-blur-v" class="tiny">0</span>
     </label>
@@ -2577,29 +2629,30 @@ async function saveTouch() {
 }
 
 
-async function loadQuality() {
+async function loadDim() {
   try {
-    const j = await getJSON('/api/quality');
-    const sel = document.getElementById('disp-quality');
-    if (sel && j.quality) sel.value = j.quality;
+    const j = await getJSON('/api/dim');
+    const el = document.getElementById('disp-dim');
+    if (el && document.activeElement !== el && j.dim !== undefined) {
+      el.value = j.dim;
+      setDimLabel();
+    }
   } catch(e) {}
 }
 
-async function setQuality() {
-  const q = document.getElementById('disp-quality').value;
-  const hint = document.getElementById('quality-hint');
+function setDimLabel() {
+  const v = document.getElementById('disp-dim').value;
+  document.getElementById('disp-dim-v').textContent = v + '%';
+}
+
+async function applyDim() {
+  setDimLabel();
+  const v = parseInt(document.getElementById('disp-dim').value, 10);
   try {
-    const j = await postJSON('/api/quality', { quality: q });
-    if (j.ok) {
-      setMsg('msg-display', '画质已切换：' + (q === 'high' ? '高清' : '流畅'), false);
-      if (hint) hint.textContent = (q === 'high')
-        ? '高清模式每帧约 25 KB，只在画面变化时发送变化的区块。'
-        : '流畅模式每帧约 13 KB，216 色，适合投屏和动画。';
-    } else {
-      setMsg('msg-display', j.err || '切换失败', true);
-    }
+    const j = await postJSON('/api/dim', { dim: v });
+    if (!j.ok) setMsg('msg-display', j.err || '设置失败', true);
   } catch(e) {
-    setMsg('msg-display', '失败: ' + e, true);
+    setMsg('msg-display', '错误: ' + e, true);
   }
 }
 
@@ -2655,28 +2708,21 @@ async function sendNotify() {
     j.ok ? '已推送' : (j.err || '失败');
 }
 
-function setBgDimLabel() {
-  document.getElementById('bg-dim-v').textContent =
-    document.getElementById('bg-dim').value + '%';
-}
-
 function setBgBlurLabel() {
   document.getElementById('bg-blur-v').textContent =
     document.getElementById('bg-blur').value;
 }
 
 async function applyBgLook() {
-  const dim = parseInt(document.getElementById('bg-dim').value, 10);
   const blur = parseInt(document.getElementById('bg-blur').value, 10);
   const j = await postJSON('/api/background', {
     enabled: allBgEnabled,
     path: document.getElementById('bg-path').value.trim(),
     paths: bgPaths(),
     mode: document.getElementById('bg-mode').value,
-    dim, blur,
   });
   document.getElementById('msg-bg').textContent =
-    j.ok ? `暗化 ${j.dim}% 模糊 ${j.blur}` : (j.err || '失败');
+    j.ok ? `暗化 ${j.blur} 模糊 ${j.blur}` : (j.err || '失败');
 }
 
 function bgSource() {
@@ -2731,75 +2777,11 @@ async function refresh() {
     if (bgModeEl && document.activeElement !== bgModeEl) {
       bgModeEl.value = j.background_mode || 'fit';
     }
-    const dimEl = document.getElementById('bg-dim');
+    const dimEl = document.getElementById('disp-dim');
     if (dimEl && document.activeElement !== dimEl) {
-      dimEl.value = j.background_dim || 0;
-      setBgDimLabel();
+      dimEl.value = j.dim || 0;
+      setDimLabel();
     }
-    const blurEl = document.getElementById('bg-blur');
-    if (blurEl && document.activeElement !== blurEl) {
-      blurEl.value = j.background_blur || 0;
-      setBgBlurLabel();
-    }
-    const pathsEl = document.getElementById('bg-paths');
-    if (pathsEl && document.activeElement !== pathsEl) {
-      const cur = (j.background_paths || []).join('\n');
-      if (pathsEl.value.trim() !== cur.trim()) pathsEl.value = cur;
-    }
-    const sel = document.getElementById('dev-select');
-    if (sel && j.active && document.activeElement !== sel) {
-      sel.value = j.active;
-    }
-    const m = j.metrics || {};
-    if (m.fps !== undefined) {
-      const rk = Object.keys(m.render_ms || {})
-        .map(k => `${k} ${m.render_ms[k]}ms`).join('  ');
-      document.getElementById('metrics-line').textContent =
-        `FPS ${m.fps}   吞吐 ${m.bytes_per_sec} B/s   帧 ${m.frames}   ` +
-        `重连 ${m.reconnects}   渲染 ${rk}`;
-    }
-    const extEl = document.getElementById('ext-line');
-    if (extEl) {
-      const ef = j.ext_failed || [];
-      extEl.textContent = ef.length
-        ? `外部插件加载失败 ${ef.length} 个：` + ef.map(function (x) {
-            const p = String(x[0] || '').split(/[\\/]/).pop();
-            return p + '（' + (x[1] || '') + '）';
-          }).join('   ')
-        : '';
-    }
-    syncTouchSelects(j.touch || {});
-    const pv = document.getElementById('dev-preview');
-    if (pv && j.current_widget) {
-      const want = '/api/preview?name=' + encodeURIComponent(j.current_widget) + '&t=' + Date.now();
-      if (pv.dataset.want !== want) { pv.dataset.want = want; pv.src = want; }
-    }
-    const srcEl = document.getElementById('bg-source');
-    if (srcEl && document.activeElement !== srcEl) {
-      srcEl.value = j.background_source || 'single';
-      setBgSource();
-    }
-    const pthEl = document.getElementById('bg-paths');
-    if (pthEl && document.activeElement !== pthEl) {
-      pthEl.value = (j.background_paths || []).join('\n');
-    }
-    const ivEl = document.getElementById('bg-interval');
-    if (ivEl && document.activeElement !== ivEl) {
-      ivEl.value = j.background_interval || 12;
-    }
-    const shEl = document.getElementById('bg-shuffle');
-    if (shEl && document.activeElement !== shEl) {
-      shEl.checked = !!j.background_shuffle;
-    }
-
-    currentWidgetName = j.current_widget || '';
-    document.querySelectorAll('#pages-list .pitem').forEach(el => {
-      el.classList.toggle('current', el.dataset.widget === currentWidgetName);
-    });
-  } catch(e) {
-    document.getElementById('status').textContent = '状态获取失败: ' + e;
-  }
-}
 
 async function loadPages() {
   const j = await getJSON('/api/widgets');
@@ -3200,7 +3182,6 @@ async function toggleBackground() {
   const modeEl = document.getElementById('bg-mode');
   const mode = modeEl ? modeEl.value : 'fit';
   const paths = bgPaths();
-  const dim = parseInt(document.getElementById('bg-dim').value, 10);
   const blur = parseInt(document.getElementById('bg-blur').value, 10);
   const source = bgSource();
   const interval = bgInterval();
@@ -3219,7 +3200,7 @@ async function toggleBackground() {
     const j = await getJSON('/api/background', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: next, path, paths, mode, dim, blur,
+      body: JSON.stringify({enabled: next, path, paths, mode, blur,
                            source, interval, shuffle})
     });
     if (j.ok) setMsg('msg-bg', next ? '已启用' : '已关闭', false);
@@ -3263,7 +3244,7 @@ async function shutdownApp() {
 }
 
 loadTouch();
-loadQuality();
+loadDim();
 loadDevices();
 setBgSource();
 loadPages();
@@ -3708,10 +3689,9 @@ class WebUI(threading.Thread):
                         vals[k] = tk.get(k, dv)
                     self._json({"ok": True, "values": vals}); return
 
-                if path == "/api/quality":
+                if path == "/api/dim":
                     self._json({"ok": True,
-                                "quality": getattr(sched, "quality", "high")
-                                if sched else "high"}); return
+                                "dim": getattr(sched, "_dim", 0) if sched else 0}); return
 
                 self.send_error(404)
 
@@ -3754,17 +3734,17 @@ class WebUI(threading.Thread):
                             save_config(outer.cfg, cfg_path)
                         self._json({"ok": ok, "orientation": sched.orientation,
                                     "err": "" if ok else "冷却中"})
-                    elif self.path == "/api/quality":
+                    elif self.path == "/api/dim":
                         body = self._read_json()
-                        q = "fast" if str(body.get("quality", "")) == "fast" else "high"
-                        sched.set_quality(q)
+                        v = body.get("dim", 0)
+                        sched.set_dim(v)
                         disp = dcfg.get("display")
                         if not isinstance(disp, dict):
                             disp = {}
                             dcfg["display"] = disp
-                        disp["quality"] = q
+                        disp["dim"] = sched._dim
                         save_config(outer.cfg, cfg_path)
-                        self._json({"ok": True, "quality": q})
+                        self._json({"ok": True, "dim": sched._dim})
                     elif self.path == "/api/pages":
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])

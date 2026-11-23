@@ -515,7 +515,7 @@ class SerialTransport:
                 log.debug("读设备存档失败: %s", e)
             return None
 
-    def devcfg_write(self, dim, orient, reverse, flags=0, timeout=1.5):
+    def devcfg_write(self, dim, orient, reverse, flags=0, timeout=3.0):
         """把配置写进设备 NOR；成功返回 True。擦除+编程约 20 ms，别和发帧抢串口。"""
         with self._lock:
             if not self._connected or not self._ser:
@@ -1367,6 +1367,9 @@ class Scheduler(threading.Thread):
         self._save_timer = None
         self._save_timer_lock = threading.Lock()
         self._devcfg_dirty = False        # 设备 NOR 存档待写
+        self._devcfg_ack = None           # 等设备回执的 Event（写设置时用）
+        self._devcfg_ack_ok = False       # 最近一次写设备是否成功
+        self._devcfg_pause_until = 0.0    # 这段时间内不发帧，好让设备安心写 NOR
 
         self.orientation = config.get("orientation", LANDSCAPE)
         self.reverse = bool(config.get("reverse", False))
@@ -1678,6 +1681,26 @@ class Scheduler(threading.Thread):
             self._switch.set()
             self._force_send = True
 
+    def stage_devcfg(self):
+        """申请一次“写设备存档”，返回一个 Event；设备真写完（成功或失败）才会被 set。
+
+        顺便把发帧暂停 0.9 秒：写 NOR 要二三十毫秒，必须等链路安静，否则会和
+        像素流抢主循环。界面在这段时间里锁住相关控件。
+        """
+        ev = threading.Event()
+        self._devcfg_ack = ev
+        self._devcfg_dirty = True
+        self._devcfg_pause_until = time.monotonic() + 0.9
+        return ev
+
+    def _devcfg_finish(self, ok):
+        """设备已经给出结论：唤醒等待的请求线程。"""
+        self._devcfg_ack_ok = bool(ok)
+        ev = self._devcfg_ack
+        self._devcfg_ack = None
+        if ev is not None:
+            ev.set()
+
     def _flush_devcfg(self):
         """把当前配置写进设备 NOR。只在主循环的空档调用——绝不能和发帧抢串口。"""
         ok = False
@@ -1691,11 +1714,13 @@ class Scheduler(threading.Thread):
             log.warning("写设备存档异常: %s", e)
         self._devcfg_dirty = False
         if ok:
-            log.info("亮度 %d%% 朝向 %s 翻转 %s",
+            log.info("亮度 %d%% 朝向 %s 翻转 %s 调试 %s",
                      100 - self._dim, self.orientation,
-                     "开" if self.reverse else "关")
+                     "开" if self.reverse else "关",
+                     "开" if self._debug else "关")
         else:
             log.warning("设备存档写入失败（下次改设置时会重试）")
+        self._devcfg_finish(ok)
 
     def find_widget(self, name):
         for w in self._widgets:
@@ -2215,6 +2240,12 @@ class Scheduler(threading.Thread):
                 # 25 KB 的高清整帧必须让它在两帧之间排空，否则帧中间断流
                 # 会留下半帧像素，表现为错位花屏。
                 if self._send_gap > 0.0 and mono - self._last_frame_mono < self._send_gap:
+                    need_render = False
+                    need_bg = False
+                    need_heartbeat = False
+
+                # 正在把设置写进设备 NOR：先别推帧，给设备一个安静的空档
+                if mono < self._devcfg_pause_until:
                     need_render = False
                     need_bg = False
                     need_heartbeat = False
@@ -2745,8 +2776,8 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <h2>显示控制</h2>
   <button onclick="post('/api/prev')">上一页</button>
   <button onclick="post('/api/next')">下一页</button>
-  <button id="btn-orient" onclick="post('/api/orientation')">切换朝向</button>
-  <button id="btn-rev" onclick="post('/api/reverse')">上下翻转</button>
+  <button id="btn-orient" onclick="applyOrient()">切换方向</button>
+  <button id="btn-rev" onclick="applyReverse()">上下反转</button>
   <span class="msg" id="msg-display"></span>
   <div style="margin-top:8px;font-size:13px">
     <label>亮度
@@ -2773,10 +2804,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       </select>
     </label>
     <span class="tiny" id="dim-hint">100% = 原亮度（整屏压暗，插件和背景一起生效）；设备会记住这个值。</span>
-  </div>
-  <div style="margin-top:8px;font-size:13px">
-    <label><input type="checkbox" id="disp-debug" onchange="applyDebug()"> 调试模式</label>
-    <span class="tiny">在屏上画联机点和完整性角标，调试用；设备会记住这个开关。</span>
   </div>
 </div>
 
@@ -2889,6 +2916,15 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <div class="tiny" id="metrics-line"></div>
   <div class="tiny" id="ext-line" style="color:#c0392b"></div>
   <pre id="status">加载中...</pre>
+</div>
+
+<div class="card">
+  <h2>设备</h2>
+  <div style="font-size:13px">
+    <label><input type="checkbox" id="disp-debug" onchange="applyDebug()"> 调试模式</label>
+    <span class="msg" id="msg-debug"></span>
+    <span class="tiny">在屏上画联机点和完整性角标，仅排查用；开关记在设备里，不接上位机也有效。</span>
+  </div>
 </div>
 
 <div class="card shutdown-card">
@@ -3034,20 +3070,82 @@ async function loadDim() {
   } catch(e) {}
 }
 
+/* 写设备 NOR 的四个控件：动一个就把四个全锁住，等设备回执再放开。
+ * 写一次 NOR 要二三十毫秒，期间设备不服务串口，所以这段时间也不推帧。 */
+const DEV_LOCK_IDS = ['disp-dim', 'btn-orient', 'btn-rev', 'disp-debug'];
+let devBusy = false;
+
+function lockDev(text) {
+  devBusy = true;
+  for (const id of DEV_LOCK_IDS) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = true;
+  }
+  if (text) setMsg('msg-display', text, false);
+}
+
+function unlockDev() {
+  devBusy = false;
+  for (const id of DEV_LOCK_IDS) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = false;
+  }
+}
+
+function devResult(j, okText, where) {
+  const box = where || 'msg-display';
+  if (!j || j.ok === false) {
+    setMsg(box, (j && j.err) || '设置失败', true);
+    return;
+  }
+  if (j.stored === false) {
+    setMsg(box, '设备没有确认（可能没连设备）', true);
+    return;
+  }
+  setMsg(box, okText, false);
+}
+
 async function applyDim() {
   const el = document.getElementById('disp-dim');
-  if (!el) return;
+  if (!el || devBusy) return;
   const bright = parseInt(el.value, 10);
   const dim = isNaN(bright) ? 0 : Math.max(0, Math.min(90, 100 - bright));
+  lockDev('正在写入设备…');
   try {
     const j = await postJSON('/api/dim', { dim: dim });
-    if (j.ok) {
-      setMsg('msg-display', '亮度 ' + (100 - j.dim) + '%', false);
-    } else {
-      setMsg('msg-display', j.err || '设置失败', true);
-    }
+    devResult(j, '亮度 ' + (100 - j.dim) + '%');
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
+  } finally {
+    unlockDev();
+  }
+}
+
+async function applyOrient() {
+  if (devBusy) return;
+  lockDev('正在写入设备…');
+  try {
+    const j = await postJSON('/api/orientation', {});
+    devResult(j, '方向已切换');
+    loadStatus();
+  } catch(e) {
+    setMsg('msg-display', '失败: ' + e, true);
+  } finally {
+    unlockDev();
+  }
+}
+
+async function applyReverse() {
+  if (devBusy) return;
+  lockDev('正在写入设备…');
+  try {
+    const j = await postJSON('/api/reverse', {});
+    devResult(j, '已翻转');
+    loadStatus();
+  } catch(e) {
+    setMsg('msg-display', '失败: ' + e, true);
+  } finally {
+    unlockDev();
   }
 }
 
@@ -3061,13 +3159,16 @@ async function loadDebug() {
 
 async function applyDebug() {
   const el = document.getElementById('disp-debug');
-  if (!el) return;
+  if (!el || devBusy) return;
+  lockDev('');
+  setMsg('msg-debug', '正在写入设备…', false);
   try {
     const j = await postJSON('/api/debug', { on: el.checked });
-    if (j.ok) setMsg('msg-display', el.checked ? '调试模式已开' : '调试模式已关', false);
-    else setMsg('msg-display', j.err || '设置失败', true);
+    devResult(j, el.checked ? '调试模式已开' : '调试模式已关', 'msg-debug');
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
+  } finally {
+    unlockDev();
   }
 }
 
@@ -4214,22 +4315,29 @@ class WebUI(threading.Thread):
                         ok = sched.notify(text, secs)
                         self._json({"ok": ok, "err": "" if ok else "内容为空"})
                     elif self.path == "/api/reverse":
+                        ev = sched.stage_devcfg()
                         ok = sched.toggle_reverse()
                         if ok:
                             dcfg["reverse"] = sched.reverse
                             save_config(outer.cfg, cfg_path)
+                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": ok, "reverse": sched.reverse,
+                                    "stored": stored,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/orientation":
+                        ev = sched.stage_devcfg()
                         ok = sched.toggle_orientation()
                         if ok:
                             dcfg["orientation"] = sched.orientation
                             save_config(outer.cfg, cfg_path)
+                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": ok, "orientation": sched.orientation,
+                                    "stored": stored,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/dim":
                         body = self._read_json()
                         v = body.get("dim", 0)
+                        ev = sched.stage_devcfg()
                         sched.set_dim(v)
                         disp = dcfg.get("display")
                         if not isinstance(disp, dict):
@@ -4237,13 +4345,17 @@ class WebUI(threading.Thread):
                             dcfg["display"] = disp
                         disp["dim"] = sched._dim
                         save_config_soon(outer.cfg, cfg_path)   # 连续改时合并写盘
-                        self._json({"ok": True, "dim": sched._dim})
+                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
+                        self._json({"ok": True, "dim": sched._dim, "stored": stored})
                     elif self.path == "/api/debug":
                         body = self._read_json()
+                        ev = sched.stage_devcfg()
                         ok = sched.set_debug(bool(body.get("on")))
                         dcfg["debug"] = bool(getattr(sched, "_debug", False))
                         save_config_soon(outer.cfg, cfg_path)
+                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": ok, "on": bool(getattr(sched, "_debug", False)),
+                                    "stored": stored,
                                     "err": "" if ok else "设备没有回应"})
                     elif self.path == "/api/pages":
                         body = self._read_json()

@@ -1611,7 +1611,7 @@ class Scheduler(threading.Thread):
         if dim != self._dim:
             self._dim = dim
             self.config.setdefault("display", {})["dim"] = dim
-            log.info("从设备恢复暗化: %d%%", dim)
+            log.info("从设备恢复伪亮度: %d%%", 100 - dim)
         orient = PORTRAIT if info["orient"] else LANDSCAPE
         if orient != self.orientation:
             self.orientation = orient
@@ -1735,7 +1735,7 @@ class Scheduler(threading.Thread):
         return True
 
     def set_dim(self, value):
-        """整屏暗化 0-90：作用在最终合成帧上，等于一个假亮度旋钮。"""
+        """伪亮度：内部存的是压暗量 0-90，作用在最终合成帧上；100% = 不压暗。"""
         v = _coerce_int(value, self._dim, 0, 90)
         if v == self._dim:
             return True
@@ -1744,7 +1744,7 @@ class Scheduler(threading.Thread):
         self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
         self._devcfg_dirty = True        # 亮度也记到设备里
         self._force_send = True
-        log.info("暗化 -> %d%%", v)
+        log.info("伪亮度 -> %d%%", 100 - v)
         return True
 
     def toggle_lock(self, from_touch=False):
@@ -2005,6 +2005,20 @@ class Scheduler(threading.Thread):
         except Exception as e:
             log.exception("执行触摸动作 %s/%s 失败: %s", gesture, action, e)
 
+    def _run_with_notify(self, func, ok_text, fail_text, *args):
+        """后台跑一个电脑侧动作，完了在屏上回一句结果。"""
+        def run():
+            try:
+                ok = bool(func(*args))
+            except Exception as e:
+                log.warning("%s 异常: %s", fail_text, e)
+                ok = False
+            try:
+                self.notify(ok_text if ok else fail_text, 1.2)
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
     def _exec_action(self, action, macro="", program="", from_touch=False):
         if action == "next_page":
             self.next_page(from_touch=from_touch)
@@ -2019,35 +2033,25 @@ class Scheduler(threading.Thread):
         elif action == "screenshot":
             threading.Thread(target=_act_screenshot, daemon=True).start()
         elif action == "mute_toggle":
-            threading.Thread(target=_act_mute_toggle, daemon=True).start()
+            self._run_with_notify(_act_mute_toggle, "静音状态已切换", "静音切换失败")
         elif action == "macro":
-            threading.Thread(target=_act_send_macro, args=(macro,),
-                             daemon=True).start()
+            self._run_with_notify(_act_send_macro, "已发送键盘宏", "键盘宏发送失败",
+                                  macro)
         elif action == "launch":
-            threading.Thread(target=_act_launch_program, args=(program,),
-                             daemon=True).start()
+            self._run_with_notify(_act_launch_program, "已启动程序", "启动程序失败",
+                                  program)
         elif action == "shutdown":
             log.info("触摸触发关闭程序")
+            self.notify("正在关闭程序…", 2.0)
             if callable(self._on_shutdown):
                 self._on_shutdown()
-        elif action == "dim_down":
-            self.set_dim(max(0, self._dim - 15))
-            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
         elif action == "dim_up":
+            # 提高亮度 = 减少压暗量
+            self.set_dim(max(0, self._dim - 15))
+            self.notify("伪亮度 %d%%" % (100 - self._dim), 1.0)
+        elif action == "dim_down":
             self.set_dim(min(90, self._dim + 15))
-            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
-        elif action == "dim_cycle":
-            steps = [0, 30, 60, 90]
-            nxt = next((x for x in steps if x > self._dim), steps[0])
-            self.set_dim(nxt)
-            self.notify("亮度 %d%%" % (100 - nxt), 1.0)
-        elif action == "blank":
-            size = PORTRAIT_SIZE if self.orientation == PORTRAIT else LANDSCAPE_SIZE
-            self._overlay = Image.new("RGBA", size, (0, 0, 0, 255))
-            self._overlay_until = time.monotonic() + 5.0
-            self._overlay_seen = None
-            self._force_send = True
-            log.info("屏幕已清空 5 秒")
+            self.notify("伪亮度 %d%%" % (100 - self._dim), 1.0)
         else:
             log.warning("未知触摸动作: %s", action)
 
@@ -2256,8 +2260,8 @@ _CONFIG_LOCK = threading.RLock()
 
 _TOUCH_ACTIONS = ("passthrough", "next_page", "prev_page", "flip",
                   "toggle_orientation", "lock", "screenshot",
-                  "mute_toggle", "macro", "launch", "shutdown", "blank",
-                  "dim_down", "dim_up", "dim_cycle")
+                  "mute_toggle", "macro", "launch", "shutdown",
+                  "dim_down", "dim_up")
 
 _TOUCH_DEFAULTS = {
     "single": "passthrough",
@@ -2689,13 +2693,13 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <button id="btn-rev" onclick="post('/api/reverse')">上下翻转</button>
   <span class="msg" id="msg-display"></span>
   <div style="margin-top:8px;font-size:13px">
-    <label>暗化（伪亮度）
-      <input type="range" id="disp-dim" min="0" max="90" step="5" value="0"
+    <label>伪亮度
+      <input type="range" id="disp-dim" min="10" max="100" step="5" value="100"
              oninput="setDimLabel()" onchange="applyDim()"
              style="width:170px;vertical-align:middle">
-      <span id="disp-dim-v" class="tiny">0%</span>
+      <span id="disp-dim-v" class="tiny">100%</span>
     </label>
-    <span class="tiny" id="dim-hint">整屏压暗，插件和背景一起生效；0% = 原亮度。</span>
+    <span class="tiny" id="dim-hint">100% = 原亮度；往左调越暗（整屏压暗，插件和背景一起生效）。</span>
   </div>
 </div>
 
@@ -2838,29 +2842,34 @@ let configWidgetName = '';
 let currentWidgetName = '';
 
 const TOUCH_ACTIONS = [
-  ["passthrough", "未定义（透传给插件）"],
-  ["next_page", "下一页"],
-  ["prev_page", "上一页"],
-  ["flip", "上下翻转"],
-  ["toggle_orientation", "横竖屏切换"],
-  ["lock", "锁定/解锁当前页"],
-  ["screenshot", "截屏"],
-  ["mute_toggle", "静音 / 解除"],
-  ["macro", "自定义键盘宏"],
-  ["launch", "自定义程序"],
-  ["shutdown", "关闭程序"],
-  ["blank", "熄屏 5 秒"],
-  ["dim_down", "亮度 -15%"],
-  ["dim_up", "亮度 +15%"],
-  ["dim_cycle", "亮度循环 0/30/60/90"],
+  ["passthrough", "未定义（透传给插件）", "通用"],
+  ["next_page", "下一页", "小屏"],
+  ["prev_page", "上一页", "小屏"],
+  ["flip", "上下翻转", "小屏"],
+  ["toggle_orientation", "横竖屏切换", "小屏"],
+  ["lock", "锁定/解锁当前页", "小屏"],
+  ["dim_up", "伪亮度 +15%（屏幕更亮）", "小屏"],
+  ["dim_down", "伪亮度 -15%（屏幕更暗）", "小屏"],
+  ["screenshot", "截屏（宿主机）", "电脑"],
+  ["mute_toggle", "静音 / 解除（宿主机）", "电脑"],
+  ["macro", "自定义键盘宏（宿主机）", "电脑"],
+  ["launch", "启动自定义程序（宿主机）", "电脑"],
+  ["shutdown", "关闭程序（宿主机）", "电脑"],
 ];
 
 function fillTouchSelect(sel) {
   sel.innerHTML = '';
-  TOUCH_ACTIONS.forEach(([v, l]) => {
+  let group = null, last = null;
+  TOUCH_ACTIONS.forEach(([v, l, g]) => {
+    if (g !== last) {
+      group = document.createElement('optgroup');
+      group.label = g || '其他';
+      sel.appendChild(group);
+      last = g;
+    }
     const o = document.createElement('option');
     o.value = v; o.textContent = l;
-    sel.appendChild(o);
+    group.appendChild(o);
   });
 }
 
@@ -2943,7 +2952,7 @@ async function loadDim() {
     const j = await getJSON('/api/dim');
     const el = document.getElementById('disp-dim');
     if (el && document.activeElement !== el) {
-      el.value = j.dim || 0;
+      el.value = 100 - (j.dim || 0);
       setDimLabel();
     }
   } catch(e) {}
@@ -2958,12 +2967,13 @@ function setDimLabel() {
 async function applyDim() {
   const el = document.getElementById('disp-dim');
   if (!el) return;
-  const v = parseInt(el.value, 10);
+  const bright = parseInt(el.value, 10);
+  const dim = isNaN(bright) ? 0 : Math.max(0, Math.min(90, 100 - bright));
   try {
-    const j = await postJSON('/api/dim', { dim: isNaN(v) ? 0 : v });
+    const j = await postJSON('/api/dim', { dim: dim });
     if (j.ok) {
       setDimLabel();
-      setMsg('msg-display', '暗化 ' + j.dim + '%', false);
+      setMsg('msg-display', '伪亮度 ' + (100 - j.dim) + '%', false);
     } else {
       setMsg('msg-display', j.err || '设置失败', true);
     }

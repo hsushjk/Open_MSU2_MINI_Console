@@ -178,9 +178,41 @@ class MiniProtocol:
     def devcfg_clear():
         return MiniProtocol._frame(0x09, 0x03, 0, 0, 0, 0)
 
+    # --- 资产（v32+）：开机/待机画面存在板载 NOR，class 0x0A ---
+    ASSET_BOOT = 0x00
+    ASSET_STANDBY = 0x01
+
     @staticmethod
-    def set_debug(on):
-        return MiniProtocol._frame(0x00, 0x5A, 1 if on else 0, 0, 0, 0)
+    def asset_info():
+        return MiniProtocol._frame(0x0A, 0x00, 0, 0, 0, 0)
+
+    @staticmethod
+    def asset_begin(kind, slot, length):
+        return MiniProtocol._frame(0x0A, 0x01, kind, slot,
+                                   (length >> 8) & 0xFF, length & 0xFF)
+
+    @staticmethod
+    def asset_commit(crc32):
+        return MiniProtocol._frame(0x0A, 0x03,
+                                   (crc32 >> 24) & 0xFF, (crc32 >> 16) & 0xFF,
+                                   (crc32 >> 8) & 0xFF, crc32 & 0xFF)
+
+    @staticmethod
+    def asset_abort():
+        return MiniProtocol._frame(0x0A, 0x02, 0, 0, 0, 0)
+
+    @staticmethod
+    def asset_draw(kind, slot):
+        return MiniProtocol._frame(0x0A, 0x04, kind, slot, 0, 0)
+
+    @staticmethod
+    def asset_erase(kind, slot):
+        return MiniProtocol._frame(0x0A, 0x05, kind, slot, 0, 0)
+
+    @staticmethod
+    def asset_settings(boot_mode, standby_mode, count, dwell):
+        return MiniProtocol._frame(0x0A, 0x06, boot_mode, standby_mode,
+                                   count, dwell)
 
     @staticmethod
     def lcd_set_xy(x, y):
@@ -402,6 +434,90 @@ class SerialTransport:
             except Exception:
                 self._connected = False; self._handshaked = False
                 return False
+
+    def asset_info(self, timeout=1.5):
+        """查设备上的资产：开机图是否有效、待机图哪几槽有效、当前设置。"""
+        self.reset_input_buffer()
+        self.write(MiniProtocol.asset_info())
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < deadline:
+            chunk = self._ser.read(64) if self._ser else b""
+            if chunk:
+                buf += chunk
+                idx = buf.find(b"\x0a\x00")
+                while idx >= 0 and len(buf) - idx >= 12:
+                    frame = buf[idx:idx + 12]
+                    if frame[11] == 0xAA:
+                        return {
+                            "boot_valid": bool(frame[2]),
+                            "standby_mask": frame[3],
+                            "boot_mode": frame[4],
+                            "standby_mode": frame[5],
+                            "count": frame[6],
+                            "dwell": (frame[7] << 8) | frame[8],
+                            "fw": frame[9],
+                        }
+                    buf = buf[idx + 1:]
+                    idx = buf.find(b"\x0a\x00")
+            else:
+                time.sleep(0.01)
+        return None
+
+    def asset_write(self, kind, slot, payload, chunk=1024, gap=0.008,
+                    timeout=8.0):
+        """把一张 160x80 RGB565 图写进指定槽：begin -> 流式写 -> commit(crc)。"""
+        import zlib
+
+        payload = bytes(payload)
+        if len(payload) != 160 * 80 * 2:
+            raise ValueError("payload must be 160x80 RGB565")
+
+
+        self.reset_input_buffer()
+        self.write(MiniProtocol.asset_begin(kind, slot, len(payload)))
+        ack = self._wait_byte(timeout)
+        if ack != 0x06:
+            return False, "begin 失败（%r）" % (ack,)
+
+        for i in range(0, len(payload), chunk):
+            self.write(payload[i:i + chunk])
+            if gap:
+                time.sleep(gap)
+
+        self.write(MiniProtocol.asset_commit(zlib.crc32(payload) & 0xFFFFFFFF))
+        ack = self._wait_byte(timeout)
+        return (ack == 0x06), ("ok" if ack == 0x06 else "commit 失败（%r）" % (ack,))
+
+    def _wait_byte(self, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._ser is None:
+                return None
+            chunk = self._ser.read(1)
+            if chunk:
+                return chunk[0]
+            time.sleep(0.005)
+        return None
+
+    def asset_draw(self, kind, slot, timeout=3.0):
+        self.reset_input_buffer()
+        self.write(MiniProtocol.asset_draw(kind, slot))
+        ack = self._wait_byte(timeout)
+        return ack == 0x06
+
+    def asset_erase(self, kind, slot, timeout=3.0):
+        self.reset_input_buffer()
+        self.write(MiniProtocol.asset_erase(kind, slot))
+        ack = self._wait_byte(timeout)
+        return ack == 0x06
+
+    def asset_settings(self, boot_mode, standby_mode, count, dwell, timeout=4.0):
+        self.reset_input_buffer()
+        self.write(MiniProtocol.asset_settings(boot_mode, standby_mode,
+                                               count, dwell))
+        ack = self._wait_byte(timeout)
+        return ack == 0x06
 
     def wait_idle(self, timeout=0.8):
         """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
@@ -986,6 +1102,22 @@ class MiniDevice:
 
     def set_debug(self, on):
         return self.transport.set_debug(on)
+
+    def asset_info(self):
+        return self.transport.asset_info()
+
+    def asset_write(self, kind, slot, payload):
+        return self.transport.asset_write(kind, slot, payload)
+
+    def asset_draw(self, kind, slot):
+        return self.transport.asset_draw(kind, slot)
+
+    def asset_erase(self, kind, slot):
+        return self.transport.asset_erase(kind, slot)
+
+    def asset_settings(self, boot_mode, standby_mode, count, dwell):
+        return self.transport.asset_settings(boot_mode, standby_mode,
+                                             count, dwell)
 
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
@@ -1646,6 +1778,46 @@ class Scheduler(threading.Thread):
         self._devcfg_dirty = False
         self._debug = False
         return
+
+    # ---------- 开机 / 待机画面（存在设备 NOR 里） ----------
+    @staticmethod
+    def encode_asset_image(path):
+        """把任意图片转成 160x80 RGB565 小端字节（铺满，不保持比例）。"""
+        from PIL import Image
+
+        img = Image.open(path).convert("RGB").resize(
+            (SCREEN_W, SCREEN_H), Image.LANCZOS)
+        out = bytearray()
+        px = img.load()
+        for y in range(SCREEN_H):
+            for x in range(SCREEN_W):
+                r, g, b = px[x, y]
+                v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+                out.append(v & 0xFF)
+                out.append((v >> 8) & 0xFF)
+        return bytes(out)
+
+    def upload_asset(self, kind, slot, path):
+        """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。"""
+        payload = self.encode_asset_image(path)
+        self._devcfg_pause_until = time.monotonic() + 12.0
+        lock = getattr(self.device.transport, "_lock", None)
+        try:
+            if lock is not None:
+                lock.acquire()
+            ok, why = self.device.asset_write(kind, slot, payload)
+        finally:
+            if lock is not None:
+                lock.release()
+        self._devcfg_pause_until = 0.0
+        if ok:
+            self._force_send = True
+            if kind == MiniProtocol.ASSET_STANDBY:
+                try:
+                    self.device.asset_draw(kind, slot)
+                except Exception:
+                    pass
+        return ok, why
 
     def stage_devcfg(self):
         import threading
@@ -2875,9 +3047,57 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 </div>
 
 <div class="card">
-  <h2>设备</h2>
-  <div style="font-size:13px">
-    <span class="tiny">在屏上画联机点和完整性角标，仅排查用；只在本届会话有效，断电重开自动关闭。</span>
+  <h2>开机 / 待机画面</h2>
+  <div class="tiny" style="color:#666">
+    图片存在设备板载 NOR 里，不连上位机也生效；会自动铺满 160×80（不保持比例）。
+  </div>
+  <div style="margin-top:6px">
+    <label style="font-size:12px;color:#666">开机画面
+      <select id="asset-boot">
+        <option value="0">不画</option>
+        <option value="1">显示 NOR 里的图片</option>
+      </select>
+    </label>
+  </div>
+  <div style="margin-top:4px">
+    <input type="text" id="asset-boot-path" placeholder="开机图路径（png / jpg）" style="width:20em">
+    <button onclick="uploadAsset(0, 0)">写入设备</button>
+    <button onclick="drawAsset(0, 0)">预览</button>
+    <span class="msg" id="msg-asset-boot"></span>
+  </div>
+  <div style="margin-top:10px">
+    <label style="font-size:12px;color:#666">待机画面
+      <select id="asset-standby">
+        <option value="0">黑屏</option>
+        <option value="1">四角方块（白黄闪）</option>
+        <option value="2">图片轮播</option>
+      </select>
+    </label>
+    <label style="font-size:12px;color:#666;margin-left:12px">张数
+      <input type="number" id="asset-count" min="1" max="8" value="1" style="width:3.5em">
+    </label>
+    <label style="font-size:12px;color:#666;margin-left:12px">每张
+      <input type="number" id="asset-dwell" min="1" max="60" value="3" style="width:3.5em"> 秒
+    </label>
+  </div>
+  <div style="margin-top:4px">
+    第
+    <select id="asset-slot">
+      <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+      <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+      <option value="7">7</option><option value="8">8</option>
+    </select>
+    张
+    <input type="text" id="asset-standby-path" placeholder="待机图路径" style="width:18em">
+    <button onclick="uploadStandby()">写入设备</button>
+    <button onclick="eraseStandby()">擦除这张</button>
+    <span class="msg" id="msg-asset-standby"></span>
+  </div>
+  <div style="margin-top:6px">
+    <button onclick="saveAssetSettings()">保存设置</button>
+    <button onclick="refreshAsset()">刷新</button>
+    <span class="msg" id="msg-asset"></span>
+    <div class="tiny" id="asset-state" style="margin-top:4px"></div>
   </div>
 </div>
 
@@ -3713,6 +3933,64 @@ async function toggleBackground() {
   setTimeout(refresh, 250);
 }
 
+function assetSlotIndex() {
+  return (parseInt(document.getElementById('asset-slot').value || '1', 10) || 1) - 1;
+}
+
+async function refreshAsset() {
+  const j = await getJSON('/api/asset');
+  if (!j || !j.ok) { setMsg('msg-asset', '读取失败', true); return; }
+  document.getElementById('asset-boot').value = String(j.boot_mode || 0);
+  document.getElementById('asset-standby').value = String(j.standby_mode);
+  document.getElementById('asset-count').value = String(j.count || 1);
+  document.getElementById('asset-dwell').value = String(j.dwell || 3);
+  const d = j.device;
+  if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
+  const slots = [];
+  for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
+  document.getElementById('asset-state').textContent =
+    '设备上：开机图 ' + (d.boot_valid ? '有' : '无') +
+    '；待机图 ' + (slots.length ? ('第 ' + slots.join('/') + ' 张') : '无') +
+    '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
+}
+
+async function saveAssetSettings() {
+  const body = {
+    boot_mode: parseInt(document.getElementById('asset-boot').value, 10) || 0,
+    standby_mode: parseInt(document.getElementById('asset-standby').value, 10),
+    count: parseInt(document.getElementById('asset-count').value, 10) || 1,
+    dwell: parseInt(document.getElementById('asset-dwell').value, 10) || 3,
+  };
+  const j = await postJSON('/api/asset/settings', body);
+  setMsg('msg-asset', j && j.ok ? '已保存到设备' : ('失败：' + ((j && j.err) || '设备没有确认')), !(j && j.ok));
+  if (j && j.ok) refreshAsset();
+}
+
+async function uploadAsset(kind, slot) {
+  const id = kind ? 'asset-standby-path' : 'asset-boot-path';
+  const msg = kind ? 'msg-asset-standby' : 'msg-asset-boot';
+  const path = (document.getElementById(id).value || '').trim();
+  if (!path) { setMsg(msg, '先填图片路径', true); return; }
+  setMsg(msg, '正在写入设备…', false);
+  const j = await postJSON('/api/asset/upload', { kind: kind, slot: slot, path: path });
+  setMsg(msg, j && j.ok ? '已写入' : ('失败：' + ((j && j.err) || '未知错误')), !(j && j.ok));
+  if (j && j.ok) refreshAsset();
+}
+
+function uploadStandby() { uploadAsset(1, assetSlotIndex()); }
+
+async function drawAsset(kind, slot) {
+  const j = await postJSON('/api/asset/draw', { kind: kind, slot: slot });
+  setMsg(kind ? 'msg-asset-standby' : 'msg-asset-boot',
+         j && j.ok ? '已显示' : ('失败：' + ((j && j.err) || '没有这张图')), !(j && j.ok));
+}
+
+async function eraseStandby() {
+  const j = await postJSON('/api/asset/erase', { kind: 1, slot: assetSlotIndex() });
+  setMsg('msg-asset-standby', j && j.ok ? '已擦除' : '擦除失败', !(j && j.ok));
+  refreshAsset();
+}
+
 async function shutdownApp() {
   if (!confirm('确定要关闭 MSU2_MINI 上位机吗？\n关闭后需要重新启动才能继续使用。')) {
     return;
@@ -3746,7 +4024,7 @@ async function shutdownApp() {
 }
 
 loadTouch();
-loadDim();
+loadDim(); refreshAsset();
 loadDevices();
 setBgSource();
 loadPages();
@@ -4204,6 +4482,21 @@ class WebUI(threading.Thread):
                     self._json({"ok": True,
                                 "on": bool(getattr(sched, "_debug", False)) if sched else False}); return
 
+                if path == "/api/asset":
+                    info = None
+                    if sched is not None:
+                        try:
+                            info = sched.device.asset_info()
+                        except Exception:
+                            info = None
+                    acfg = dcfg.get("asset") or {}
+                    self._json({"ok": True, "device": info,
+                                "boot_mode": int(acfg.get("boot_mode", 0)),
+                                "standby_mode": int(acfg.get("standby_mode", 1)),
+                                "count": int(acfg.get("count", 1)),
+                                "dwell": int(acfg.get("dwell", 3))})
+                    return
+
                 self.send_error(404)
 
             def do_POST(self):
@@ -4282,6 +4575,46 @@ class WebUI(threading.Thread):
                         dcfg["pages"] = applied
                         save_config(outer.cfg, cfg_path)
                         self._json({"ok": True, "pages": applied, "err": ""})
+                    elif self.path == "/api/asset/upload":
+                        body = self._read_json()
+                        kind = int(body.get("kind", 0))
+                        slot = int(body.get("slot", 0))
+                        path = str(body.get("path", "")).strip()
+                        if not path:
+                            self._json({"ok": False, "err": "图片路径是空的"})
+                        else:
+                            ok, why = sched.upload_asset(kind, slot, path)
+                            self._json({"ok": ok,
+                                        "err": "" if ok else "写入失败：%s" % why})
+                    elif self.path == "/api/asset/settings":
+                        body = self._read_json()
+                        boot_mode = int(body.get("boot_mode", 0))
+                        standby_mode = int(body.get("standby_mode", 1))
+                        count = int(body.get("count", 1))
+                        dwell = int(body.get("dwell", 3))
+                        ok = sched.device.asset_settings(boot_mode, standby_mode,
+                                                         count, dwell)
+                        if ok:
+                            acfg = dcfg.get("asset")
+                            if not isinstance(acfg, dict):
+                                acfg = {}
+                                dcfg["asset"] = acfg
+                            acfg.update({"boot_mode": boot_mode,
+                                         "standby_mode": standby_mode,
+                                         "count": count, "dwell": dwell})
+                            save_config_soon(outer.cfg, cfg_path)
+                        self._json({"ok": ok,
+                                    "err": "" if ok else "设备没有确认"})
+                    elif self.path == "/api/asset/draw":
+                        body = self._read_json()
+                        ok = sched.device.asset_draw(int(body.get("kind", 0)),
+                                                     int(body.get("slot", 0)))
+                        self._json({"ok": ok, "err": "" if ok else "这张图不存在"})
+                    elif self.path == "/api/asset/erase":
+                        body = self._read_json()
+                        ok = sched.device.asset_erase(int(body.get("kind", 0)),
+                                                      int(body.get("slot", 0)))
+                        self._json({"ok": ok, "err": "" if ok else "擦除失败"})
                     elif self.path == "/api/background":
                         body = self._read_json()
                         enabled = bool(body.get("enabled", False))

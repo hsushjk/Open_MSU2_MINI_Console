@@ -355,7 +355,7 @@ class SerialTransport:
                 while time.monotonic() - t0 < timeout:
                     n = self._ser.in_waiting
                     if n:
-                        if b"\x06" in self._ser.read(n):
+                        if b"\x07" in self._ser.read(n):
                             # 栅栏发了 3 个，设备会回 3 个 0x06；剩下的如果留在
                             # 缓冲里，下一帧读回执时会被当成“这帧收齐了”。
                             time.sleep(0.02)
@@ -793,6 +793,7 @@ class MiniDevice:
             self.encoder.reset()
             self._verify_acks = None          # 重新连上就重新相信设备
             self._ack_fails = 0
+            self._zero_acks = 0
         return ok
 
     def close(self):  self.transport.close()
@@ -823,7 +824,12 @@ class MiniDevice:
             return True
         # 整帧一次写：分段写会让别的线程（触摸轮询）把请求字节插进帧中间，
         # 设备按“上一段的剩余字节数”消费，从此整条流错位。
-        ok = self.transport.write(frame)
+        payload = frame
+        if getattr(self.transport, "raw_mode", False):
+            # 每帧开头先发同步栅栏：万一上一帧把设备留在“等像素”里，设备看到
+            # 栅栏会立刻作废半开的流、回到命令模式，这一帧就不会被吃掉开头。
+            payload = SYNC_FENCE + bytes(frame)
+        ok = self.transport.write(payload)
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
             # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。
@@ -837,7 +843,8 @@ class MiniDevice:
         fw = getattr(self.transport, "fw_version", None)
         verify = getattr(self, "_verify_acks", None)
         if verify is None:
-            verify = bool(fw and fw >= (13, 0))
+            raw = bool(getattr(self.transport, "raw_mode", False))
+            verify = bool(raw and (fw is None or fw >= (13, 0)))
             self._verify_acks = verify
         if verify:
             # 每个收流命令设备都回一个裁决字节：数目对不上或出现 0x15，
@@ -850,11 +857,15 @@ class MiniDevice:
                 if self._ack_fails in (3, 30):
                     log.warning("设备连续 %d 帧没有回执：可能卡死了，请拔插一次 USB",
                                 self._ack_fails)
-                if self._ack_fails >= 5:
-                    # 设备已经彻底不听了：再逐帧等回执只会让界面卡死，
-                    # 关掉校验把控制权交回给用户（拔插后自动恢复）。
-                    self._verify_acks = False
-                    log.error("停止逐帧校验：设备没有回执，请拔插一次 USB")
+                if got == 0:
+                    self._zero_acks = int(getattr(self, "_zero_acks", 0)) + 1
+                    if self._zero_acks >= 3 and not (fw and fw >= (13, 0)):
+                        # 老固件根本不回裁决字，每帧白等 0.4 s 会把界面拖成
+                        # 幻灯片；关掉校验，但栅栏前缀照发，照样能把它拉回来。
+                        self._verify_acks = False
+                        log.info("设备不回裁决字（固件早于 v13），改为只发栅栏")
+                else:
+                    self._zero_acks = 0
                 # 有没有回执都先同步：设备可能停在“等像素”里，
                 # 只有栅栏能把它拉回命令模式，否则后面每一帧都白费。
                 self.transport.resync()

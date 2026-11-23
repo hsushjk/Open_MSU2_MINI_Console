@@ -266,6 +266,7 @@ class SerialTransport:
         self.bytes_written = 0
         self.version = ""
         self.raw_mode = False
+        self.last_status = None      # 调试模式下最近一帧的 11 字节详情（px/win/ms）
 
     def open(self):
         with self._lock:
@@ -374,9 +375,11 @@ class SerialTransport:
             if not self._connected or not self._ser:
                 return False
             try:
-                blob = END_FRAME * 420          # 2520 B，足够填掉任何 raw_left
+                # 设备卡在“等像素”时，命令会被当成像素吃掉。要把它喂饱只能灌
+                # 满一帧（整屏 25 600 像素 → 最多 25 600 字节帧头计数）。
+                blob = END_FRAME * 4300         # 25 800 B
                 self._ser.write(blob)
-                time.sleep(max(0.05, len(blob) / 100000.0))
+                time.sleep(max(0.08, len(blob) / 180000.0))
                 self._ser.reset_input_buffer()
                 return True
             except Exception:
@@ -413,7 +416,13 @@ class SerialTransport:
             return False
 
     def read_verdicts(self, count, timeout=0.4):
-        """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。"""
+        """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。
+
+        调试模式（`0x5A 01`）下设备对每个 0x09 回的是 11 字节详情帧
+        `55 done_lo done_hi drop px_lo px_hi win_lo win_hi ms_hi ms_lo AA`，
+        这里一并认下（当成“这帧收了”，并顺手把 px/win 记到 self.last_status），
+        否则会误判成“设备没回执”进而重连、断在半帧里。
+        """
         with self._lock:
             if not self._connected or not self._ser:
                 return False, 0
@@ -427,6 +436,25 @@ class SerialTransport:
                     buf.extend(self._ser.read(n))
                 while buf:
                     b = buf[0]
+                    if b == 0x55:
+                        if len(buf) < 11:
+                            break                     # 等详情帧收齐
+                        frame = bytes(buf[:11])
+                        if frame[10] != 0xAA:
+                            del buf[0]
+                            continue
+                        px = frame[4] | (frame[5] << 8)
+                        win = frame[6] | (frame[7] << 8)
+                        self.last_status = {
+                            "done": frame[1] | (frame[2] << 8),
+                            "drop": frame[3], "px": px, "win": win,
+                            "ms": frame[8] * 256 + frame[9],
+                        }
+                        if win and px != win:
+                            bad = True
+                        del buf[:11]
+                        got += 1
+                        continue
                     del buf[0]
                     if b == 0x06:
                         got += 1
@@ -1666,6 +1694,15 @@ class Scheduler(threading.Thread):
         self.orientation = PORTRAIT if info["orient"] else LANDSCAPE
         self.reverse = bool(info["reverse"])
         self._debug = bool((info.get("flags") or 0) & 1)
+        if self._debug:
+            # v36 及更早会把调试模式写进 NOR。调试模式下每个收流帧回的是 11 字节
+            # 详情帧而不是 1 字节裁决，老上位机会误判“没回执”，所以连上就关掉它。
+            log.info("设备存档里调试模式是开的，先关掉（排错开关不跨上电）")
+            self._debug = False
+            try:
+                self.device.set_debug(False)
+            except Exception:
+                pass
         self.config.setdefault("display", {})["dim"] = self._dim
         self.config.setdefault("display", {})["debug"] = self._debug
         self.config["orientation"] = self.orientation

@@ -2633,26 +2633,33 @@ async function loadDim() {
   try {
     const j = await getJSON('/api/dim');
     const el = document.getElementById('disp-dim');
-    if (el && document.activeElement !== el && j.dim !== undefined) {
-      el.value = j.dim;
+    if (el && document.activeElement !== el) {
+      el.value = j.dim || 0;
       setDimLabel();
     }
   } catch(e) {}
 }
 
 function setDimLabel() {
-  const v = document.getElementById('disp-dim').value;
-  document.getElementById('disp-dim-v').textContent = v + '%';
+  const el = document.getElementById('disp-dim');
+  const lab = document.getElementById('disp-dim-v');
+  if (el && lab) lab.textContent = el.value + '%';
 }
 
 async function applyDim() {
-  setDimLabel();
-  const v = parseInt(document.getElementById('disp-dim').value, 10);
+  const el = document.getElementById('disp-dim');
+  if (!el) return;
+  const v = parseInt(el.value, 10);
   try {
-    const j = await postJSON('/api/dim', { dim: v });
-    if (!j.ok) setMsg('msg-display', j.err || '设置失败', true);
+    const j = await postJSON('/api/dim', { dim: isNaN(v) ? 0 : v });
+    if (j.ok) {
+      setDimLabel();
+      setMsg('msg-display', '暗化 ' + j.dim + '%', false);
+    } else {
+      setMsg('msg-display', j.err || '设置失败', true);
+    }
   } catch(e) {
-    setMsg('msg-display', '错误: ' + e, true);
+    setMsg('msg-display', '失败: ' + e, true);
   }
 }
 
@@ -2720,9 +2727,10 @@ async function applyBgLook() {
     path: document.getElementById('bg-path').value.trim(),
     paths: bgPaths(),
     mode: document.getElementById('bg-mode').value,
+    blur,
   });
   document.getElementById('msg-bg').textContent =
-    j.ok ? `暗化 ${j.blur} 模糊 ${j.blur}` : (j.err || '失败');
+    j.ok ? `模糊 ${j.blur}` : (j.err || '失败');
 }
 
 function bgSource() {
@@ -2782,6 +2790,70 @@ async function refresh() {
       dimEl.value = j.dim || 0;
       setDimLabel();
     }
+    const blurEl = document.getElementById('bg-blur');
+    if (blurEl && document.activeElement !== blurEl) {
+      blurEl.value = j.background_blur || 0;
+      setBgBlurLabel();
+    }
+    const pathsEl = document.getElementById('bg-paths');
+    if (pathsEl && document.activeElement !== pathsEl) {
+      const cur = (j.background_paths || []).join('\n');
+      if (pathsEl.value.trim() !== cur.trim()) pathsEl.value = cur;
+    }
+    const sel = document.getElementById('dev-select');
+    if (sel && j.active && document.activeElement !== sel) {
+      sel.value = j.active;
+    }
+    const m = j.metrics || {};
+    if (m.fps !== undefined) {
+      const rk = Object.keys(m.render_ms || {})
+        .map(k => `${k} ${m.render_ms[k]}ms`).join('  ');
+      document.getElementById('metrics-line').textContent =
+        `FPS ${m.fps}   吞吐 ${m.bytes_per_sec} B/s   帧 ${m.frames}   ` +
+        `重连 ${m.reconnects}   渲染 ${rk}`;
+    }
+    const extEl = document.getElementById('ext-line');
+    if (extEl) {
+      const ef = j.ext_failed || [];
+      extEl.textContent = ef.length
+        ? `外部插件加载失败 ${ef.length} 个：` + ef.map(function (x) {
+            const p = String(x[0] || '').split(/[\\/]/).pop();
+            return p + '（' + (x[1] || '') + '）';
+          }).join('   ')
+        : '';
+    }
+    syncTouchSelects(j.touch || {});
+    const pv = document.getElementById('dev-preview');
+    if (pv && j.current_widget) {
+      const want = '/api/preview?name=' + encodeURIComponent(j.current_widget) + '&t=' + Date.now();
+      if (pv.dataset.want !== want) { pv.dataset.want = want; pv.src = want; }
+    }
+    const srcEl = document.getElementById('bg-source');
+    if (srcEl && document.activeElement !== srcEl) {
+      srcEl.value = j.background_source || 'single';
+      setBgSource();
+    }
+    const pthEl = document.getElementById('bg-paths');
+    if (pthEl && document.activeElement !== pthEl) {
+      pthEl.value = (j.background_paths || []).join('\n');
+    }
+    const ivEl = document.getElementById('bg-interval');
+    if (ivEl && document.activeElement !== ivEl) {
+      ivEl.value = j.background_interval || 12;
+    }
+    const shEl = document.getElementById('bg-shuffle');
+    if (shEl && document.activeElement !== shEl) {
+      shEl.checked = !!j.background_shuffle;
+    }
+
+    currentWidgetName = j.current_widget || '';
+    document.querySelectorAll('#pages-list .pitem').forEach(el => {
+      el.classList.toggle('current', el.dataset.widget === currentWidgetName);
+    });
+  } catch(e) {
+    document.getElementById('status').textContent = '状态获取失败: ' + e;
+  }
+}
 
 async function loadPages() {
   const j = await getJSON('/api/widgets');
@@ -3614,6 +3686,7 @@ class WebUI(threading.Thread):
                         "widgets": [w.name for w in widgets],
                         "orientation": sched.orientation,
                         "reverse": sched.reverse,
+                        "dim": getattr(sched, "_dim", 0),
                         "locked": sched._locked,
                         "background_enabled": sched._bg_enabled,
                         "background_path": sched._bg_path,

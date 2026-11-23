@@ -356,6 +356,10 @@ class SerialTransport:
                     n = self._ser.in_waiting
                     if n:
                         if b"\x06" in self._ser.read(n):
+                            # 栅栏发了 3 个，设备会回 3 个 0x06；剩下的如果留在
+                            # 缓冲里，下一帧读回执时会被当成“这帧收齐了”。
+                            time.sleep(0.02)
+                            self._ser.reset_input_buffer()
                             return True
                     time.sleep(0.004)
                 return False

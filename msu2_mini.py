@@ -192,6 +192,11 @@ class MiniProtocol:
                                    (length >> 8) & 0xFF, length & 0xFF)
 
     @staticmethod
+    def asset_window(n):
+        """送一段数据：`0A 08 len_hi len_lo`，紧跟 n 个字节，设备收满回 ack。"""
+        return MiniProtocol._frame(0x0A, 0x08, (n >> 8) & 0xFF, n & 0xFF, 0, 0)
+
+    @staticmethod
     def asset_commit(crc32):
         return MiniProtocol._frame(0x0A, 0x03,
                                    (crc32 >> 24) & 0xFF, (crc32 >> 16) & 0xFF,
@@ -478,18 +483,65 @@ class SerialTransport:
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_begin(kind, slot, len(payload)))
-        ack = self._wait_byte(timeout)
-        if ack != 0x06:
-            return False, "begin 失败（%r）" % (ack,)
+        st = self._asset_reply(0x01, max(timeout, 8.0))
+        if st != 0x06:
+            if st is None:
+                return False, "设备没有回执（没有开始接收）"
+            return False, "设备拒绝接收（begin 回 0x%02X）" % st
 
-        for i in range(0, len(payload), chunk):
-            self.write(payload[i:i + chunk])
-            if gap:
-                time.sleep(gap)
+        # 分窗上传：每窗写完，设备把它真正吃进 flash 之后才回 ack。
+        # 这样主机永远不会比设备快，也不会把 USB 接收环撑爆。
+        window = 1024
+        sent = 0
+        while sent < len(payload):
+            block = payload[sent:sent + window]
+            st = None
+            for attempt in (0, 1):
+                self.write(MiniProtocol.asset_window(len(block)))
+                self.write(block)
+                st = self._asset_reply(0x08, max(timeout, 8.0))
+                if st == 0x06:
+                    break
+                time.sleep(0.05)
+            if st != 0x06:
+                self.write(MiniProtocol.asset_abort())
+                return False, ("第 %d 字节处设备没确认（%s），已放弃"
+                               % (sent, "没回执" if st is None else "回 0x%02X" % st))
+            sent += len(block)
 
         self.write(MiniProtocol.asset_commit(zlib.crc32(payload) & 0xFFFFFFFF))
-        ack = self._wait_byte(timeout)
-        return (ack == 0x06), ("ok" if ack == 0x06 else "commit 失败（%r）" % (ack,))
+        st = self._asset_reply(0x03, timeout)
+        if st == 0x06:
+            return True, "ok"
+        if st is None:
+            return False, "数据发完了，但设备没有回执（可能掉线）"
+        return False, "设备校验没过（0x%02X），图没写进去" % st
+
+    def _asset_reply(self, sub, timeout=3.0):
+        """读资产命令的回执。
+
+        设备回的是 6 字节帧 `0A sub status 00 00 00`（查询是 12 字节），
+        这里扫出 `sub` 对应的 status：0x06 成功 / 0x15 失败，没等到返回 None。
+        早先按“单个字节回执”写，结果把帧头 0x0A 当成了回执值（日志里那个 10）。
+        """
+        deadline = time.monotonic() + timeout
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            if self._ser is None:
+                return None
+            try:
+                n = self._ser.in_waiting
+                chunk = self._ser.read(n if n else 1)
+            except Exception:
+                return None
+            if chunk:
+                buf.extend(chunk)
+                for i in range(len(buf) - 2):
+                    if buf[i] == 0x0A and buf[i + 1] == sub:
+                        return buf[i + 2]
+            else:
+                time.sleep(0.005)
+        return None
 
     def _wait_byte(self, timeout=2.0):
         deadline = time.monotonic() + timeout
@@ -502,27 +554,31 @@ class SerialTransport:
             time.sleep(0.005)
         return None
 
-    def asset_draw(self, kind, slot, timeout=3.0):
+    def asset_draw(self, kind, slot, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_draw(kind, slot))
-        ack = self._wait_byte(timeout)
-        return ack == 0x06
+        st = self._asset_reply(0x04, timeout)
+        if st == 0x06:
+            return True, "ok"
+        if st is None:
+            return False, "设备没有回执"
+        return False, "设备上那个槽还没有图（先写入再预览）"
 
-    def asset_erase(self, kind, slot, timeout=3.0):
+    def asset_erase(self, kind, slot, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_erase(kind, slot))
-        ack = self._wait_byte(timeout)
-        return ack == 0x06
+        st = self._asset_reply(0x05, timeout)
+        return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认擦除（%r）" % (st,))
 
     def asset_settings(self, boot_mode, standby_mode, count, dwell, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_settings(boot_mode, standby_mode,
                                                count, dwell))
-        ack = self._wait_byte(timeout)
-        return ack == 0x06
+        st = self._asset_reply(0x06, timeout)
+        return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认设置（%r）" % (st,))
 
     def wait_idle(self, timeout=0.8):
         """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
@@ -4601,8 +4657,8 @@ class WebUI(threading.Thread):
                         standby_mode = int(body.get("standby_mode", 1))
                         count = int(body.get("count", 1))
                         dwell = int(body.get("dwell", 3))
-                        ok = sched.device.asset_settings(boot_mode, standby_mode,
-                                                         count, dwell)
+                        ok, why = sched.device.asset_settings(boot_mode, standby_mode,
+                                                              count, dwell)
                         if ok:
                             acfg = dcfg.get("asset")
                             if not isinstance(acfg, dict):
@@ -4613,16 +4669,16 @@ class WebUI(threading.Thread):
                                          "count": count, "dwell": dwell})
                             save_config_soon(outer.cfg, cfg_path)
                         self._json({"ok": ok,
-                                    "err": "" if ok else "设备没有确认"})
+                                    "err": "" if ok else why})
                     elif self.path == "/api/asset/draw":
                         body = self._read_json()
-                        ok = sched.device.asset_draw(int(body.get("kind", 0)),
-                                                     int(body.get("slot", 0)))
-                        self._json({"ok": ok, "err": "" if ok else "这张图不存在"})
+                        ok, why = sched.device.asset_draw(int(body.get("kind", 0)),
+                                                          int(body.get("slot", 0)))
+                        self._json({"ok": ok, "err": "" if ok else why})
                     elif self.path == "/api/asset/erase":
                         body = self._read_json()
-                        ok = sched.device.asset_erase(int(body.get("kind", 0)),
-                                                      int(body.get("slot", 0)))
+                        ok, why = sched.device.asset_erase(int(body.get("kind", 0)),
+                                                           int(body.get("slot", 0)))
                         self._json({"ok": ok, "err": "" if ok else "擦除失败"})
                     elif self.path == "/api/background":
                         body = self._read_json()

@@ -660,8 +660,16 @@ class SerialTransport:
                 return buf[i + 3:i + 3 + buf[i + 2]]
         return None
 
-    def boot_trace(self, timeout=1.2):
+    def boot_trace(self, timeout=1.2, tries=3):
         """复位面包屑（固件 v53 起）：上次停在哪一步、累计复位次数。"""
+        for _attempt in range(max(1, int(tries))):
+            got = self._boot_trace_once(timeout)
+            if got is not None:
+                return got
+            time.sleep(0.08)
+        return None
+
+    def _boot_trace_once(self, timeout=1.2):
         self._ser.reset_input_buffer()
         self._ser.write(MiniProtocol.boot_trace())
         end = time.monotonic() + timeout

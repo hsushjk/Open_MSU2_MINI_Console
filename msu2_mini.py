@@ -945,6 +945,12 @@ class MiniDevice:
             self._ack_fails = int(getattr(self, "_ack_fails", 0)) + 1
             # 设备说像素不够：字节在路上真丢了。降速重发。
             self._pace_bps = max(40000.0, getattr(self, "_pace_bps", 140000.0) * 0.6)
+            _st = getattr(self.transport, "last_status", None)
+            if _st:
+                log.warning("device saw px=%d win=%d drop=%d (%.1f KB missing)",
+                            _st.get("px", -1), _st.get("win", -1),
+                            _st.get("drop", -1),
+                            max(0, (_st.get("win", 0) - _st.get("px", 0))) * 2 / 1024.0)
             if self._ack_fails in (1, 3, 10, 30):
                 log.warning("device did not confirm the frame (attempt %d, got %d "
                             "verdict bytes), resending at %.0f KB/s",

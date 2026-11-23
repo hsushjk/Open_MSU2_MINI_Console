@@ -195,3 +195,7 @@ MIT，见 `LICENSE`。上游的界面、插件框架与大部分 widget 由原�
 - [Open_MSU2_MINI](https://github.com/hsushjk/Open_MSU2_MINI) —— 硬件：引脚、网表、协议说明
 - [MSU2_MINI_FW_Reverse](https://github.com/hsushjk/MSU2_MINI_FW_Reverse) —— 原厂固件反编译与分析
 - [MSU2_MINI_Console](https://github.com/hsushjk/MSU2_MINI_Console) —— 原厂固件的上位机（本仓库的上游）
+### 资产图片的字节序
+
+写进 NOR 的图片必须是 **RGB565 高字节在前**，和帧编码器 `FrameEncoder._to_rgb565()` 完全一致。
+之前资产编码器写成了低字节在前，屏上就是红蓝互换加麻点——遇到"色彩不对"先查这里。

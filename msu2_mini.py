@@ -224,6 +224,11 @@ class MiniProtocol:
                                    count, dwell)
 
     @staticmethod
+    def asset_boot_hold(secs):
+        """开机画面停留秒数：`0A 09 secs`"""
+        return MiniProtocol._frame(0x0A, 0x09, int(secs) & 0xFF, 0, 0, 0)
+
+    @staticmethod
     def lcd_set_xy(x, y):
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_SET_XY,
                                    (x >> 8) & 0xFF, x & 0xFF,
@@ -467,6 +472,7 @@ class SerialTransport:
                             "count": frame[6],
                             "dwell": (frame[7] << 8) | frame[8],
                             "fw": frame[9],
+                            "boot_hold": frame[10] or 4,
                         }
                     buf = buf[idx + 1:]
                     idx = buf.find(b"\x0a\x00")
@@ -596,13 +602,20 @@ class SerialTransport:
         st = self._asset_reply(0x05, timeout)
         return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认擦除（%r）" % (st,))
 
-    def asset_settings(self, boot_mode, standby_mode, count, dwell, timeout=4.0):
+    def asset_settings(self, boot_mode, standby_mode, count, dwell,
+                       boot_hold=4, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_settings(boot_mode, standby_mode,
                                                count, dwell))
         st = self._asset_reply(0x06, timeout)
-        return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认设置（%r）" % (st,))
+        if st != 0x06:
+            return False, "设备没有确认画面设置（回 %r）" % (st,)
+        self.write(MiniProtocol.asset_boot_hold(boot_hold))
+        st = self._asset_reply(0x09, timeout)
+        if st != 0x06:
+            return False, "设备没有确认开机停留时间（回 %r）" % (st,)
+        return True, "ok"
 
     def wait_idle(self, timeout=0.8):
         """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
@@ -1200,9 +1213,9 @@ class MiniDevice:
     def asset_erase(self, kind, slot):
         return self.transport.asset_erase(kind, slot)
 
-    def asset_settings(self, boot_mode, standby_mode, count, dwell):
+    def asset_settings(self, boot_mode, standby_mode, count, dwell, boot_hold=4):
         return self.transport.asset_settings(boot_mode, standby_mode,
-                                             count, dwell)
+                                             count, dwell, boot_hold)
 
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
@@ -1872,15 +1885,9 @@ class Scheduler(threading.Thread):
 
         img = Image.open(path).convert("RGB").resize(
             (SCREEN_W, SCREEN_H), Image.LANCZOS)
-        out = bytearray()
-        px = img.load()
-        for y in range(SCREEN_H):
-            for x in range(SCREEN_W):
-                r, g, b = px[x, y]
-                v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-                out.append(v & 0xFF)
-                out.append((v >> 8) & 0xFF)
-        return bytes(out)
+        # 字节序必须和帧编码器（_to_rgb565）一致：**高字节在前**。
+        # 之前写成低字节在前，屏上颜色全乱（红蓝互换 + 麻点）。
+        return FrameEncoder._to_rgb565(img)
 
     def _asset_idle(self, fn, pause=0.8):
         """先把帧流停一会儿、拿住串口锁，再发一条资产命令。
@@ -1914,9 +1921,11 @@ class Scheduler(threading.Thread):
     def asset_erase_safe(self, kind, slot):
         return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
 
-    def asset_settings_safe(self, boot_mode, standby_mode, count, dwell):
+    def asset_settings_safe(self, boot_mode, standby_mode, count, dwell,
+                            boot_hold=4):
         return self._asset_idle(
-            lambda: self.device.asset_settings(boot_mode, standby_mode, count, dwell))
+            lambda: self.device.asset_settings(boot_mode, standby_mode,
+                                               count, dwell, boot_hold))
 
     def upload_asset(self, kind, slot, path):
         """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。"""
@@ -3183,6 +3192,9 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <option value="1">显示 NOR 里的图片</option>
       </select>
     </label>
+    <label style="font-size:12px;color:#666;margin-left:12px">停留
+      <input type="number" id="asset-boot-hold" min="1" max="60" value="4" style="width:3.5em"> 秒
+    </label>
   </div>
   <div style="margin-top:4px">
     <input type="text" id="asset-boot-path" placeholder="开机图路径（png / jpg）" style="width:20em">
@@ -4070,6 +4082,8 @@ async function refreshAsset() {
   document.getElementById('asset-count').value = String(j.count || 1);
   document.getElementById('asset-dwell').value = String(j.dwell || 3);
   const d = j.device;
+  const bhEl = document.getElementById('asset-boot-hold');
+  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 4);
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
   const slots = [];
   for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
@@ -4085,6 +4099,7 @@ async function saveAssetSettings() {
     standby_mode: parseInt(document.getElementById('asset-standby').value, 10),
     count: parseInt(document.getElementById('asset-count').value, 10) || 1,
     dwell: parseInt(document.getElementById('asset-dwell').value, 10) || 3,
+    boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 4,
   };
   const j = await postJSON('/api/asset/settings', body);
   setMsg('msg-asset', j && j.ok ? '已保存到设备' : ('失败：' + ((j && j.err) || '设备没有确认')), !(j && j.ok));
@@ -4619,7 +4634,9 @@ class WebUI(threading.Thread):
                                 "boot_mode": int(acfg.get("boot_mode", 0)),
                                 "standby_mode": int(acfg.get("standby_mode", 1)),
                                 "count": int(acfg.get("count", 1)),
-                                "dwell": int(acfg.get("dwell", 3))})
+                                "dwell": int(acfg.get("dwell", 3)),
+                                "boot_hold": int((info or {}).get(
+                                    "boot_hold", acfg.get("boot_hold", 4)))})
                     return
 
                 self.send_error(404)
@@ -4717,14 +4734,16 @@ class WebUI(threading.Thread):
                         standby_mode = int(body.get("standby_mode", 1))
                         count = int(body.get("count", 1))
                         dwell = int(body.get("dwell", 3))
+                        boot_hold = int(body.get("boot_hold", 4))
                         ok, why = sched.asset_settings_safe(boot_mode, standby_mode,
-                                                            count, dwell)
+                                                            count, dwell, boot_hold)
                         if ok:
                             acfg = dcfg.get("asset")
                             if not isinstance(acfg, dict):
                                 acfg = {}
                                 dcfg["asset"] = acfg
                             acfg.update({"boot_mode": boot_mode,
+                                         "boot_hold": boot_hold,
                                          "standby_mode": standby_mode,
                                          "count": count, "dwell": dwell})
                             save_config_soon(outer.cfg, cfg_path)

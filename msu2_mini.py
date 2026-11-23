@@ -687,32 +687,38 @@ class SerialTransport:
         return None
 
     def tile_check(self, sigs, timeout=2.5):
-        """分块签名核对（固件 v56）：返回 50 位掩码，bit=1 表示这一块没画对。"""
+        """分块签名核对（固件 v58）：命令与 100 字节签名一次写完，设备回 10 字节掩码。
+
+        不设“开始收”的 ack：那需要一个来回，而设备的 EP3 只有一笔在途缓冲，
+        心跳一来就把 ack 顶掉了；顶掉之后设备还停着等 100 字节，后面所有命令
+        都被当成签名吃掉 —— 一个丢包就能让整机像死了一样。
+        v58 起设备只是按序收下紧跟命令的 100 字节，收满就回包，不需要握手。
+        """
         if self._ser is None or len(sigs) != TILE_N * 2:
             return None
-        self._ser.reset_input_buffer()
-        self._ser.write(MiniProtocol.tile_check())
-        end = time.monotonic() + timeout
-        buf = b""
-        base = 0
-        while time.monotonic() < end:
-            buf += self._ser.read(self._ser.in_waiting or 1)
-            i = buf.find(b"\x0a\x11")
-            if i >= 0 and len(buf) >= i + 6:
-                base = i + 6
-                break
-        else:
-            return None
-        self._ser.write(sigs)
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            buf += self._ser.read(self._ser.in_waiting or 1)
-            i = buf.find(b"\x0a\x11", base)
-            if i >= 0 and len(buf) >= i + 10 and buf[i + 9] == 0xAA:
-                mask = 0
-                for k in range(7):
-                    mask |= buf[i + 2 + k] << (8 * k)
-                return mask
+        payload = MiniProtocol.tile_check() + bytes(sigs)
+        # 设备的 EP3 只有一笔在途缓冲：上一拍心跳如果还没被主机取走，应答包
+        # 可能整包丢掉。所以整条命令重发 3 次，早到的那份会被当成“多余命令”忽略
+        # （设备每次都按序收下 100 字节，不会残留状态）。
+        for _attempt in range(3):
+            self._ser.reset_input_buffer()
+            self._ser.write(payload)
+            end = time.monotonic() + timeout / 3.0
+            buf = b""
+            while time.monotonic() < end:
+                buf += self._ser.read(self._ser.in_waiting or 1)
+                i = buf.find(b"\x0a\x11")
+                if i >= 0 and len(buf) >= i + 10 and buf[i + 9] == 0xAA:
+                    mask = 0
+                    for k in range(7):
+                        mask |= buf[i + 2 + k] << (8 * k)
+                    return mask
+            time.sleep(0.02)
+        # 没等到回包：把 100 字节补齐，别让设备停在“等签名”的状态里
+        try:
+            self._ser.write(bytes(TILE_N * 2))
+        except Exception:
+            pass
         return None
 
     def asset_verify_check(self, kind, slot, timeout=8.0):

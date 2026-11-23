@@ -244,6 +244,9 @@ class MiniProtocol:
                                    count, dwell)
 
     @staticmethod
+    def boot_report():
+        return MiniProtocol._frame(0x0A, 0x0B, 0, 0, 0, 0)
+
     def asset_wipe():
         """抹掉全部资产与设置：`0A 0A`"""
         return MiniProtocol._frame(0x0A, 0x0A, 0, 0, 0, 0)
@@ -503,6 +506,25 @@ class SerialTransport:
                     idx = buf.find(b"\x0a\x00")
             else:
                 time.sleep(0.01)
+        return None
+
+    def boot_report(self, timeout=1.0):
+        """读开机自检结果位图（v47 起）：bit0 FLASH / bit1 TOUCH / bit2 LCD / bit3 USB / bit4 CFG"""
+        if self._ser is None:
+            return None
+        try:
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
+        self.write(MiniProtocol.boot_report())
+        deadline = time.monotonic() + float(timeout)
+        buf = b""
+        while time.monotonic() < deadline:
+            buf += self.read_all() or b""
+            for i in range(len(buf) - 2):
+                if buf[i] == 0x0A and buf[i + 1] == 0x0B:
+                    return int(buf[i + 2])
+            time.sleep(0.01)
         return None
 
     def asset_write(self, kind, slot, payload, chunk=1024, gap=0.008,
@@ -1238,6 +1260,9 @@ class MiniDevice:
     def asset_info(self):
         return self.transport.asset_info()
 
+    def boot_report(self):
+        return self.transport.boot_report()
+
     def asset_write(self, kind, slot, payload):
         return self.transport.asset_write(kind, slot, payload)
 
@@ -1948,6 +1973,11 @@ class Scheduler(threading.Thread):
         for _ in range(max(1, int(tries))):
             info = self._asset_idle(lambda: self.device.asset_info(), 0.5)
             if info is not None:
+                try:
+                    info["boot_report"] = self._asset_idle(
+                        lambda: self.device.boot_report(), 0.4)
+                except Exception:
+                    info["boot_report"] = None
                 return info
             time.sleep(0.25)
         return None
@@ -3257,6 +3287,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       <select id="asset-boot">
         <option value="0">不画</option>
         <option value="1">显示 NOR 里的图片</option>
+        <option value="2">跑自检并显示结果</option>
       </select>
     </label>
     <label style="font-size:12px;color:#666;margin-left:12px">停留
@@ -3300,6 +3331,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <button onclick="wipeAsset()" style="color:#c33">抹掉板载 NOR（全部）</button>
     <span class="msg" id="msg-asset"></span>
     <div class="tiny" id="asset-state" style="margin-top:4px"></div>
+    <div class="tiny" id="asset-boot-report" style="margin-top:2px"></div>
   </div>
 </div>
 
@@ -4243,6 +4275,19 @@ async function refreshAsset() {
     '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
   renderSlotList(d, slots);
   syncAssetUi();
+  const repEl = document.getElementById('asset-boot-report');
+  if (repEl) {
+    const rep = j.boot_report;
+    if (rep === null || rep === undefined) {
+      repEl.textContent = '开机自检：设备没有回报（固件需要 v47 及以上）';
+      repEl.style.color = '#888';
+    } else {
+      const names = [['FLASH', 1], ['TOUCH', 2], ['LCD', 4], ['USB', 8], ['CFG', 16]];
+      const bad = names.filter(n => !(rep & n[1])).map(n => n[0]);
+      repEl.textContent = '开机自检：' + (bad.length ? ('未通过 ' + bad.join(' / ')) : '全部通过');
+      repEl.style.color = bad.length ? '#c0392b' : '#2e7d32';
+    }
+  }
 }
 
 async function saveAssetSettings() {
@@ -4809,7 +4854,8 @@ class WebUI(threading.Thread):
                                 "count": int(acfg.get("count", 1)),
                                 "dwell": int(acfg.get("dwell", 3)),
                                 "boot_hold": int((info or {}).get(
-                                    "boot_hold", acfg.get("boot_hold", 4)))})
+                                    "boot_hold", acfg.get("boot_hold", 4))),
+                                "boot_report": (info or {}).get("boot_report")})
                     return
 
                 self.send_error(404)

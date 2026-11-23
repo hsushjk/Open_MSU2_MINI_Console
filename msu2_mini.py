@@ -211,26 +211,6 @@ class MiniProtocol:
                 + bytes(payload))
 
     @staticmethod
-    def lcd_palette(pal_bytes):
-        n = len(pal_bytes)
-        return (MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x0F,
-                                    (n >> 8) & 0xFF, n & 0xFF, 0x00)
-                + bytes(pal_bytes))
-
-    @staticmethod
-    def lcd_index8_segment(payload):
-        """8 位索引段（0x10）：一字节一个像素，固定 216 色立方调色板。"""
-        n = len(payload)
-        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x10,
-                                   (n >> 8) & 0xFF, n & 0xFF, 0x00) + payload
-
-    def lcd_index_segment(payload):
-        n = len(payload)
-        return (MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x0E,
-                                    (n >> 8) & 0xFF, n & 0xFF, 0x00)
-                + bytes(payload))
-
-    @staticmethod
     def lcd_raw_end():
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x09, 0, 0, 0)
 
@@ -569,16 +549,11 @@ class FrameEncoder:
     def __init__(self):
         self._last_raw = None
         self._last_tile_raw = None
-        self._last_indexed = None
-        self.color4 = True          # 4 位索引色 + 每帧调色板（6.7 KB/帧）
-        # 16 色下抖动是性价比最高的画质手段：不增加字节数，只改索引值。
-        import os as _os
-        self.dither = _os.environ.get("MSU2_DITHER", "0") != "0"
+        self.last_full = False
 
     def reset(self):
         self._last_raw = None
         self._last_tile_raw = None
-        self._last_indexed = None
 
     @staticmethod
     def _to_rgb565(img):
@@ -599,7 +574,7 @@ class FrameEncoder:
             raw[2 * k + 1] = v & 0xFF
         return bytes(raw)
 
-    def encode(self, img, raw_mode=False, fast=False):
+    def encode(self, img, raw_mode=False):
         if img.size != (SCREEN_W, SCREEN_H):
             img = img.resize((SCREEN_W, SCREEN_H))
         if img.mode != "RGB":
@@ -614,13 +589,6 @@ class FrameEncoder:
         out += MiniProtocol.lcd_set_xy(0, 0)
         out += MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
         out += MiniProtocol.lcd_enter_direct_mode()
-
-        if raw_mode and fast and self.color4:
-            import os as _os
-            self.last_full = True
-            if _os.environ.get("MSU2_TILES", "0") == "1":
-                return bytes(out + self._encode_indexed_tiles(img))
-            return bytes(out + self._encode_indexed(img))
 
         if raw_mode:
             # v23: one full-screen 0x09 per frame, device answers one verdict
@@ -664,111 +632,7 @@ class FrameEncoder:
     # 调色板用 PIL 的自适应量化（中位切分），16 色；解码在固件里做。
     # 固定 16 色调色板：4 级灰 + 6 个基色 + 2 个深色。
     # 顺序与取值都不随画面变化，抖动图案因此逐帧稳定，静态区域不会闪烁。
-    PALETTE16 = [
-        (0, 0, 0), (64, 64, 64), (128, 128, 128), (255, 255, 255),
-        (255, 0, 0), (0, 200, 0), (0, 0, 255), (255, 220, 0),
-        (0, 220, 220), (220, 0, 220), (0, 90, 200), (150, 90, 40),
-        (90, 40, 0), (0, 60, 0), (60, 0, 60), (30, 30, 30),
-    ]
-
-    def _palette_image(self):
-        im = Image.new("P", (1, 1))
-        flat = []
-        for r, g, b in self.PALETTE16:
-            flat += [r, g, b]
-        im.putpalette(flat + [0] * (768 - len(flat)))
-        return im
-
-    def _palette_bytes(self):
-        out = bytearray(32)
-        for i, (r, g, b) in enumerate(self.PALETTE16):
-            v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-            out[2 * i] = (v >> 8) & 0xFF
-            out[2 * i + 1] = v & 0xFF
-        return bytes(out)
-
     # 有序抖动的 Bayer 8×8 矩阵（0..1）
-    BAYER8 = [
-        0, 32, 8, 40, 2, 34, 10, 42,
-        48, 16, 56, 24, 50, 18, 58, 26,
-        12, 44, 4, 36, 14, 46, 6, 38,
-        60, 28, 52, 20, 62, 30, 54, 22,
-        3, 35, 11, 43, 1, 33, 9, 41,
-        51, 19, 59, 27, 49, 17, 57, 25,
-        15, 47, 7, 39, 13, 45, 5, 37,
-        63, 31, 55, 23, 61, 29, 53, 21,
-    ]
-
-    def _quantize_index(self, img):
-        """把 RGB 图量化成 216 色索引矩阵（R/G/B 各 6 级）。"""
-        import numpy as _np
-        rgb = _np.asarray(img.convert("RGB"), dtype=_np.int16)
-        if self.dither:
-            h, w = rgb.shape[0], rgb.shape[1]
-            bay = _np.array(self.BAYER8, dtype=_np.int16).reshape(8, 8)
-            bay = (bay - 32).astype(_np.int16)
-            th = _np.tile(bay, ((h + 7) // 8, (w + 7) // 8))[:h, :w]
-            rgb = _np.clip(rgb + (th * 3)[..., None], 0, 255)
-        lvl = (rgb * 6 // 256).astype(_np.uint8)
-        return (lvl[..., 0] * 36 + lvl[..., 1] * 6 + lvl[..., 2]).astype(_np.uint8)
-
-    def _encode_indexed(self, img):
-        """整帧单窗口：一次设窗口、一次收流，画面整体切换，撕裂最小。"""
-        idx = self._quantize_index(img)
-        payload = idx.tobytes()
-        if payload == self._last_indexed:
-            return b""
-        self._last_indexed = payload
-
-        out = bytearray()
-        for k in range(0, len(payload), 128):
-            out += MiniProtocol.lcd_index8_segment(payload[k:k + 128])
-        out += MiniProtocol.lcd_raw_end()
-        return bytes(out)
-
-    def _encode_indexed_tiles(self, img):
-        """8 位索引 + 16×16 分块增量。
-
-        整帧 12.8 KB 在 64 字节包的链路上要 60 ms 以上；桌面上真正变化的
-        往往只有一小片，所以按块比对，只发变化的块。整块 16×16 = 256 字节。
-        """
-        import numpy as _np
-
-        rgb = _np.asarray(img.convert("RGB"), dtype=_np.int16)
-        h, w = rgb.shape[0], rgb.shape[1]
-        if self.dither:
-            bay = _np.array(self.BAYER8, dtype=_np.int16).reshape(8, 8)
-            bay = (bay - 32).astype(_np.int16)
-            th = _np.tile(bay, ((h + 7) // 8, (w + 7) // 8))[:h, :w]
-            rgb = _np.clip(rgb + (th * 3)[..., None], 0, 255)
-
-        lvl = (rgb * 6 // 256).astype(_np.uint8)
-        idx = (lvl[..., 0] * 36 + lvl[..., 1] * 6 + lvl[..., 2]).astype(_np.uint8)
-
-        tile = 16
-        prev = self._last_indexed
-        out = bytearray()
-        changed = 0
-        for ty in range(0, h, tile):
-            for tx in range(0, w, tile):
-                blk = idx[ty:ty + tile, tx:tx + tile]
-                if prev is not None and prev.shape == idx.shape:
-                    old = prev[ty:ty + tile, tx:tx + tile]
-                    if _np.array_equal(blk, old):
-                        continue
-                changed += 1
-                payload = blk.tobytes()
-                out += MiniProtocol.lcd_set_xy(tx, ty)
-                out += MiniProtocol.lcd_set_size(tx + blk.shape[1], ty + blk.shape[0])
-                out += MiniProtocol.lcd_enter_direct_mode()
-                for k in range(0, len(payload), 128):
-                    out += MiniProtocol.lcd_index8_segment(payload[k:k + 128])
-                out += MiniProtocol.lcd_raw_end()
-
-        self._last_indexed = idx
-        if changed == 0:
-            return b""
-        return bytes(out)
     def _encode_tiles(self, raw):
         T = self.TILE
         prev = self._last_tile_raw
@@ -852,27 +716,19 @@ class MiniDevice:
     @property
     def connected(self): return self.transport.connected
 
-    def show_image(self, img, fast=False):
-        ok = self._show_image_once(img, fast)
+    def show_image(self, img):
+        ok = self._show_image_once(img)
         if ok:
             return True
         # 设备报告缺像素（或整段作废）：缓存已清，立刻整帧补一次，
         # 用户看到的是“偶尔卡一下”，而不是半屏花掉的内容。
         log.debug("整帧校验失败，重发一次")
-        return self._show_image_once(img, fast)
+        return self._show_image_once(img)
 
-    def _show_image_once(self, img, fast=False):
-        # 每 1.5 秒强制一次整屏重绘。差分帧只重画变化的块，一旦某帧在中途
-        # 被打断（设备判死、USB 卡顿、掉线重连），画面上就会留下再也补不回来
-        # 的残影。整屏重绘是唯一能把残影抹掉的低成本办法。
-        if fast != getattr(self, "_last_fast", None):
-            # 换画质模式时缓存里存的不是同一种编码，必须整帧重发一次。
-            self.encoder.reset()
-            self._last_fast = fast
+    def _show_image_once(self, img):
         t0 = time.perf_counter()
         frame = self.encoder.encode(
-            img, raw_mode=getattr(self.transport, "raw_mode", False),
-            fast=bool(fast))
+            img, raw_mode=getattr(self.transport, "raw_mode", False))
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
         if not frame:
             return True
@@ -3630,7 +3486,7 @@ class OfflineDevice:
     def close(self):
         self.connected = False
 
-    def show_image(self, img, fast=False):
+    def show_image(self, img):
         self.last = img.copy()
         self.frames += 1
         self.transport.bytes_written += img.size[0] * img.size[1] * 2
@@ -4393,6 +4249,77 @@ def run_offline_window(manager, stop_event, device_id=None):
     return 0
 
 
+def cmd_selftest(port=None):
+    """--selftest：不开界面，直接体检设备（握手 / 版本 / 触摸 / 整帧链路 / 逐帧回执）。"""
+    names = [port] if port else [p.device for p in serial.tools.list_ports.comports()]
+    if not names:
+        _console("没有找到串口设备")
+        return 2
+    bad = 0
+    for name in names:
+        _console("== %s ==" % name)
+        dev = MiniDevice(name)
+        if not dev.open():
+            _console("  [FAIL] 打不开或握手失败: %s"
+                     % (dev.transport.last_error or "设备没有回问候包"))
+            bad += 1
+            continue
+        tr = dev.transport
+        fw = tr.fw_version
+        _console("  握手 %s，raw_mode=%s" % (tr.version or "?", tr.raw_mode))
+        if fw:
+            _console("  固件 %d.%d" % fw)
+        else:
+            _console("  固件版本未知（v8 及更早没有版本帧）")
+
+        # 1) 触摸：连读 10 次，看有没有非 0 值
+        vals = []
+        for _ in range(10):
+            v = dev.read_touch()
+            if v is not None:
+                vals.append(v)
+            time.sleep(0.03)
+        vals = [v for v in vals if v]
+        if vals:
+            _console("  触摸 %d..%d（%d 次采样）" % (min(vals), max(vals), len(vals)))
+        else:
+            _console("  [WARN] 触摸读不到有效值")
+
+        # 2) 链路：静态帧、局部变化、整屏噪点各发几帧
+        img = Image.new("RGB", (SCREEN_W, SCREEN_H), (16, 20, 28))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, SCREEN_W - 1, SCREEN_H - 1], outline=(0, 255, 0))
+        d.line([0, 0, SCREEN_W - 1, SCREEN_H - 1], fill=(0, 120, 255))
+        ok = 0
+        for i in range(4):
+            d.rectangle([8 + i * 6, 20, 20 + i * 6, 32], outline=(255, 255, 0))
+            if dev.show_image(img):
+                ok += 1
+        _console("  局部变化 4 帧：成功 %d，最近一次 %d ms / %d B"
+                 % (ok, int(getattr(dev, "tx_ms", 0) or 0),
+                    int(getattr(dev, "frame_bytes", 0) or 0)))
+
+        noise = Image.new("RGB", (SCREEN_W, SCREEN_H))
+        npx = noise.load()
+        rnd = random.Random(7)
+        for y in range(SCREEN_H):
+            for x in range(SCREEN_W):
+                npx[x, y] = (rnd.randrange(256), rnd.randrange(256),
+                             rnd.randrange(256))
+        ok_full = sum(1 for _ in range(3) if dev.show_image(noise))
+        _console("  整屏噪点 3 帧：成功 %d，最近一次 %d ms / %d B"
+                 % (ok_full, int(getattr(dev, "tx_ms", 0) or 0),
+                    int(getattr(dev, "frame_bytes", 0) or 0)))
+
+        if ok == 4 and ok_full == 3:
+            _console("  [PASS] 链路与回执正常")
+        else:
+            _console("  [FAIL] 有帧没有确认——检查 USB 线、或换短一点的线")
+            bad += 1
+        dev.close()
+    return 0 if bad == 0 else 1
+
+
 def main(argv=None):
     _setup_stdio()
     ap = argparse.ArgumentParser(description="MSU2_MINI_Console")
@@ -4407,6 +4334,8 @@ def main(argv=None):
     ap.add_argument("--simulate", "--offline", dest="simulate",
                     action="store_true", help="额外开一个模拟屏窗口")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="连上设备做自检（握手/版本/触摸/整帧链路/回执）后退出")
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)
@@ -4420,6 +4349,8 @@ def main(argv=None):
         cmd_plugins(); return 0
     if args.new_widget:
         return cmd_new_widget(args.new_widget)
+    if args.selftest:
+        return cmd_selftest(args.port)
 
     stream = sys.stderr
     if stream is None:

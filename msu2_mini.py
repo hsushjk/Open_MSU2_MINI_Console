@@ -796,6 +796,14 @@ class MiniDevice:
             self._verify_acks = None          # 重新连上就重新相信设备
             self._ack_fails = 0
             self._zero_acks = 0
+            if getattr(self.transport, "fw_version", None) is None:
+                # 上手时设备可能正卡在“等像素”里（上一轮崩在半路），版本查询
+                # 不理人。先发栅栏把它拉回命令模式，再问一次版本。
+                try:
+                    self.transport.resync()
+                    self.transport.query_version()
+                except Exception:
+                    pass
         return ok
 
     def close(self):  self.transport.close()

@@ -193,8 +193,12 @@ class MiniProtocol:
 
     @staticmethod
     def asset_window(n):
-        """送一段数据：`0A 08 len_hi len_lo`，紧跟 n 个字节，设备收满回 ack。"""
-        return MiniProtocol._frame(0x0A, 0x08, (n >> 8) & 0xFF, n & 0xFF, 0, 0)
+        """送一段数据：`0A 08 b2 b3 len_hi len_lo`，紧跟 n 个字节，设备收满回 ack。
+
+        注意长度放在**第 5、6 字节**（和 `asset_begin` 一致）：固件读 f[4]:f[5]。
+        之前放在 b2/b3，设备读成 0 就退化成 4096，永远等不满，把板子卡住。
+        """
+        return MiniProtocol._frame(0x0A, 0x08, 0, 0, (n >> 8) & 0xFF, n & 0xFF)
 
     @staticmethod
     def asset_commit(crc32):
@@ -472,8 +476,25 @@ class SerialTransport:
 
     def asset_write(self, kind, slot, payload, chunk=1024, gap=0.008,
                     timeout=8.0):
-        """把一张 160x80 RGB565 图写进指定槽：begin -> 流式写 -> commit(crc)。"""
+        """把一张 160x80 RGB565 图写进指定槽。
+
+        分窗上传，一窗一确认；如果第一窗就被拒绝（比如设备刚被别的东西
+        弄乱），整笔重试一次，不要一次失败就让用户手动再点。
+        """
+        for attempt in (0, 1):
+            ok, why = self._asset_write_once(kind, slot, payload, chunk, gap, timeout)
+            if ok or attempt == 1:
+                return ok, why
+            time.sleep(0.25)
+        return False, "unknown"
+
+    def _asset_write_once(self, kind, slot, payload, chunk=1024, gap=0.008,
+                          timeout=8.0):
         import zlib
+
+        # 先打个招呼：设备要是已经卡死了，别再去按它的按钮，直接告诉用户拔插
+        if self.asset_info(timeout=0.8) is None:
+            return False, "设备没应答（请拔插一次 USB 再试）"
 
         payload = bytes(payload)
         if len(payload) != 160 * 80 * 2:
@@ -482,12 +503,15 @@ class SerialTransport:
 
         if self._ser is not None:
             self._ser.reset_input_buffer()
+        t_begin = time.monotonic()
         self.write(MiniProtocol.asset_begin(kind, slot, len(payload)))
-        st = self._asset_reply(0x01, max(timeout, 8.0))
+        st = self._asset_reply(0x01, max(timeout, 20.0))
         if st != 0x06:
+            used = time.monotonic() - t_begin
             if st is None:
-                return False, "设备没有回执（没有开始接收）"
-            return False, "设备拒绝接收（begin 回 0x%02X）" % st
+                return False, ("设备没有回执（等了 %.1f 秒；可能它先要擦 7 个扇区，"
+                               "也可能设备掉线了）" % used)
+            return False, "设备拒绝接收（begin 回 0x%02X，用时 %.1f 秒）" % (st, used)
 
         # 分窗上传：每窗写完，设备把它真正吃进 flash 之后才回 ack。
         # 这样主机永远不会比设备快，也不会把 USB 接收环撑爆。
@@ -1857,6 +1881,42 @@ class Scheduler(threading.Thread):
                 out.append(v & 0xFF)
                 out.append((v >> 8) & 0xFF)
         return bytes(out)
+
+    def _asset_idle(self, fn, pause=0.8):
+        """先把帧流停一会儿、拿住串口锁，再发一条资产命令。
+
+        帧正在发的时候，设备会把命令字节当成像素吃掉，所以「预览 / 擦除 /
+        存设置」这种单独的命令必须等当前这一帧收完再进串口。
+        """
+        self._devcfg_pause_until = time.monotonic() + pause
+        lock = getattr(getattr(self.device, "transport", None), "_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            time.sleep(0.06)
+            return fn()
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def asset_query(self, tries=3):
+        """读设备资产信息；开机瞬间设备可能正忙着画开机图，多试几次。"""
+        for _ in range(max(1, int(tries))):
+            info = self._asset_idle(lambda: self.device.asset_info(), 0.5)
+            if info is not None:
+                return info
+            time.sleep(0.25)
+        return None
+
+    def asset_draw_safe(self, kind, slot):
+        return self._asset_idle(lambda: self.device.asset_draw(kind, slot))
+
+    def asset_erase_safe(self, kind, slot):
+        return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
+
+    def asset_settings_safe(self, boot_mode, standby_mode, count, dwell):
+        return self._asset_idle(
+            lambda: self.device.asset_settings(boot_mode, standby_mode, count, dwell))
 
     def upload_asset(self, kind, slot, path):
         """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。"""
@@ -4551,7 +4611,7 @@ class WebUI(threading.Thread):
                     info = None
                     if sched is not None:
                         try:
-                            info = sched.device.asset_info()
+                            info = sched.asset_query()
                         except Exception:
                             info = None
                     acfg = dcfg.get("asset") or {}
@@ -4657,8 +4717,8 @@ class WebUI(threading.Thread):
                         standby_mode = int(body.get("standby_mode", 1))
                         count = int(body.get("count", 1))
                         dwell = int(body.get("dwell", 3))
-                        ok, why = sched.device.asset_settings(boot_mode, standby_mode,
-                                                              count, dwell)
+                        ok, why = sched.asset_settings_safe(boot_mode, standby_mode,
+                                                            count, dwell)
                         if ok:
                             acfg = dcfg.get("asset")
                             if not isinstance(acfg, dict):
@@ -4672,13 +4732,13 @@ class WebUI(threading.Thread):
                                     "err": "" if ok else why})
                     elif self.path == "/api/asset/draw":
                         body = self._read_json()
-                        ok, why = sched.device.asset_draw(int(body.get("kind", 0)),
-                                                          int(body.get("slot", 0)))
+                        ok, why = sched.asset_draw_safe(int(body.get("kind", 0)),
+                                                        int(body.get("slot", 0)))
                         self._json({"ok": ok, "err": "" if ok else why})
                     elif self.path == "/api/asset/erase":
                         body = self._read_json()
-                        ok, why = sched.device.asset_erase(int(body.get("kind", 0)),
-                                                           int(body.get("slot", 0)))
+                        ok, why = sched.asset_erase_safe(int(body.get("kind", 0)),
+                                                         int(body.get("slot", 0)))
                         self._json({"ok": ok, "err": "" if ok else "擦除失败"})
                     elif self.path == "/api/background":
                         body = self._read_json()

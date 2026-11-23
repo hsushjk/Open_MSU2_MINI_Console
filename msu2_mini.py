@@ -437,7 +437,8 @@ class SerialTransport:
 
     def asset_info(self, timeout=1.5):
         """查设备上的资产：开机图是否有效、待机图哪几槽有效、当前设置。"""
-        self.reset_input_buffer()
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_info())
         deadline = time.monotonic() + timeout
         buf = b""
@@ -474,7 +475,8 @@ class SerialTransport:
             raise ValueError("payload must be 160x80 RGB565")
 
 
-        self.reset_input_buffer()
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_begin(kind, slot, len(payload)))
         ack = self._wait_byte(timeout)
         if ack != 0x06:
@@ -501,19 +503,22 @@ class SerialTransport:
         return None
 
     def asset_draw(self, kind, slot, timeout=3.0):
-        self.reset_input_buffer()
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_draw(kind, slot))
         ack = self._wait_byte(timeout)
         return ack == 0x06
 
     def asset_erase(self, kind, slot, timeout=3.0):
-        self.reset_input_buffer()
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_erase(kind, slot))
         ack = self._wait_byte(timeout)
         return ack == 0x06
 
     def asset_settings(self, boot_mode, standby_mode, count, dwell, timeout=4.0):
-        self.reset_input_buffer()
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_settings(boot_mode, standby_mode,
                                                count, dwell))
         ack = self._wait_byte(timeout)
@@ -2147,6 +2152,10 @@ class Scheduler(threading.Thread):
         self._save_flush()      # 退出前把还没落盘的改动补上
 
     def _poll_touch(self, now):
+        # 往设备 NOR 里写图/写设置时，设备正在把收到的每个字节当图像数据处理；
+        # 这时再插一条触摸查询（6 字节命令）会被当成像素吃掉，图就花了。
+        if now < getattr(self, "_devcfg_pause_until", 0.0):
+            return
         v = self.device.read_touch()
         if v is None:
             self._touch_zero_streak = 0

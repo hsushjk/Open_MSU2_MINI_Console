@@ -20,6 +20,7 @@ import time
 import traceback
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+import zlib
 
 if getattr(sys, "frozen", False):
     _APP_DIR = Path(os.path.dirname(os.path.abspath(sys.executable)))
@@ -269,16 +270,16 @@ class MiniProtocol:
 
     @staticmethod
     def flash_begin(total):
-        return MiniProtocol._frame(0x0A, 0x12, 0x01, (total >> 8) & 0xFF, total & 0xFF, 0)
+        return MiniProtocol._frame(0x0A, 0x12, 0x01, 0, (total >> 8) & 0xFF, total & 0xFF)
 
     @staticmethod
     def flash_window(n):
-        return MiniProtocol._frame(0x0A, 0x12, 0x02, (n >> 8) & 0xFF, n & 0xFF, 0)
+        return MiniProtocol._frame(0x0A, 0x12, 0x02, 0, (n >> 8) & 0xFF, n & 0xFF)
 
     @staticmethod
     def flash_commit(crc):
-        return MiniProtocol._frame(0x13, (crc >> 24) & 0xFF, (crc >> 16) & 0xFF,
-                                   (crc >> 8) & 0xFF, crc & 0xFF, 0)
+        return MiniProtocol._frame(0x13, 0, (crc >> 24) & 0xFF, (crc >> 16) & 0xFF,
+                                   (crc >> 8) & 0xFF, crc & 0xFF)
 
     @staticmethod
     def flash_apply():
@@ -681,15 +682,39 @@ class SerialTransport:
                 time.sleep(0.005)
         return None
 
+    def _drain_upload_window(self):
+        """Feed zeros so a half-open upload window on the device closes."""
+        if self._ser is None:
+            return
+        try:
+            self._ser.write(b"\x00" * 4096)
+            time.sleep(0.15)
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
+
     def flash_firmware(self, data, progress=None, chunk=1024):
+        # 固件侧按 256 字节一页搬运，镜像长度必须是 256 的整数倍
+        if len(data) % 256:
+            data = bytes(data) + b"\xff" * (256 - len(data) % 256)
+
         """Upload ``data`` (raw firmware image) into the device and reboot it."""
         total = len(data)
         if total <= 0 or total > 48000:
             return False, "image size out of range (%d bytes)" % total
         self._ser.reset_input_buffer()
+        # Close any half-open frame and reset the device's per-session byte budget
+        # (firmware >= v59 drops everything once 40 KB has gone through without a reset).
+        self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
+        self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
+        self._ser.write(MiniProtocol.lcd_enter_direct_mode())
+        self._ser.write(MiniProtocol.lcd_raw_end())
+        time.sleep(0.05)
+        self._ser.reset_input_buffer()
         self._ser.write(MiniProtocol.flash_begin(total))
         r = self._reply_byte(0x0A, 0x12, 3.0)
         if r != 0x06:
+            self._drain_upload_window()
             return False, "device refused the upload (0x%02X)" % (r if r is not None else 0)
         pos = 0
         while pos < total:
@@ -698,6 +723,7 @@ class SerialTransport:
             self._ser.write(part)
             r = self._reply_byte(0x0A, 0x12, 6.0)
             if r != 0x06:
+                self._drain_upload_window()
                 return False, "device did not confirm at byte %d (0x%02X)" % (pos, r if r is not None else 0)
             pos += len(part)
             if progress:
@@ -706,6 +732,7 @@ class SerialTransport:
         self._ser.write(MiniProtocol.flash_commit(crc))
         r = self._reply_byte(0x13, 0x00, 8.0)
         if r != 0x06:
+            self._drain_upload_window()
             return False, "CRC check failed on the device (0x%02X)" % (r if r is not None else 0)
         self._ser.write(MiniProtocol.flash_apply())
         time.sleep(0.2)

@@ -708,7 +708,7 @@ class SerialTransport:
         while time.monotonic() < end:
             buf += self._ser.read(self._ser.in_waiting or 1)
             i = buf.find(b"\x0a\x11", base)
-            if i >= 0 and len(buf) >= i + 9 and buf[i + 8] == 0xAA:
+            if i >= 0 and len(buf) >= i + 10 and buf[i + 9] == 0xAA:
                 mask = 0
                 for k in range(7):
                     mask |= buf[i + 2 + k] << (8 * k)

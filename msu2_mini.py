@@ -3,17 +3,21 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import faulthandler
 import io
 import json
 import logging
+import logging.handlers
 import os
 import random
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -254,7 +258,7 @@ class SerialTransport:
                 try:
                     self._ser = serial.Serial(self.port, self.baud,
                                               timeout=self.timeout,
-                                              write_timeout=None)
+                                              write_timeout=1.0)
                 except PermissionError:
                     if sys.platform == "win32":
                         self.last_error = f"{self.port} 被其它程序占用"
@@ -4380,8 +4384,72 @@ def cmd_selftest(port=None):
     return 0 if bad == 0 else 1
 
 
+def _data_dir():
+    """放日志与崩溃记录的地方；装到只读目录时退回用户目录。"""
+    bases = []
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            bases.append(Path(la) / "MSU2_MINI")
+    bases.append(Path.home() / ".msu2_mini")
+    for p in bases:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".writable"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return p
+        except Exception:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+_FAULT_FILE = None
+
+
+def _install_crash_handlers(data_dir):
+    """Python 未捕获异常 + 原生崩溃（0xc0000374 这种）都落盘，别让窗口一关什么都不剩。"""
+    global _FAULT_FILE
+    try:
+        _FAULT_FILE = open(data_dir / "crash.log", "a", buffering=1,
+                           encoding="utf-8", errors="replace")
+        _FAULT_FILE.write("\n===== %s 启动 pid=%d =====\n"
+                          % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()))
+        faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+    except Exception:
+        _FAULT_FILE = None
+
+    def _hook(exc_type, exc, tb):
+        try:
+            log.critical("未捕获异常", exc_info=(exc_type, exc, tb))
+        except Exception:
+            pass
+        try:
+            if _FAULT_FILE:
+                _FAULT_FILE.write("\n--- 未捕获异常 ---\n")
+                traceback.print_exception(exc_type, exc, tb, file=_FAULT_FILE)
+                _FAULT_FILE.flush()
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+    def _thook(a):
+        try:
+            log.error("线程 %s 抛出未捕获异常",
+                      getattr(a.thread, "name", "?"),
+                      exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+        except Exception:
+            pass
+
+    threading.excepthook = _thook
+
+
 def main(argv=None):
     _setup_stdio()
+    data_dir = _data_dir()
+    _install_crash_handlers(data_dir)
     ap = argparse.ArgumentParser(description="MSU2_MINI_Console")
     ap.add_argument("--config")
     ap.add_argument("--init-config", action="store_true")
@@ -4400,7 +4468,8 @@ def main(argv=None):
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)
     ap.add_argument("--log-level", default=None)
-    ap.add_argument("--log-file", default=None)
+    ap.add_argument("--log-file", default=str(data_dir / "console.log"),
+                    help="日志文件（默认 %s；传 none 关闭）" % (data_dir / "console.log"))
     args = ap.parse_args(argv)
 
     if args.list:
@@ -4421,9 +4490,11 @@ def main(argv=None):
         except Exception:
             stream = None
     handlers = [logging.StreamHandler(stream)]
-    if args.log_file:
+    if args.log_file and str(args.log_file).lower() not in ("none", "off", "-"):
         try:
-            handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+            handlers.append(logging.handlers.RotatingFileHandler(
+                args.log_file, maxBytes=2_000_000, backupCount=3,
+                encoding="utf-8"))
         except Exception:
             _console("无法写入日志文件: %s" % args.log_file)
 

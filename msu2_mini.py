@@ -119,12 +119,13 @@ def lcd_segment_payload(chunk):
 HEARTBEAT_INTERVAL = 2.0
 
 TOUCH_CH = 9
-TOUCH_SAMPLE_INTERVAL = 0.04
+TOUCH_SAMPLE_INTERVAL = 0.03
 TOUCH_LONG_PRESS = 0.8
-TOUCH_DOUBLE_WINDOW = 0.35
-TOUCH_MIN_TAP_GAP = 0.04
-TOUCH_RELEASE_RATIO = 0.5
+TOUCH_DOUBLE_WINDOW = 0.5
+TOUCH_MIN_TAP_GAP = 0.012
+TOUCH_RELEASE_RATIO = 0.3
 TOUCH_DEBOUNCE = 2
+TOUCH_RELEASE_DEBOUNCE = 1
 TOUCH_BASE_TRACK = 0.002
 TOUCH_DEFAULT_THRESHOLD = 60
 
@@ -1137,6 +1138,7 @@ class Scheduler(threading.Thread):
             min_gap=TOUCH_MIN_TAP_GAP,
             release_ratio=TOUCH_RELEASE_RATIO,
             debounce=TOUCH_DEBOUNCE,
+            release_debounce=TOUCH_RELEASE_DEBOUNCE,
             base_track=TOUCH_BASE_TRACK,
         )
         self._locked = False
@@ -1187,6 +1189,7 @@ class Scheduler(threading.Thread):
             min_gap=TOUCH_MIN_TAP_GAP,
             release_ratio=TOUCH_RELEASE_RATIO,
             debounce=TOUCH_DEBOUNCE,
+            release_debounce=TOUCH_RELEASE_DEBOUNCE,
             base_track=TOUCH_BASE_TRACK,
         )
 
@@ -3185,7 +3188,15 @@ def _check_widget_values(schema, values):
             return False, "%s: %s" % (label, err)
     return True, ""
 
+_PROBED = {}
+
+
 def _pick_free_port(used):
+    """自动挑一个能握手的串口。
+
+    握手成功的那条连接**不关**，留在 _PROBED 里交给 DeviceManager 直接复用：
+    否则探测时打一遍“串口已打开 / 固件版本”，_build 里再开一次又打一遍。
+    """
     try:
         ports = [p.device for p in serial.tools.list_ports.comports()]
     except Exception:
@@ -3199,11 +3210,12 @@ def _pick_free_port(used):
             ok = probe.open()
         except Exception:
             ok = False
-        finally:
-            probe.close()
         if ok:
+            _PROBED[name] = probe
             return name
+        probe.close()
     return ""
+
 
 class OfflineDevice:
     def __init__(self):
@@ -3263,11 +3275,17 @@ class DeviceManager:
                 continue
             did = str(dev.get("id") or ("dev%d" % (i + 1)))
             port = str(dev.get("port") or "auto")
+            reused = None
             if port.lower() in ("auto", ""):
                 port = _pick_free_port(used) or ""
+                reused = _PROBED.pop(port, None)
             if port:
                 used.add(port)
-            device = OfflineDevice() if port.lower() == "offline" else MiniDevice(port or "auto")
+            if reused is not None:
+                device = reused
+            else:
+                device = (OfflineDevice() if port.lower() == "offline"
+                          else MiniDevice(port or "auto"))
             sched = Scheduler(device, dev, on_config_changed=self._persist,
                               shared=self.cfg)
             self.schedulers[did] = sched

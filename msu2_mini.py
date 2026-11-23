@@ -1547,7 +1547,18 @@ class Scheduler(threading.Thread):
     def _poll_touch(self, now):
         v = self.device.read_touch()
         if v is None:
+            self._touch_zero_streak = 0
             return
+
+        # 设备端的转换是异步的，开机头一两拍可能还没有结果（返回 0）；
+        # 如果一直只拿到 0，说明 ADC 根本没在转换，这里明确报出来而不是静默失效。
+        if v <= 0:
+            self._touch_zero_streak = getattr(self, "_touch_zero_streak", 0) + 1
+            if self._touch_zero_streak == 25:
+                log.warning("触摸通道读数一直为 0：设备 ADC 没有产出结果"
+                            "（确认固件是 MSU2_open_v8 或更新）")
+            return
+        self._touch_zero_streak = 0
 
         had_base = self._touch.baseline is not None
         events = self._touch.feed(v, now)

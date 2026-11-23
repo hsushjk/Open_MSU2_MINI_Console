@@ -57,6 +57,11 @@ class TouchGestures:
         if value is False:
             return []
 
+        # 0 是“设备还没有转换结果”的占位值（异步取值的第一拍），
+        # 不能当真实读数参与标定，否则基准会被拉到 0 附近、永远判不出按下。
+        if value <= 0 and (self.baseline is None or self.baseline > 500):
+            return []
+
         if self.baseline is None:
             self._cal.append(value)
             if len(self._cal) >= self.calibrate:

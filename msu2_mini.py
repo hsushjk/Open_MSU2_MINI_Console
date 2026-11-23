@@ -691,10 +691,12 @@ class FrameEncoder:
         self._last_raw = None
         self._last_tile_raw = None
         self.last_full = False
+        self._force_full = True
 
     def reset(self):
         self._last_raw = None
         self._last_tile_raw = None
+        self._force_full = True
 
     @staticmethod
     def _to_rgb565(img):
@@ -722,7 +724,7 @@ class FrameEncoder:
             img = img.convert("RGB")
         raw = self._to_rgb565(img)
         self.last_full = False
-        if raw == self._last_raw:
+        if raw == self._last_raw and not self._force_full:
             return b""
         self._last_raw = raw
 
@@ -732,12 +734,15 @@ class FrameEncoder:
         out += MiniProtocol.lcd_enter_direct_mode()
 
         if raw_mode:
-            # v23: one full-screen 0x09 per frame, device answers one verdict
-            # byte and we only send the next frame after reading it. Tile deltas
-            # leave a broken tile broken forever - that is why tearing stuck.
-            self._last_tile_raw = None
-            self.last_full = True
-            return bytes(out + self._encode_full(raw))
+            # 差分优先：每帧只发变化的 16x16 块（几百字节到 2 KB）。
+            # 整帧 25.6 KB 对设备是重负荷，链路一丢就是永久残影；
+            # 只有首帧、纠错、定时刷新和变化块过多时才发整帧。
+            if self._force_full:
+                self._force_full = False
+                self._last_tile_raw = raw
+                self.last_full = True
+                return bytes(out + self._encode_full(raw))
+            return bytes(out + self._encode_tiles(raw))
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -874,6 +879,9 @@ class MiniDevice:
 
     def _show_image_once(self, img):
         t0 = time.perf_counter()
+        if time.monotonic() - getattr(self, "_last_full_t", 0.0) > 3.0:
+            self.encoder._force_full = True
+            self._last_full_t = time.monotonic()
         frame = self.encoder.encode(
             img, raw_mode=getattr(self.transport, "raw_mode", False))
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
@@ -909,6 +917,14 @@ class MiniDevice:
             return False
         fw = getattr(self.transport, "fw_version", None)
         raw = bool(getattr(self.transport, "raw_mode", False))
+        if not getattr(self.encoder, "last_full", False):
+            # 差分帧：每条收流命令都会回一个裁决字节，不读掉会污染
+            # 后面的触摸应答缓冲；这里只清理，不判成败。
+            want_delta = bytes(frame).count(END_FRAME)
+            if want_delta:
+                self.transport.read_verdicts(want_delta, 0.08)
+            self.self_paced = True
+            return True
         if raw and fw is not None and fw >= (23, 0):
             # Full frame written; wait for the device verdict byte. 0x06 = all
             # 12800 pixels arrived, 0x15 = short. We never send the next frame

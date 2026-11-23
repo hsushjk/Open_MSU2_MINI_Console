@@ -2030,6 +2030,17 @@ class Scheduler(threading.Thread):
             log.info("触摸触发关闭程序")
             if callable(self._on_shutdown):
                 self._on_shutdown()
+        elif action == "dim_down":
+            self.set_dim(max(0, self._dim - 15))
+            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
+        elif action == "dim_up":
+            self.set_dim(min(90, self._dim + 15))
+            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
+        elif action == "dim_cycle":
+            steps = [0, 30, 60, 90]
+            nxt = next((x for x in steps if x > self._dim), steps[0])
+            self.set_dim(nxt)
+            self.notify("亮度 %d%%" % (100 - nxt), 1.0)
         elif action == "blank":
             size = PORTRAIT_SIZE if self.orientation == PORTRAIT else LANDSCAPE_SIZE
             self._overlay = Image.new("RGBA", size, (0, 0, 0, 255))
@@ -2245,7 +2256,8 @@ _CONFIG_LOCK = threading.RLock()
 
 _TOUCH_ACTIONS = ("passthrough", "next_page", "prev_page", "flip",
                   "toggle_orientation", "lock", "screenshot",
-                  "mute_toggle", "macro", "launch", "shutdown")
+                  "mute_toggle", "macro", "launch", "shutdown", "blank",
+                  "dim_down", "dim_up", "dim_cycle")
 
 _TOUCH_DEFAULTS = {
     "single": "passthrough",
@@ -2837,6 +2849,10 @@ const TOUCH_ACTIONS = [
   ["macro", "自定义键盘宏"],
   ["launch", "自定义程序"],
   ["shutdown", "关闭程序"],
+  ["blank", "熄屏 5 秒"],
+  ["dim_down", "亮度 -15%"],
+  ["dim_up", "亮度 +15%"],
+  ["dim_cycle", "亮度循环 0/30/60/90"],
 ];
 
 function fillTouchSelect(sel) {

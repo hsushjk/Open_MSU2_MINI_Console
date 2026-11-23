@@ -489,7 +489,7 @@ class SerialTransport:
                                 "dim": buf[6],
                                 "orient": buf[7],
                                 "reverse": buf[8],
-                                "page": buf[9],
+                                "flags": buf[9],
                             }
                             del buf[:11]
                             return info
@@ -499,7 +499,7 @@ class SerialTransport:
                 log.debug("读设备存档失败: %s", e)
             return None
 
-    def devcfg_write(self, dim, orient, reverse, page, timeout=1.5):
+    def devcfg_write(self, dim, orient, reverse, flags=0, timeout=1.5):
         """把配置写进设备 NOR；成功返回 True。擦除+编程约 20 ms，别和发帧抢串口。"""
         with self._lock:
             if not self._connected or not self._ser:
@@ -507,7 +507,7 @@ class SerialTransport:
             try:
                 self._ser.reset_input_buffer()
                 self._ser.write(MiniProtocol.devcfg_write(dim, orient,
-                                                          reverse, page))
+                                                          reverse, flags))
                 t0 = time.monotonic()
                 buf = bytearray()
                 while time.monotonic() - t0 < timeout:
@@ -938,8 +938,8 @@ class MiniDevice:
     def devcfg_info(self):
         return self.transport.devcfg_info()
 
-    def devcfg_write(self, dim, orient, reverse, page):
-        return self.transport.devcfg_write(dim, orient, reverse, page)
+    def devcfg_write(self, dim, orient, reverse, flags=0):
+        return self.transport.devcfg_write(dim, orient, reverse, flags)
 
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
@@ -1410,9 +1410,9 @@ class Scheduler(threading.Thread):
         if not isinstance(tk, dict):
             tk = {}
         self._touch_cfg = {
-            "single": tk.get("single", "next_page"),
-            "double": tk.get("double", "toggle_orientation"),
-            "long":   tk.get("long",   "toggle_reverse"),
+            "single": tk.get("single", "passthrough"),
+            "double": tk.get("double", "passthrough"),
+            "long":   tk.get("long",   "passthrough"),
             "macro_single": str(tk.get("macro_single", "") or ""),
             "macro_double": str(tk.get("macro_double", "") or ""),
             "macro_long":   str(tk.get("macro_long", "") or ""),
@@ -1588,71 +1588,55 @@ class Scheduler(threading.Thread):
         if self.config.get("current_page") != name:
             self.config["current_page"] = name
             self._save_config()
-            self._devcfg_dirty = True
 
     # ---------- 设备端配置存档（v30 起：板载 NOR 记住亮度/朝向/翻转/页） ----------
     def _devcfg_boot_sync(self):
-        """连上设备后先读它记的配置：设备是断电记忆的权威，读回来就用。"""
+        """连上设备后先读一眼它记的东西（只是日志），然后以上位机为准把值写进去。
+
+        设备存档的意义是“不接上位机时它也懂自己该什么亮度/朝向”，
+        一旦连上上位机，显示相关的一切听上位机的。
+        """
+        if not getattr(self, "_devcfg_supported", True):
+            return
         try:
             info = self.device.devcfg_info()
         except Exception:
             info = None
         if not info:
-            self._devcfg_dirty = True        # 老固件或读不到：先把当前配置写进去
+            log.info("设备存档不可用（v31 之前，或 NOR 读不到）")
+            self._devcfg_supported = False
+            self._devcfg_dirty = False
             return
-        log.info("设备存档: NOR=%s 有效=%s 亮度=%d 朝向=%s 翻转=%s 页=%d",
+        log.info("设备存档: NOR=%s 有效=%s 亮度=%d%% 朝向=%s 翻转=%s 调试=%s",
                  info["flash_id"], "是" if info["valid"] else "否",
-                 info["dim"], "竖屏" if info["orient"] else "横屏",
-                 "开" if info["reverse"] else "关", info["page"])
-        if not info["valid"]:
-            self._devcfg_dirty = True
-            return
-        dim = _coerce_int(info["dim"], self._dim, 0, 90)
-        if dim != self._dim:
-            self._dim = dim
-            self.config.setdefault("display", {})["dim"] = dim
-            log.info("从设备恢复伪亮度: %d%%", 100 - dim)
-        orient = PORTRAIT if info["orient"] else LANDSCAPE
-        if orient != self.orientation:
-            self.orientation = orient
-            self.ctx.orientation = orient
-            self.config["orientation"] = orient
-            try:
-                self._ensure_supported()
-            except Exception:
-                pass
-            log.info("从设备恢复朝向: %s", orient)
-        rev = bool(info["reverse"])
-        if rev != self.reverse:
-            self.reverse = rev
-            self.device.set_reverse(rev)
-            self.config["reverse"] = rev
-            log.info("从设备恢复翻转: %s", rev)
-        # 页只在配置里没记过时采用（插件顺序可能变过，硬套索引不可靠）
-        if "current_page" not in self.config and self._widgets:
-            idx = min(int(info["page"]), len(self._widgets) - 1)
-            if idx != self._current:
-                self._current = idx
-                log.info("从设备恢复页: %s", self._widgets[idx].name)
-        self._switch.set()
+                 100 - info["dim"], "竖屏" if info["orient"] else "横屏",
+                 "开" if info["reverse"] else "关",
+                 "开" if (info.get("flags") or 0) & 1 else "关")
+        stored = (100 - info["dim"],
+                  1 if info["orient"] else 0,
+                  1 if info["reverse"] else 0)
+        mine = (100 - self._dim,
+                1 if self.orientation == PORTRAIT else 0,
+                1 if self.reverse else 0)
+        if not info["valid"] or stored != mine:
+            self._devcfg_dirty = True     # 让主循环把上位机的值盖上去
 
     def _flush_devcfg(self):
         """把当前配置写进设备 NOR。只在主循环的空档调用——绝不能和发帧抢串口。"""
-        page = self._current if self._widgets else 0
         ok = False
         try:
             ok = self.device.devcfg_write(
                 _coerce_int(self._dim, 0, 0, 90),
                 1 if self.orientation == PORTRAIT else 0,
                 1 if self.reverse else 0,
-                page & 0xFF)
+                0)
         except Exception as e:
             log.warning("写设备存档异常: %s", e)
         self._devcfg_dirty = False
         if ok:
-            log.info("设备存档已更新: 亮度 %d%% 朝向 %s 页 %s",
-                     self._dim, self.orientation,
-                     self._widgets[page].name if self._widgets else "-")
+            log.info("亮度 %d%% 朝向 %s 翻转 %s",
+                     100 - self._dim, self.orientation,
+                     "开" if self.reverse else "关")
         else:
             log.warning("设备存档写入失败（下次改设置时会重试）")
 
@@ -1744,7 +1728,7 @@ class Scheduler(threading.Thread):
         self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
         self._devcfg_dirty = True        # 亮度也记到设备里
         self._force_send = True
-        log.info("伪亮度 -> %d%%", 100 - v)
+        log.info("亮度 -> %d%%", 100 - v)
         return True
 
     def toggle_lock(self, from_touch=False):
@@ -2033,25 +2017,25 @@ class Scheduler(threading.Thread):
         elif action == "screenshot":
             threading.Thread(target=_act_screenshot, daemon=True).start()
         elif action == "mute_toggle":
-            self._run_with_notify(_act_mute_toggle, "静音状态已切换", "静音切换失败")
+            threading.Thread(target=_act_mute_toggle, daemon=True).start()
         elif action == "macro":
             self._run_with_notify(_act_send_macro, "已发送键盘宏", "键盘宏发送失败",
                                   macro)
         elif action == "launch":
-            self._run_with_notify(_act_launch_program, "已启动程序", "启动程序失败",
+            self._run_with_notify(_act_launch_program, "已启动可执行文件", "启动可执行文件失败",
                                   program)
         elif action == "shutdown":
-            log.info("触摸触发关闭程序")
-            self.notify("正在关闭程序…", 2.0)
+            log.info("触摸触发关闭上位机")
+            self.notify("上位机正在被关闭…", 2.0)
             if callable(self._on_shutdown):
                 self._on_shutdown()
         elif action == "dim_up":
             # 提高亮度 = 减少压暗量
             self.set_dim(max(0, self._dim - 15))
-            self.notify("伪亮度 %d%%" % (100 - self._dim), 1.0)
+            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
         elif action == "dim_down":
             self.set_dim(min(90, self._dim + 15))
-            self.notify("伪亮度 %d%%" % (100 - self._dim), 1.0)
+            self.notify("亮度 %d%%" % (100 - self._dim), 1.0)
         else:
             log.warning("未知触摸动作: %s", action)
 
@@ -2848,13 +2832,13 @@ const TOUCH_ACTIONS = [
   ["flip", "上下翻转", "小屏"],
   ["toggle_orientation", "横竖屏切换", "小屏"],
   ["lock", "锁定/解锁当前页", "小屏"],
-  ["dim_up", "伪亮度 +15%（屏幕更亮）", "小屏"],
-  ["dim_down", "伪亮度 -15%（屏幕更暗）", "小屏"],
-  ["screenshot", "截屏（宿主机）", "电脑"],
-  ["mute_toggle", "静音 / 解除（宿主机）", "电脑"],
-  ["macro", "自定义键盘宏（宿主机）", "电脑"],
-  ["launch", "启动自定义程序（宿主机）", "电脑"],
-  ["shutdown", "关闭程序（宿主机）", "电脑"],
+  ["dim_up", "亮度 +15%", "小屏"],
+  ["dim_down", "亮度 -15%", "小屏"],
+  ["screenshot", "截屏", "宿主机"],
+  ["mute_toggle", "静音 / 解除", "宿主机"],
+  ["macro", "自定义键盘宏", "宿主机"],
+  ["launch", "启动可执行文件", "宿主机"],
+  ["shutdown", "关闭上位机", "宿主机"],
 ];
 
 function fillTouchSelect(sel) {
@@ -4520,10 +4504,11 @@ def cmd_selftest(port=None):
         # 0) 设备存档（v30 起：板载 NOR 记得亮度/朝向/翻转/页）
         info = tr.devcfg_info()
         if info:
-            _console("  存档 NOR=%s 有效=%s 亮度=%d 朝向=%s 翻转=%s 页=%d"
+            _console("  存档 NOR=%s 有效=%s 亮度=%d%% 朝向=%s 翻转=%s 调试=%s"
                      % (info["flash_id"], "是" if info["valid"] else "否",
-                        info["dim"], "竖" if info["orient"] else "横",
-                        "开" if info["reverse"] else "关", info["page"]))
+                        100 - info["dim"], "竖" if info["orient"] else "横",
+                        "开" if info["reverse"] else "关",
+                     "开" if (info.get("flags") or 0) & 1 else "关"))
         else:
             _console("  设备存档不可用（v30 之前，或 NOR 读不到）")
 

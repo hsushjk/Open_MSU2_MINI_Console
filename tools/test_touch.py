@@ -1,0 +1,77 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from msu2_core.touch import TouchGestures
+
+BASE = 3925
+THR = 60
+DT = 0.03
+PRESS = BASE - THR - 40
+ok = True
+
+
+def check(name, cond, detail=""):
+    global ok
+    ok = ok and bool(cond)
+    print(("PASS " if cond else "FAIL ") + name + (" " + detail if detail else ""))
+
+
+def run(seq, g=None):
+    g = g or TouchGestures(threshold=THR)
+    events = []
+    t = 0.0
+    for v in seq:
+        for e in g.feed(v, t):
+            events.append((t, e))
+        t += DT
+    return g, events
+
+
+def names(events):
+    return [e for _, e in events]
+
+
+# 1) 单点：抬手后超过一个双击窗口才报单击
+_, ev = run([BASE] * 20 + [PRESS] * 4 + [BASE] * 40)
+check("单点", names(ev) == ["single"], str(names(ev)))
+if ev:
+    release_ts = 24 * DT
+    fire_ts = ev[0][0]
+    check("单击时机", release_ts + 0.35 < fire_ts <= release_ts + 0.35 + 2 * DT,
+          "fire=%.2f release=%.2f" % (fire_ts, release_ts))
+
+# 2) 短促双击：两下之间只隔 3 个采样
+_, ev = run([BASE] * 20 + [PRESS] * 3 + [BASE] * 3 + [PRESS] * 3 + [BASE] * 20)
+check("双击", names(ev) == ["double"], str(names(ev)))
+
+# 3) 长按
+_, ev = run([BASE] * 20 + [PRESS] * 40 + [BASE] * 10)
+check("长按", names(ev) == ["long"], str(names(ev)))
+
+# 4) 阈值附近抖动：只按一次，读数上下跳，不应误判双击
+jitter = [BASE - THR + 2, BASE - THR - 2, BASE - THR + 3, BASE - THR - 3, BASE]
+_, ev = run([BASE] * 20 + jitter + [BASE] * 20)
+check("抖动不误判", names(ev) == [], str(names(ev)))
+
+# 5) 两下间隔太远：两次单击
+_, ev = run([BASE] * 20 + [PRESS] * 3 + [BASE] * 15 + [PRESS] * 3 + [BASE] * 25)
+check("两次单击", names(ev) == ["single", "single"], str(names(ev)))
+
+# 6) 基准缓慢漂移仍能触发
+seq = []
+curve = 0.0
+for _ in range(300):
+    seq.append(BASE + min(30.0, curve))
+    curve += 0.2
+seq += [BASE + 30 - THR - 40] * 4 + [BASE + 30] * 30
+_, ev = run(seq)
+check("基准漂移", names(ev) == ["single"], str(names(ev)))
+
+# 7) 单击之后紧跟长按：不能变成双击
+_, ev = run([BASE] * 20 + [PRESS] * 3 + [BASE] * 15 + [PRESS] * 40 + [BASE] * 10)
+check("单击后长按", names(ev) == ["single", "long"], str(names(ev)))
+
+print("ALL PASS" if ok else "SOME FAILED")
+sys.exit(0 if ok else 1)

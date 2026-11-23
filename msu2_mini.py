@@ -60,6 +60,7 @@ try:
         probe_fonts, set_user_font, get_font,
         merge_config,
     )
+    from msu2_core.touch import TouchGestures
     import widgets as _widgets_pkg
 except ImportError as e:
     _console(f"无法导入 msu2_core/widgets: {e}"); sys.exit(1)
@@ -118,9 +119,13 @@ def lcd_segment_payload(chunk):
 HEARTBEAT_INTERVAL = 2.0
 
 TOUCH_CH = 9
-TOUCH_SAMPLE_INTERVAL = 0.06
+TOUCH_SAMPLE_INTERVAL = 0.03
 TOUCH_LONG_PRESS = 0.8
 TOUCH_DOUBLE_WINDOW = 0.35
+TOUCH_MIN_TAP_GAP = 0.04
+TOUCH_RELEASE_RATIO = 0.5
+TOUCH_DEBOUNCE = 2
+TOUCH_BASE_TRACK = 0.002
 TOUCH_DEFAULT_THRESHOLD = 60
 
 def _asset_dir(name):
@@ -1080,13 +1085,16 @@ class Scheduler(threading.Thread):
         self._watch_ts = 0.0
 
         self._touch_baseline = None
-        self._touch_cal = []
-        self._touch_pressed = False
-        self._touch_press_ts = 0.0
         self._touch_last_sample_ts = 0.0
-        self._touch_waiting_double = False
-        self._touch_double_ts = 0.0
-        self._touch_long_fired = False
+        self._touch = TouchGestures(
+            threshold=TOUCH_DEFAULT_THRESHOLD,
+            long_press=TOUCH_LONG_PRESS,
+            double_window=TOUCH_DOUBLE_WINDOW,
+            min_gap=TOUCH_MIN_TAP_GAP,
+            release_ratio=TOUCH_RELEASE_RATIO,
+            debounce=TOUCH_DEBOUNCE,
+            base_track=TOUCH_BASE_TRACK,
+        )
         self._locked = False
         self._load_touch_cfg(config)
 
@@ -1127,13 +1135,16 @@ class Scheduler(threading.Thread):
                                      TOUCH_DEFAULT_THRESHOLD, 5, 2000),
         }
         self._touch_baseline = None
-        self._touch_cal = []
-        self._touch_pressed = False
-        self._touch_press_ts = 0.0
         self._touch_last_sample_ts = 0.0
-        self._touch_waiting_double = False
-        self._touch_double_ts = 0.0
-        self._touch_long_fired = False
+        self._touch = TouchGestures(
+            threshold=self._touch_cfg["threshold"],
+            long_press=TOUCH_LONG_PRESS,
+            double_window=TOUCH_DOUBLE_WINDOW,
+            min_gap=TOUCH_MIN_TAP_GAP,
+            release_ratio=TOUCH_RELEASE_RATIO,
+            debounce=TOUCH_DEBOUNCE,
+            base_track=TOUCH_BASE_TRACK,
+        )
 
     def set_touch_config(self, new_cfg):
         if not isinstance(new_cfg, dict):
@@ -1535,47 +1546,19 @@ class Scheduler(threading.Thread):
         if v is None:
             return
 
-        if self._touch_baseline is None:
-            self._touch_cal.append(v)
-            if len(self._touch_cal) >= 6:
-                self._touch_baseline = min(self._touch_cal)
-                log.info("触摸基准 = %d", self._touch_baseline)
-            return
+        had_base = self._touch.baseline is not None
+        events = self._touch.feed(v, now)
+        self._touch_baseline = self._touch.baseline
+        if not had_base and self._touch.baseline is not None:
+            log.info("触摸基准 = %d", int(self._touch.baseline))
+        if self._touch.pressed:
+            log.debug("touch adc=%d base=%d thr=%d pressed",
+                      v, int(self._touch.baseline), self._touch_cfg["threshold"])
 
-        thr = self._touch_cfg["threshold"]
-        pressed = v < (self._touch_baseline - thr)
-        log.debug("touch adc=%d base=%d thr=%d pressed=%s",
-                  v, self._touch_baseline, thr, pressed)
-
-        if pressed and not self._touch_pressed:
-            self._touch_press_ts = now
-            self._touch_pressed = True
-            self._touch_long_fired = False
-        elif pressed and self._touch_pressed:
-            if (not self._touch_long_fired and
-                    now - self._touch_press_ts >= TOUCH_LONG_PRESS):
-                self._touch_long_fired = True
-                self._touch_waiting_double = False
-                log.info("触摸: 长按")
-                self._dispatch_touch("long")
-        elif not pressed and self._touch_pressed:
-            self._touch_pressed = False
-            if self._touch_long_fired:
-                pass
-            elif (self._touch_waiting_double and
-                    now - self._touch_double_ts <= TOUCH_DOUBLE_WINDOW):
-                self._touch_waiting_double = False
-                log.info("触摸: 双击")
-                self._dispatch_touch("double")
-            else:
-                self._touch_waiting_double = True
-                self._touch_double_ts = now
-
-        if self._touch_waiting_double and \
-                now - self._touch_double_ts > TOUCH_DOUBLE_WINDOW:
-            self._touch_waiting_double = False
-            log.info("触摸: 单击")
-            self._dispatch_touch("single")
+        for gesture in events:
+            log.info("触摸: %s", {"single": "单击", "double": "双击",
+                                 "long": "长按"}.get(gesture, gesture))
+            self._dispatch_touch(gesture)
 
     def _dispatch_touch(self, gesture):
         action = self._touch_cfg.get(gesture, "passthrough")

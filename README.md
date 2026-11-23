@@ -18,12 +18,23 @@
 
 ## 使用
 
+推荐用 pip 安装（跑在正常解释器里，标准库和依赖都没有限制，插件用什么都行）：
+
+```bash
+pip install .
+msu2-console          # 或 python -m msu2_mini
+```
+
+可选依赖：`pip install ".[extras]"`（pynput + mss），或 `pip install ".[full]"`（再加 numpy、pywin32）。
+
+从源码直接跑：
+
 ```bash
 pip install -r requirements.txt
 python msu2_mini.py
 ```
 
-打包：
+打包成单文件 exe（给没有 Python 的机器用，解释器只带主程序用到的标准库）：
 
 ```bash
 build.bat

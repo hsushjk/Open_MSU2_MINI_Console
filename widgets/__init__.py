@@ -65,6 +65,14 @@ def _candidate_dirs():
             out.append(Path(base) / "MSU2_MINI" / "widgets")
     else:
         out.append(app / "widgets_ext")
+        base = os.environ.get("LOCALAPPDATA")
+        if not base:
+            try:
+                base = str(Path.home() / ".local" / "share")
+            except Exception:
+                base = ""
+        if base:
+            out.append(Path(base) / "MSU2_MINI" / "widgets")
     return out
 
 

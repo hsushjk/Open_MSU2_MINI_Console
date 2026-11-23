@@ -112,7 +112,8 @@ def set_user_font(path_or_name: str):
 
 def _font_roots():
     roots = []
-    for base in (_RES_DIR, _APP_DIR):
+    pkg_dir = Path(__file__).resolve().parent
+    for base in (_RES_DIR, _APP_DIR, pkg_dir, _RES_DIR / "msu2_core", _APP_DIR / "msu2_core"):
         p = base / "assets" / "fonts"
         if p not in roots:
             roots.append(p)

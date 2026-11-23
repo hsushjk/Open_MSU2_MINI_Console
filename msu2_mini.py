@@ -123,8 +123,16 @@ TOUCH_LONG_PRESS = 0.8
 TOUCH_DOUBLE_WINDOW = 0.35
 TOUCH_DEFAULT_THRESHOLD = 60
 
+def _asset_dir(name):
+    for base in (_APP_DIR, _APP_DIR / "msu2_core", Path(__file__).resolve().parent,
+                 Path(__file__).resolve().parent / "msu2_core"):
+        p = base / "assets" / name
+        if p.is_dir():
+            return p
+    return _APP_DIR / "assets" / name
+
 SCREENSHOT_DIR = _APP_DIR / "screenshots"
-DEFAULT_GIF_DIR = _APP_DIR / "assets" / "gif"
+DEFAULT_GIF_DIR = _asset_dir("gif")
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_RESOURCE_BYTES = 8 * 1024 * 1024
@@ -1784,7 +1792,25 @@ class Scheduler(threading.Thread):
             self._teardown_all()
             log.info("Scheduler 退出")
 
-DEFAULT_CONFIG_PATH = str(_APP_DIR / "config.json")
+def _default_config_path():
+    local = _APP_DIR / "config.json"
+    installed = "site-packages" in _APP_DIR.parts or "dist-packages" in _APP_DIR.parts
+    if not installed:
+        try:
+            probe = _APP_DIR / ".write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return str(local)
+        except Exception:
+            pass
+    try:
+        home = Path.home() / ".msu2_mini"
+        home.mkdir(parents=True, exist_ok=True)
+        return str(home / "config.json")
+    except Exception:
+        return str(local)
+
+DEFAULT_CONFIG_PATH = _default_config_path()
 
 _CONFIG_LOCK = threading.RLock()
 

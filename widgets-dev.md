@@ -1,4 +1,4 @@
-# 插件开发和导入手册
+﻿# 插件开发和导入手册
 
 **您可能觉得我的项目写的可差，确实差，我基本上不怎么会python，敬请谅解**
 
@@ -371,7 +371,7 @@ f = get_font(20, bold=True)         # 粗体（内置 Bold 字重）
 f = get_font(20, cjk=False)         # 参数仅保留兼容，字体同上
 ```
 
-字体固定为随程序分发的 **Noto Sans Mono CJK SC**（`assets/fonts/`，SIL OFL 1.1），
+字体固定为随程序分发的 **Noto Sans Mono CJK SC**（`msu2_core/assets/fonts/`，SIL OFL 1.1），
 不依赖系统字体，各平台渲染结果一致，数字与英文都是等宽的。
 `cjk` 参数只为兼容旧代码保留，两种取值使用同一字体。
 

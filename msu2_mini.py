@@ -876,6 +876,20 @@ class MiniDevice:
         return self._show_image_once(img)
 
     def _show_image_once(self, img):
+        # 一帧要分好几笔写（2 KB 一次）+ 等设备回执。这段时间里如果别的
+        # 线程往串口写 6 字节命令（改亮度、读存档、开关调试），设备会把
+        # 它们当成像素吃进去 —— 整帧从此错位，就是那种“局部一块花掉”。
+        # 所以整帧独占串口锁（RLock，write() 内部同名锁可重入）。
+        _lock = getattr(self.transport, "_lock", None)
+        if _lock is not None:
+            _lock.acquire()
+        try:
+            return self._show_image_once_locked(img)
+        finally:
+            if _lock is not None:
+                _lock.release()
+
+    def _show_image_once_locked(self, img):
         t0 = time.perf_counter()
         frame = self.encoder.encode(
             img, raw_mode=getattr(self.transport, "raw_mode", False))
@@ -2939,7 +2953,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <div style="font-size:13px">
     <label><input type="checkbox" id="disp-debug" onchange="applyDebug()"> 调试模式</label>
     <span class="msg" id="msg-debug"></span>
-    <span class="tiny">在屏上画联机点和完整性角标，仅排查用；开关记在设备里，不接上位机也有效。</span>
+    <span class="tiny">在屏上画联机点和完整性角标，仅排查用；只在本届会话有效，断电重开自动关闭。</span>
   </div>
 </div>
 
@@ -3115,7 +3129,7 @@ function devResult(j, okText, where) {
     return;
   }
   if (j.stored === false) {
-    setMsg(box, '设备没有确认（可能没连设备）', true);
+    setMsg(box, '设备没有应答（可能没连设备）', true);
     return;
   }
   setMsg(box, okText, false);
@@ -3123,45 +3137,34 @@ function devResult(j, okText, where) {
 
 async function applyDim() {
   const el = document.getElementById('disp-dim');
-  if (!el || devBusy) return;
+  if (!el) return;
   const bright = parseInt(el.value, 10);
   const dim = isNaN(bright) ? 0 : Math.max(0, Math.min(90, 100 - bright));
-  lockDev('正在写入设备…');
   try {
     const j = await postJSON('/api/dim', { dim: dim });
-    devResult(j, '亮度 ' + (100 - j.dim) + '%');
+    setMsg('msg-display', '亮度 ' + (100 - j.dim) + '%', false);
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
-  } finally {
-    unlockDev();
   }
 }
 
 async function applyOrient() {
-  if (devBusy) return;
-  lockDev('正在写入设备…');
   try {
     const j = await postJSON('/api/orientation', {});
-    devResult(j, '方向已切换');
+    setMsg('msg-display', (j && j.ok === false) ? '失败' : '方向已切换', false);
     loadStatus();
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
-  } finally {
-    unlockDev();
   }
 }
 
 async function applyReverse() {
-  if (devBusy) return;
-  lockDev('正在写入设备…');
   try {
     const j = await postJSON('/api/reverse', {});
-    devResult(j, '已翻转');
+    setMsg('msg-display', (j && j.ok === false) ? '失败' : '已翻转', false);
     loadStatus();
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
-  } finally {
-    unlockDev();
   }
 }
 
@@ -3176,15 +3179,14 @@ async function loadDebug() {
 async function applyDebug() {
   const el = document.getElementById('disp-debug');
   if (!el || devBusy) return;
-  lockDev('');
-  setMsg('msg-debug', '正在写入设备…', false);
+  setMsg('msg-debug', '正在下发…', false);
   try {
     const j = await postJSON('/api/debug', { on: el.checked });
     devResult(j, el.checked ? '调试模式已开' : '调试模式已关', 'msg-debug');
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
-  } finally {
-    unlockDev();
+  } catch(e2) {
+    setMsg('msg-debug', '失败: ' + e2, true);
   }
 }
 

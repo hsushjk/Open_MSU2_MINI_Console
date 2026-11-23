@@ -26,6 +26,26 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 _HERE = str(_APP_DIR)
+def _icon_bytes():
+    """浏览器标签图标：和 exe 用同一张 icon.ico。"""
+    try:
+        cands = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+        cands.append(_APP_DIR / "icon.ico")
+        cands.append(Path(_HERE) / "icon.ico")
+        for f in cands:
+            try:
+                if f.is_file():
+                    return f.read_bytes()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return b""
+
+
 __version__ = "2.2.2"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -3258,8 +3278,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <option value="0">黑屏</option>
         <option value="1">四角方块（白黄闪）</option>
         <option value="2">图片轮播</option>
-        <option value="3">小球弹跳（带拖尾）</option>
-        <option value="4">呼吸灯</option>
+        <option value="3">Ping-Pong</option>
       </select>
     </label>
     <label id="asset-dwell-wrap" style="font-size:12px;color:#666;margin-left:12px">每张
@@ -4648,6 +4667,14 @@ class WebUI(threading.Thread):
 
                 if path in ("/", "/index.html"):
                     self._html(INDEX_HTML); return
+
+                if path in ("/favicon.ico", "/favicon.png"):
+                    ico = _icon_bytes()
+                    if ico:
+                        self._send(ico, "image/x-icon")
+                    else:
+                        self.send_error(404)
+                    return
 
                 if path == "/api/devices":
                     self._json({"ok": True,

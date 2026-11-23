@@ -3751,6 +3751,23 @@ def _widget_class_name(name):
     return base + "Widget"
 
 
+def _user_widgets_dir():
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        base = os.environ.get("XDG_DATA_HOME")
+    if not base:
+        try:
+            base = str(Path.home() / ".local" / "share")
+        except Exception:
+            return None
+    try:
+        p = Path(base) / "MSU2_MINI" / "widgets"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:
+        return None
+
+
 def cmd_new_widget(name):
     raw = str(name or "").strip()
     if not raw:
@@ -3768,6 +3785,9 @@ def cmd_new_widget(name):
     except Exception:
         ext_dirs = []
     target_dir = Path(ext_dirs[0]) if ext_dirs else (Path(_APP_DIR) / "widgets_ext")
+    if not getattr(sys, "frozen", False) and ("site-packages" in _APP_DIR.parts
+                                              or "dist-packages" in _APP_DIR.parts):
+        target_dir = _user_widgets_dir() or target_dir
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:

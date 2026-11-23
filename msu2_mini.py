@@ -2194,131 +2194,149 @@ class Scheduler(threading.Thread):
         last_bg_ts = 0.0
         try:
             while not self._stop.is_set():
-                if not self.device.connected:
-                    if not self.device.open():
-                        time.sleep(1.0); continue
-                    self.device.set_reverse(self.reverse)
-                    self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
-                    last_mono = 0.0
-                    last_bg_ts = 0.0
-                    self._devcfg_boot_sync()
+                try:
+                    if not self.device.connected:
+                        if not self.device.open():
+                            time.sleep(1.0); continue
+                        self.device.set_reverse(self.reverse)
+                        self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
+                        last_mono = 0.0
+                        last_bg_ts = 0.0
+                        self._devcfg_boot_sync()
 
-                self._drain_ops()
-                self._watch_widgets(time.monotonic())
+                    self._drain_ops()
+                    self._watch_widgets(time.monotonic())
 
-                if self._devcfg_dirty:
-                    self._flush_devcfg()
+                    if self._devcfg_dirty:
+                        self._flush_devcfg()
 
-                widgets = self._widgets
-                current = self._current
-                if not widgets or current >= len(widgets):
-                    time.sleep(0.5); continue
+                    widgets = self._widgets
+                    current = self._current
+                    if not widgets or current >= len(widgets):
+                        time.sleep(0.5); continue
 
-                if self._switch.is_set():
-                    self._switch.clear()
-                    last_mono = 0.0
-                    last_bg_ts = 0.0
-                    self._handle_switch()
+                    if self._switch.is_set():
+                        self._switch.clear()
+                        last_mono = 0.0
+                        last_bg_ts = 0.0
+                        self._handle_switch()
 
-                w = widgets[current]
-                now = time.time()
-                mono = time.monotonic()
-                self.ctx.now = now
-                self.ctx.orientation = self.orientation
-                wctx = self._ctx_for(w)
-                wctx.now = now
-                wctx.orientation = self.orientation
+                    w = widgets[current]
+                    now = time.time()
+                    mono = time.monotonic()
+                    self.ctx.now = now
+                    self.ctx.orientation = self.orientation
+                    wctx = self._ctx_for(w)
+                    wctx.now = now
+                    wctx.orientation = self.orientation
 
-                need_render = (mono - last_mono >= w.interval)
-                need_bg = (self._bg_enabled and
-                           len(self.background.frames) > 1 and
-                           mono - last_bg_ts >= 0.1)
-                need_heartbeat = (not need_render and not need_bg and
-                                  mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
+                    need_render = (mono - last_mono >= w.interval)
+                    need_bg = (self._bg_enabled and
+                               len(self.background.frames) > 1 and
+                               mono - last_bg_ts >= 0.1)
+                    need_heartbeat = (not need_render and not need_bg and
+                                      mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
 
-                # 上一帧还在链路上就不要排下一帧。设备侧环缓冲只有 8 KB，
-                # 25 KB 的高清整帧必须让它在两帧之间排空，否则帧中间断流
-                # 会留下半帧像素，表现为错位花屏。
-                if self._send_gap > 0.0 and mono - self._last_frame_mono < self._send_gap:
-                    need_render = False
-                    need_bg = False
-                    need_heartbeat = False
+                    # 上一帧还在链路上就不要排下一帧。设备侧环缓冲只有 8 KB，
+                    # 25 KB 的高清整帧必须让它在两帧之间排空，否则帧中间断流
+                    # 会留下半帧像素，表现为错位花屏。
+                    if self._send_gap > 0.0 and mono - self._last_frame_mono < self._send_gap:
+                        need_render = False
+                        need_bg = False
+                        need_heartbeat = False
 
-                # 正在把设置写进设备 NOR：先别推帧，给设备一个安静的空档
-                if mono < self._devcfg_pause_until:
-                    need_render = False
-                    need_bg = False
-                    need_heartbeat = False
+                    # 正在把设置写进设备 NOR：先别推帧，给设备一个安静的空档
+                    if mono < self._devcfg_pause_until:
+                        need_render = False
+                        need_bg = False
+                        need_heartbeat = False
 
-                if self._overlay is not None:
-                    if mono >= self._overlay_until:
-                        self._overlay = None
-                        self._overlay_seen = None
-                        self._force_send = True
-                        overlay = None
-                    else:
-                        overlay = self._overlay
-                else:
-                    overlay = None
-
-                if overlay is not None:
-                    key = id(overlay)
-                    if key != self._overlay_seen or self._force_send:
-                        self._overlay_seen = key
-                        if self.device.show_image(self._composite(overlay, mono)):
-                            self._last_send_mono = mono
-                            self._count_frame(mono)
-                            self._force_send = False
+                    if self._overlay is not None:
+                        if mono >= self._overlay_until:
+                            self._overlay = None
+                            self._overlay_seen = None
+                            self._force_send = True
+                            overlay = None
                         else:
-                            self._force_send = True      # ???????????
-                elif need_render:
-                    last_mono = mono
-                    t0 = time.perf_counter()
-                    try:
-                        img = w.render(wctx)
-                    except Exception as e:
-                        log.exception("插件 %s 渲染异常: %s", w.name, e)
-                        img = None
-                        time.sleep(0.3)
-                    t1 = time.perf_counter()
-                    cost = (t1 - t0) * 1000.0
-                    old = self.metrics["render_ms"].get(w.name, cost)
-                    self.metrics["render_ms"][w.name] = old * 0.8 + cost * 0.2
-                    if img is not None:
-                        self._last_imgs[w.name] = img
-                    if need_bg:
-                        last_bg_ts = mono
-                    if img is not None or need_bg or self._force_send:
-                        frame = img if img is not None else self._last_imgs.get(w.name)
-                        if frame is not None or need_bg:
-                            if self.device.show_image(self._composite(frame, mono)):
+                            overlay = self._overlay
+                    else:
+                        overlay = None
+
+                    if overlay is not None:
+                        key = id(overlay)
+                        if key != self._overlay_seen or self._force_send:
+                            self._overlay_seen = key
+                            if self.device.show_image(self._composite(overlay, mono)):
                                 self._last_send_mono = mono
                                 self._count_frame(mono)
                                 self._force_send = False
                             else:
-                                self._force_send = True
-                    log.debug("渲染 %s: render=%.1fms total=%.1fms",
-                              w.name, cost, (time.perf_counter() - t0) * 1000.0)
-                elif need_bg:
-                    last_bg_ts = mono
-                    if self.device.show_image(
-                            self._composite(self._last_imgs.get(w.name), mono)):
-                        self._last_send_mono = mono
-                        self._count_frame(mono)
-                    else:
-                        self._force_send = True
-                elif need_heartbeat:
-                    if self.device.heartbeat():
-                        self._last_send_mono = mono
+                                self._force_send = True      # ???????????
+                    elif need_render:
+                        last_mono = mono
+                        t0 = time.perf_counter()
+                        try:
+                            img = w.render(wctx)
+                        except Exception as e:
+                            log.exception("插件 %s 渲染异常: %s", w.name, e)
+                            img = None
+                            time.sleep(0.3)
+                        t1 = time.perf_counter()
+                        cost = (t1 - t0) * 1000.0
+                        old = self.metrics["render_ms"].get(w.name, cost)
+                        self.metrics["render_ms"][w.name] = old * 0.8 + cost * 0.2
+                        if img is not None:
+                            self._last_imgs[w.name] = img
+                        if need_bg:
+                            last_bg_ts = mono
+                        if img is not None or need_bg or self._force_send:
+                            frame = img if img is not None else self._last_imgs.get(w.name)
+                            if frame is not None or need_bg:
+                                if self.device.show_image(self._composite(frame, mono)):
+                                    self._last_send_mono = mono
+                                    self._count_frame(mono)
+                                    self._force_send = False
+                                else:
+                                    self._force_send = True
+                        log.debug("渲染 %s: render=%.1fms total=%.1fms",
+                                  w.name, cost, (time.perf_counter() - t0) * 1000.0)
+                    elif need_bg:
+                        last_bg_ts = mono
+                        if self.device.show_image(
+                                self._composite(self._last_imgs.get(w.name), mono)):
+                            self._last_send_mono = mono
+                            self._count_frame(mono)
+                        else:
+                            self._force_send = True
+                    elif need_heartbeat:
+                        if self.device.heartbeat():
+                            self._last_send_mono = mono
 
-                if mono - self._touch_last_sample_ts >= TOUCH_SAMPLE_INTERVAL:
-                    self._touch_last_sample_ts = mono
+                    if mono - self._touch_last_sample_ts >= TOUCH_SAMPLE_INTERVAL:
+                        self._touch_last_sample_ts = mono
+                        try:
+                            self._poll_touch(mono)
+                        except Exception as e:
+                            log.debug("触摸采样异常: %s", e)
+
+                    time.sleep(0.005)
+                except Exception as _e:
+                    # 拔线 / 设备消失时 pyserial 会抛 SerialException 或 OSError。
+                    # 以前这里不接，Scheduler 线程会被直接打死（界面还在，但再也不发帧）。
+                    if not isinstance(_e, OSError) and type(_e).__name__ not in (
+                            "SerialException", "SerialTimeoutException"):
+                        raise
+                    if self._stop.is_set():
+                        break
+                    log.error("串口异常（设备可能拔掉了）：%s", _e)
                     try:
-                        self._poll_touch(mono)
-                    except Exception as e:
-                        log.debug("触摸采样异常: %s", e)
-
-                time.sleep(0.005)
+                        self.device.close()
+                    except Exception:
+                        pass
+                    self.metrics["errors"] = int(self.metrics.get("errors", 0)) + 1
+                    self._force_send = True
+                    time.sleep(0.5)
+                    continue
         finally:
             self._teardown_all()
             log.info("Scheduler 退出")

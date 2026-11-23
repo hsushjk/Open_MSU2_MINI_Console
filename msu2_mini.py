@@ -355,7 +355,9 @@ class SerialTransport:
                 while time.monotonic() - t0 < timeout:
                     n = self._ser.in_waiting
                     if n:
-                        if b"\x07" in self._ser.read(n):
+                        chunk = self._ser.read(n)
+                        # v15 起栅栏回执是 0x07；老固件回 0x06，都算同步成功
+                        if b"\x07" in chunk or b"\x06" in chunk:
                             # 栅栏发了 3 个，设备会回 3 个 0x06；剩下的如果留在
                             # 缓冲里，下一帧读回执时会被当成“这帧收齐了”。
                             time.sleep(0.02)

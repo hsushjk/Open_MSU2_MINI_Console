@@ -2452,6 +2452,25 @@ class Scheduler(threading.Thread):
                 log.warning("on_enter %s 失败: %s", cur.name, e)
         self._force_send = True
 
+    def _rediscover(self):
+        """连不上时每 3 秒重新扫一次串口：拔插后 COM 号变了也能自己找回。"""
+        now = time.monotonic()
+        if now - getattr(self, "_last_scan", 0.0) < 3.0:
+            return
+        self._last_scan = now
+        if str(getattr(self.device, "port", "auto")).lower() not in ("auto", "", "offline"):
+            return
+        found = _pick_free_port(set())
+        if not found:
+            return
+        log.info("重新发现设备: %s", found)
+        try:
+            self.device.close()
+        except Exception:
+            pass
+        self.device = MiniDevice(found)
+        self._force_send = True
+
     def run(self):
         log.info("Scheduler 启动, %d 页, 朝向 %s, 翻转 %s",
                  len(self._widgets), self.orientation, self.reverse)
@@ -2462,6 +2481,7 @@ class Scheduler(threading.Thread):
                 try:
                     if not self.device.connected:
                         if not self.device.open():
+                            self._rediscover()
                             time.sleep(1.0); continue
                         self.device.set_reverse(self.reverse)
                         self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
@@ -5299,9 +5319,31 @@ def _install_crash_handlers(data_dir):
     threading.excepthook = _thook
 
 
+def _single_instance():
+    """同一时间只允许一个上位机实例（两个实例会抢同一个串口）。"""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.CreateMutexW(None, False, "MSU2_MINI_Console_SingleInstance")
+        if not handle:
+            return True
+        if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
+            return False
+        globals()["_SINGLE_HANDLE"] = handle     # 进程活着就一直持有
+    except Exception:
+        return True
+    return True
+
+
 def main(argv=None):
     _setup_stdio()
     data_dir = _data_dir()
+    if not _single_instance():
+        log.error("已经有一个上位机在运行了：两个实例会抢同一个串口，请先关掉旧的再开新的")
+        print("已经有一个 MSU2 上位机实例在运行了，请先关闭它。")
+        return 2
     _install_crash_handlers(data_dir)
     ap = argparse.ArgumentParser(description="MSU2_MINI_Console")
     ap.add_argument("--config")

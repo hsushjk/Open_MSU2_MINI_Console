@@ -796,7 +796,11 @@ class MiniDevice:
             self._verify_acks = None          # 重新连上就重新相信设备
             self._ack_fails = 0
             self._zero_acks = 0
-            if getattr(self.transport, "fw_version", None) is None:
+            fwv = getattr(self.transport, "fw_version", None)
+            if fwv is not None and fwv < (15, 0):
+                log.warning("固件版本 %d.%d 偏旧：整屏帧超过 200 ms 会被设备判失败，"
+                            "请烧 MSU2_open_v15.hex", fwv[0], fwv[1])
+            if fwv is None:
                 # 上手时设备可能正卡在“等像素”里（上一轮崩在半路），版本查询
                 # 不理人。先发栅栏把它拉回命令模式，再问一次版本。
                 try:
@@ -821,6 +825,13 @@ class MiniDevice:
         return self._show_image_once(img, fast)
 
     def _show_image_once(self, img, fast=False):
+        # 每 1.5 秒强制一次整屏重绘。差分帧只重画变化的块，一旦某帧在中途
+        # 被打断（设备判死、USB 卡顿、掉线重连），画面上就会留下再也补不回来
+        # 的残影。整屏重绘是唯一能把残影抹掉的低成本办法。
+        now = time.monotonic()
+        if now - getattr(self, "_last_full_t", 0.0) > 1.5:
+            self.encoder.reset()
+            self._last_full_t = now
         if fast != getattr(self, "_last_fast", None):
             # 换画质模式时缓存里存的不是同一种编码，必须整帧重发一次。
             self.encoder.reset()

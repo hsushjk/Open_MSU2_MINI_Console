@@ -3228,9 +3228,6 @@ async function refresh() {
     if (dimEl && document.activeElement !== dimEl) {
       dimEl.value = String(100 - (j.dim || 0));
     }
-    if (dbgEl && document.activeElement !== dbgEl) {
-      dbgEl.checked = !!j.debug;
-    }
     const blurEl = document.getElementById('bg-blur');
     if (blurEl && document.activeElement !== blurEl) {
       blurEl.value = j.background_blur || 0;

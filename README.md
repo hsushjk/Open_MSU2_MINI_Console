@@ -41,6 +41,15 @@ pip install -r requirements.txt
 python msu2_mini.py
 ```
 
+设备连不上或者怀疑线材/固件有问题时，先跑自检（不开界面，直接体检设备）：
+
+```bash
+msu2-console --selftest        # 或 python msu2_mini.py --selftest [--port COM4]
+```
+
+它会打印握手、固件版本、10 次触摸采样，然后发 4 帧局部变化 + 3 帧整屏噪点并读回执，
+最后给 `[PASS]` / `[FAIL]`。
+
 打包成单文件 exe（给没有 Python 的机器用，解释器只带主程序用到的标准库）：
 
 ```bash

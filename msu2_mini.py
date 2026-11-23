@@ -295,6 +295,18 @@ class SerialTransport:
                 self.close(); return False
             log.info("串口已打开: %s @ %d", self.port, self.baud)
             ver = self.query_version()
+            if not ver:
+                # 设备可能正卡在“等像素”里（上一次写到一半就断了）：
+                # 先灌几条收流帧把 raw_left 喂到 0，再问一次。
+                for _ in range(3):
+                    try:
+                        self.resync(timeout=0.3)
+                    except Exception:
+                        break
+                    ver = self.query_version(timeout=0.4)
+                    if ver:
+                        log.info("设备恢复应答: %s", self.port)
+                        break
             if ver:
                 major, minor, touch = ver
                 self.fw_version = (major, minor)

@@ -19,3 +19,5 @@ Traceback (most recent call last):
     crc = zlib.crc32(data) & 0xFFFFFFFF
           ^^^^
 NameError: name 'zlib' is not defined. Did you forget to import 'zlib'?
+
+===== 2026-11-24 15:41:17 启动 pid=14716 =====

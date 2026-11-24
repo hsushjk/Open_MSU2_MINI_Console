@@ -227,7 +227,9 @@ class MiniProtocol:
 
     @staticmethod
     def flash_apply():
-        return MiniProtocol._frame(0x14, 0, 0, 0, 0, 0)
+        # f[2]/f[3] 是确认令牌 A5 5A：固件只会执行带令牌的搬运命令，
+        # 防止流错位时像素字节凑出 0A 14 误触内部 flash 擦写。
+        return MiniProtocol._frame(0x14, 0, 0xA5, 0x5A, 0, 0)
 
     @staticmethod
     def asset_boot_hold(secs):

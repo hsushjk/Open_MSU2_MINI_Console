@@ -199,7 +199,7 @@ class MiniProtocol:
     def devcfg_clear():
         return MiniProtocol._frame(0x09, 0x03, 0, 0, 0, 0)
 
-    # --- 资产（v32+）：开机/待机画面存在板载 NOR，class 0x0A ---
+    # --- 资产（v1.0.0）：开机/待机画面存在板载 NOR，class 0x0A（16 槽） ---
     ASSET_BOOT = 0x00
     ASSET_STANDBY = 0x01
 
@@ -3687,7 +3687,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       <div class="card">
         <h3>固件升级</h3>
         <p class="hint">把新的 .hex 写进设备的板载 NOR，写完自动重启。
-          <b>v60 及以上</b>支持；第一次升级需要先用 ISP 刷一次 v60。</p>
+          <b>v1.0.0 及以上</b>支持；第一次升级需要先用 ISP 刷一次 v1.0.0。</p>
         <div class="row" style="align-items:center; gap:8px">
           <button onclick="pickFirmware()">选择固件…</button>
           <input id="fw-file" type="file" accept=".hex,.bin" style="display:none"
@@ -4632,7 +4632,7 @@ async function refreshAsset() {
   const d = j.device;
   const bhEl = document.getElementById('asset-boot-hold');
   if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
-  if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
+  if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件 v1.0.0）'; return; }
   const slots = [];
   for (let i = 0; i < 16; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
   document.getElementById('asset-state').textContent =
@@ -4646,7 +4646,7 @@ async function refreshAsset() {
   if (repEl) {
     const rep = j.boot_report;
     if (rep === null || rep === undefined) {
-      repEl.textContent = '开机自检：设备没有回报（固件需要 v47 及以上）';
+      repEl.textContent = '开机自检：设备没有回报（固件 v1.0.0）';
       repEl.style.color = '#888';
     } else {
       const names = [['FLASH', 1], ['TOUCH', 2], ['LCD', 4], ['USB', 8], ['CFG', 16]];
@@ -5792,7 +5792,7 @@ def _load_firmware_image(path):
 
 
 def cmd_flash(path, port=None):
-    """--flash：把固件写进设备板载 NOR 并重启（需要固件 v60 及以上）。"""
+    """--flash：把固件写进设备板载 NOR 并重启（需要固件 v1.0.0 及以上）。"""
     try:
         data, note = _load_firmware_image(path)
     except Exception as e:
@@ -6107,7 +6107,7 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true",
                     help="连上设备做自检（握手/版本/触摸/整帧链路/回执）后退出")
     ap.add_argument("--flash", default=None,
-                    help="\u628a\u56fa\u4ef6\u5199\u8fdb\u8bbe\u5907\u677f\u8f7d NOR\uff08\u56fa\u4ef6 v60\uff09")
+                    help="\u628a\u56fa\u4ef6\u5199\u8fdb\u8bbe\u5907\u677f\u8f7d NOR\uff08\u56fa\u4ef6 v1.0.0\uff09")
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)

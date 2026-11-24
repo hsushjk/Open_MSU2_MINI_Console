@@ -397,10 +397,9 @@ class Background:
                 late = now - (prev_ts + self.pl_interval)
                 self.switch_ts = now
                 self.switch_count += 1
-                # 只在 --log DEBUG 时输出：每换一张图一行会把 INFO 刷满。
-                log.debug("背景切换 #%d：第 %d/%d 组（实际间隔 %.2f s，设定 %.1f s，滞后 %.2f s）",
-                          self.switch_count, self.group_idx + 1, len(self.groups),
-                          gap, self.pl_interval, late)
+                log.info("背景切换 #%d：第 %d/%d 组（实际间隔 %.2f s，设定 %.1f s，滞后 %.2f s）",
+                         self.switch_count, self.group_idx + 1, len(self.groups),
+                         gap, self.pl_interval, late)
         if not self.frames:
             return None
         if len(self.frames) == 1:

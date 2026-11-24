@@ -252,9 +252,6 @@ class MiniDevice:
     def open(self, handshake_timeout=2.0):
         ok = self.transport.open(handshake_timeout=handshake_timeout)
         if ok:
-            # 设备此刻可能正踩着待机画面的一条淡入带子（5–10 ms）或在
-            # 换图；给它一拍再推第一帧，免得刚连上就撞上满环。
-            time.sleep(0.06)
             self.encoder.reset()
             self._ack_fails = 0
             self._zero_acks = 0

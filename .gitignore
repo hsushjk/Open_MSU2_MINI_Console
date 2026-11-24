@@ -39,3 +39,7 @@ dist/
 build/
 tools/_t_*.py
 tools/_p*.py
+crash.log
+console.log
+uploads/
+backgrounds/

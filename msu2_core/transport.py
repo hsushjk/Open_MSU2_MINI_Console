@@ -26,11 +26,9 @@ SCREEN_BAUD = 19200
 
 
 def normalize_fw_version(fw):
-    """把两段/三段版本统一成三段元组；空值返回 None。
+    """把版本号统一成三段元组；空值返回 None。
 
-    v1.0.2 起版本帧带 patch；更老的 6 字节帧只有 major/minor，patch 补 0。
-    版本门限比较统一走这个函数，避免 (1, 0) 与 (1, 0, 0) 直接比较时
-    因元组长度不同而被误判成“更旧”。
+    版本比较统一走这个函数，避免 (1, 0) 与 (1, 0, 0) 因长度不同被误判。
     """
     if not fw:
         return None
@@ -41,12 +39,12 @@ def normalize_fw_version(fw):
 
 
 def format_fw_version(fw):
-    """把固件版本排成三段式字符串（如 "1.0.2"），空值返回"未知"。"""
+    """把固件版本排成三段式字符串（如 "1.0.9"），空值返回"未知"。"""
     ver = normalize_fw_version(fw)
     return "%d.%d.%d" % ver if ver else "未知"
 
 
-# v16 起：空闲探询。设备只有在“上一帧的字节全吃完、没有半开的段”时才能
+# 空闲探询。设备只有在“上一帧的字节全吃完、没有半开的段”时才能
 # 解析到这条命令并回包，所以收到回包 = 设备确实空下来了。
 
 
@@ -106,13 +104,8 @@ class SerialTransport:
                     self.last_error = f"打开 {self.port} 失败: {e}"
                     return False
             self._connected = True
-            # 对齐垫：上一会话若在驱动/设备里留下 1..5 个残字节，6 字节定界
-            # 就永久错位（设备还在打招呼，但所有命令都不回，只能拔插）。先写
-            # 一整帧 0x00：class 0 未知 sub 固件直接忽略；完全空闲时连续 0 也会
-            # 被当填充丢掉。写完等一会儿，让设备按“100 ms 无新字节”清残包。
-            # 打开端口后先什么都不写、只听设备问候（这是 1.0.5 之前的行为；
-            # 之前那笔“对齐垫”会在设备还没准备好的时候撞上 1 秒写超时）。
-            # 只有当问候迟迟不来时，才灌字节自救。
+            # 打开端口后先什么都不写，只听设备问候：设备可能还没准备好，
+            # 抢先写会撞上 1 秒写超时。问候迟迟不来才灌字节自救。
             if not self._handshaked and not self.handshake(
                     timeout=handshake_timeout):
                 # 上一次会话被强行结束时，设备可能正卡在“等像素”里：raw_left > 0，
@@ -165,7 +158,7 @@ class SerialTransport:
                             break
                     if touch == 0:
                         log.warning("固件上报的触摸读数是 0：ADC 还没有产出结果"
-                                    "（没有触摸的老固件可以忽略这条）")
+                                    "（没有触摸模块时可以忽略这条）")
             else:
                 log.warning("固件没有回应版本查询（可能是 v8 或更早的固件）")
             return True
@@ -409,7 +402,7 @@ class SerialTransport:
                     timeout=8.0, fmt=0):
         """把一张 160x80 图写进指定槽。
 
-        fmt=0 时 payload 是 25 600 B 裸 RGB565（v1.0.3 及更早、或压缩不划算时）；
+        fmt=0 时 payload 是 25 600 B 裸 RGB565（压缩不划算时）；
         fmt=1 时 payload 是 RLE 压缩数据（`[cnt,hi,lo]` 流，长度更短）。
         分窗上传，一窗一确认；如果第一窗就被拒绝（比如设备刚被别的东西
         弄乱），整笔重试一次，不要一次失败就让用户手动再点。
@@ -604,9 +597,8 @@ class SerialTransport:
             self._drain_upload_window()
             return False, "CRC check failed on the device (0x%02X)" % (r if r is not None else 0)
         self._write_raw(MiniProtocol.flash_apply())
-        # 收到 [OK] uploaded 后设备立刻重启：马上关串口，从这里起一个字节都不写。
-        # 旧代码 sleep(0.2) 的“礼貌等待”正好让调度器往正在重启的句柄里塞像素帧，
-        # Windows 上就是 WriteFile failed (PermissionError(13, ...)) 刷屏。
+        # 设备收到 [OK] uploaded 后立刻重启：马上关串口，从这里起一个字节都不写，
+        # 否则调度器会往正在重启的句柄里塞像素帧，Windows 上表现为写失败刷屏。
         self.close()
         log.info("固件已写入，串口已关闭，等待设备重新枚举")
         return True, "uploaded %d bytes, device is rebooting" % total
@@ -804,7 +796,7 @@ class SerialTransport:
     def asset_blit(self, kind, slot, x, y, timeout=6.0):
         """`0A 18`：把槽里的图贴到屏幕 (x, y)（有符号，允许负偏移裁剪）。
 
-        固件 v1.0.4 起对 fmt=1 用滚动 RLE 解压后贴图；回包 `[0A,18,06/15,...]`。
+        设备端对 fmt=1 用滚动 RLE 解压后贴图；回包 `[0A,18,06/15,...]`。
         返回 `(ok, why)`。
         """
         if self._ser is not None:
@@ -872,10 +864,8 @@ class SerialTransport:
     def query_version(self, timeout=0.4):
         """问固件版本；返回 (major, minor, patch, touch) 或 None。
 
-        v1.0.2 起固件回 7 字节：56 MA MI PA TH TL AA；
-        更老的固件回 6 字节：56 MA MI TH TL AA，patch 补 0。
-        新固件在同一个回包里带上当前触摸读数，所以这一条日志就能同时回答
-        “烧的是哪一版”和“ADC 有没有在产出”。
+        设备回 7 字节：56 MA MI PA TH TL AA，末两字节是当前触摸读数，所以
+        一次查询就能同时回答“烧的是哪一版”和“ADC 有没有在产出”。
         """
         with self._lock:
             if not self._connected or not self._ser:
@@ -885,36 +875,17 @@ class SerialTransport:
                 self._write_raw(bytes([0x00, 0x56, 0, 0, 0, 0]))
                 t0 = time.monotonic()
                 buf = bytearray()
-                waited = False
                 while time.monotonic() - t0 < timeout:
                     n = self._ser.in_waiting
                     if n:
                         buf.extend(self._ser.read(n))
-                    while len(buf) >= 6:
-                        if buf[0] == 0x56:
-                            # 新固件 7 字节：末字节 0xAA 且 patch 在 buf[3]
-                            if len(buf) >= 7 and buf[6] == 0xAA:
-                                major, minor, patch = buf[1], buf[2], buf[3]
-                                touch = (buf[4] << 8) | buf[5]
-                                del buf[:7]
-                                return major, minor, patch, touch
-                            # 旧固件 6 字节末字节也是 0xAA：稍等一下，看第 7
-                            # 字节是不是还在路上。只等一次，避免旧固件慢半拍
-                            # 时把每条查询都拖到超时。
-                            if buf[5] == 0xAA:
-                                if not waited:
-                                    waited = True
-                                    time.sleep(0.03)
-                                    n = self._ser.in_waiting
-                                    if n:
-                                        buf.extend(self._ser.read(n))
-                                    continue
-                                major, minor = buf[1], buf[2]
-                                touch = (buf[3] << 8) | buf[4]
-                                del buf[:6]
-                                return major, minor, 0, touch
+                    while len(buf) >= 7:
+                        if buf[0] == 0x56 and buf[6] == 0xAA:
+                            major, minor, patch = buf[1], buf[2], buf[3]
+                            touch = (buf[4] << 8) | buf[5]
+                            del buf[:7]
+                            return major, minor, patch, touch
                         del buf[0]
-                        waited = False
                     time.sleep(0.005)
             except Exception as e:
                 log.debug("查询固件版本失败: %s", e)
@@ -925,7 +896,7 @@ class SerialTransport:
         """读设备端存档（板载 NOR）。
 
         回包 11 字节：09 01 id0 id1 id2 valid dim orient reverse page AA。
-        返回 dict 或 None（老固件 / 没有 NOR）。
+        返回 dict 或 None（设备没有 NOR 或未响应）。
         """
         with self._lock:
             if not self._connected or not self._ser:
@@ -984,9 +955,6 @@ class SerialTransport:
             return False
 
     @_serial_locked
-
-
-    @_serial_locked
     def read_adc(self, ch, timeout=0.05):
         with self._lock:
             if not self._connected or not self._ser:
@@ -1011,34 +979,27 @@ class SerialTransport:
             return None
 
     def handshake(self, timeout=2.0):
+        """等设备主动问候；收到后回 OKMSU（整段传输模式）。"""
         if self._handshaked:
             return True
-        t0 = time.monotonic(); buf = bytearray()
+        t0 = time.monotonic()
+        buf = bytearray()
         while time.monotonic() - t0 < timeout:
             chunk = self.read_all()
             if chunk:
                 buf.extend(chunk)
                 idx = buf.find(b"\x00OPM")
                 if idx >= 0 and len(buf) >= idx + 6:
-                    # 自研握手：设备发 \0OPMSU，主机回 \0OKMSU。握手串里没有
-                    # 版本数字（版本只从 0x56 版本帧取），所以 version 留空。
+                    # 设备问候串 \0OPMSU，主机回 \0OKMSU。串里没有版本号，
+                    # 版本只从 0x56 版本帧取，所以 version 留空。
                     self.version = ""
                     self.raw_mode = True
-                    log.info("检测到 OPMSU 设备（自研握手，整段传输）")
+                    log.info("设备已握手（整段传输）")
                     self.write(b"\x00OKMSU")
-                    time.sleep(0.05); self.read_all()
-                    self._handshaked = True; return True
-                idx = buf.find(b"\x00MSN")
-                if idx >= 0 and len(buf) >= idx + 6:
-                    # 原厂/老固件（MSN02）：整段传输协议一样，回 \0MSNCN，
-                    # 版本字母就在握手串里（buf[4..5]），继续兼容。
-                    self.version = chr(buf[idx + 4]) + chr(buf[idx + 5])
-                    self.raw_mode = (self.version == "02")
-                    log.info("检测到 MSN 设备, 版本=%s%s", self.version,
-                             "（整段传输）" if self.raw_mode else "")
-                    self.write(b"\x00MSNCN")
-                    time.sleep(0.05); self.read_all()
-                    self._handshaked = True; return True
+                    time.sleep(0.05)
+                    self.read_all()
+                    self._handshaked = True
+                    return True
             time.sleep(0.01)
         return False
 

@@ -29,7 +29,7 @@ else:
 _HERE = str(_APP_DIR)
 
 
-__version__ = "1.0.13"
+__version__ = "1.0.9"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
@@ -56,12 +56,7 @@ except ImportError:
     _console("缺少 psutil: pip install psutil"); sys.exit(1)
 
 try:
-    import numpy as _np
-except Exception:
-    _np = None
-
-try:
-    from msu2_core import (  # noqa: F401  (兼容旧代码：Widget 等名字继续从这里导出)
+    from msu2_core import (  # noqa: F401  (重新导出，供本文件与测试使用)
         WIDGET_REGISTRY, RenderContext, Widget,  # noqa: F401
         LANDSCAPE, PORTRAIT, LANDSCAPE_SIZE, PORTRAIT_SIZE,
         probe_fonts, set_user_font, get_font,
@@ -73,7 +68,7 @@ except ImportError as e:
     _console(f"无法导入 msu2_core/widgets: {e}"); sys.exit(1)
 
 
-# --- 已拆到 msu2_core/ 的实现：这里重新绑定旧名字，保持 msu2_mini.X 兼容 ---
+# --- 从 msu2_core 重新导出的实现（msu2_mini.X 仍然可用） ---
 from msu2_core.branding import (  # noqa: E402
     DEFAULT_GIF_DIR, SCREENSHOT_DIR,
     _asset_dir, _data_dir, _icon_bytes,  # noqa: F401
@@ -85,7 +80,6 @@ from msu2_core.protocol import (  # noqa: E402
 )
 from msu2_core.plugin_store import (
     load_all as load_plugin_configs,
-    migrate_legacy as migrate_plugin_configs,
     save_all as save_plugin_configs,
 )
 from msu2_core.transport import (  # noqa: E402
@@ -100,11 +94,6 @@ from msu2_core.channel import DeviceChannel  # noqa: E402
 
 SCREEN_W, SCREEN_H = LANDSCAPE_SIZE
 MANUAL_COOLDOWN = 0.8
-try:
-    import numpy as _np
-except Exception:  # pragma: no cover - 没装 numpy 时退化为原样发送
-    _np = None
-
 
 HEARTBEAT_INTERVAL = 2.0
 
@@ -122,12 +111,10 @@ ASSET_STANDBY_BASE = 0x008000
 ASSET_SLOT_SIZE = 0x6800
 ASSET_HDR_SIZE = 20
 ASSET_RAW_BYTES = SCREEN_W * SCREEN_H * 2
-# 从这个固件版本起资产槽支持 fmt=1（RLE）；更老的固件只能写裸 RGB565。
-RLE_MIN_FW = (1, 0, 4)
 
 
 def _open_device(dev, timeout=2.0):
-    """调设备 open()，兼容不接受 handshake_timeout 的实现（测试替身）。"""
+    """调设备 open()；测试替身可能不接受 handshake_timeout，故兜底调无参版本。"""
     open_fn = getattr(dev, "open", None)
     if not callable(open_fn):
         return False
@@ -143,7 +130,7 @@ def wait_device_back(dev, poll=REBOOT_POLL_SECS, timeout=REBOOT_TIMEOUT):
     设备重启时串口会消失再出现，调用方通常已经关掉了旧句柄，所以这里只
     open() + query_version()，绝不写像素帧。返回
     `(是否回来, "x.y.z", 失败说明, 尝试次数)`；CLI 的 `--flash` 和 Web OTA
-    共用这一套逻辑（以前 `--flash` 只睡 2 秒就下结论，和网页版不一致）。
+    共用这一套逻辑。
     """
     poll = REBOOT_POLL_SECS if poll is None else float(poll)
     deadline = time.monotonic() + (REBOOT_TIMEOUT if timeout is None
@@ -525,24 +512,6 @@ def _normalize_bg_image(path):
     return out
 
 
-def _migrate_bg_paths(paths):
-    """把旧配置里的背景图路径懒迁移成 160×80 规范图；返回 (新列表, 是否有变化)。"""
-    out = []
-    changed = False
-    for path in paths or []:
-        if not path:
-            continue
-        try:
-            new = _normalize_bg_image(path)
-        except Exception as exc:
-            log.warning("背景图迁移失败（保留原路径）%s: %s", path, exc)
-            new = path
-        if new != path:
-            changed = True
-        out.append(new)
-    return out, changed
-
-
 _BG_THUMB_CACHE = {}
 
 
@@ -828,14 +797,10 @@ class Scheduler(threading.Thread):
         self._on_shutdown = on_shutdown
         self._save_timer = None
         self._save_timer_lock = threading.Lock()
-        self._devcfg_dirty = False        # 设备 NOR 存档待写
-        self._devcfg_ack = None           # 等设备回执的 Event（写设置时用）
-        self._devcfg_ack_ok = False       # 最近一次写设备是否成功
-        self._devcfg_pause_until = 0.0    # 这段时间内不发帧，好让设备安心写 NOR
+        self._devcfg_pause_until = 0.0    # 这段时间内不发帧（固件升级等独占操作）
 
         # 当前选中设备的显示设置（每台的完整设置在各自的通道里）
         self._sync_active_display()
-        self._debug = False   # 调试模式已废弃（会跟看门狗打架），永远关闭
 
         bg = config.get("background")
         if not isinstance(bg, dict):
@@ -849,9 +814,9 @@ class Scheduler(threading.Thread):
         self._bg_mode = bg.get("mode")
         if self._bg_mode not in Background.MODES:
             self._bg_mode = "fit"
-        self._bg_dim = 0          # 暗化已独立成全局设置，这里保留字段只为兼容旧配置
+        self._bg_dim = 0          # 背景暗化（0..90，全局设置）
         self._bg_blur = _coerce_int(bg.get("blur"), 0, 0, 5)
-        self._normalize_background_config()   # 旧配置里的背景图懒迁移成 160×80
+        self._normalize_background_config()   # 把背景图统一成 160×80 规范图
         self.background = Background()
         self.background.configure(self._bg_dim, self._bg_blur)
         if self._bg_enabled:
@@ -1210,14 +1175,6 @@ class Scheduler(threading.Thread):
             self.config["current_page"] = name
             self._save_config()
 
-    # ---------- 设备端配置存档（v30 起：板载 NOR 记住亮度/朝向/翻转/页） ----------
-    def _devcfg_boot_sync(self):
-        # v38 起：亮度/朝向/翻转只在上位机里，设备不自动读写 NOR。
-        # NOR 存档能力保留在固件（class 9）里，留给以后需要断电记忆时用。
-        self._devcfg_dirty = False
-        self._debug = False
-        return
-
     # ---------- 开机 / 待机画面（存在设备 NOR 里） ----------
     @staticmethod
     def encode_asset_image(path):
@@ -1276,24 +1233,10 @@ class Scheduler(threading.Thread):
     def asset_erase_safe(self, kind, slot):
         return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
 
-    @staticmethod
-    def _open_device(dev, timeout=2.0):
-        """兼容旧调用点：实际逻辑已抽到模块级 `_open_device()`。"""
-        return _open_device(dev, timeout=timeout)
-
-    def _wait_device_back(self, dev, poll=None, timeout=None):
-        """兼容旧调用点：实际逻辑已抽到模块级 `wait_device_back()`。"""
-        back, fw_text, why, attempts = wait_device_back(
-            dev,
-            poll=REBOOT_POLL_SECS if poll is None else poll,
-            timeout=REBOOT_TIMEOUT if timeout is None else timeout)
-        self._reboot_attempts = attempts
-        return back, fw_text, why
-
     def flash_firmware_safe(self, path):
         """把固件写进设备 NOR 并等它重启回来，返回 WebUI 可直接下发的字典。
 
-        成功：{"ok": True, "rebooted": True, "fw": "1.0.4", "msg": "升级完成：固件 1.0.4"}
+        成功：{"ok": True, "rebooted": True, "fw": "1.0.9", "msg": "升级完成：固件 1.0.9"}
         设备没回来：{"ok": False, "rebooted": True, "err": "设备没有回来，请拔插一次 USB 再重试"}
         读文件/上传失败：{"ok": False, "rebooted": False, "err": ...}
         """
@@ -1318,23 +1261,13 @@ class Scheduler(threading.Thread):
                 result["err"] = "固件太大（%d 字节，上限 48000）" % len(data)
                 return result
             dev = self.device
-            fw = (getattr(getattr(dev, "transport", None), "fw_version", None)
-                  or getattr(dev, "fw_version", None))
-            fwv = normalize_fw_version(fw)
-            if fwv is not None and fwv < (1, 0, 0):
-                log.error("固件升级失败：设备固件 %s 不支持自更新",
-                          format_fw_version(fwv))
-                self.flash_phase = "failed"
-                result["err"] = ("设备固件 %s 不支持自更新，请先用 ISP 刷一次 v1.0.0"
-                                 % format_fw_version(fwv))
-                return result
             # 从现在起通道不再发帧；主循环也会被 _devcfg_pause_until 挡住。
             suspend = getattr(dev, "suspend", None)
             if callable(suspend):
                 suspend()
             if not getattr(dev, "connected", False):
                 # 上一次升级超时/失败后串口是关着的：先连上再写。
-                if not self._open_device(dev, timeout=1.5):
+                if not _open_device(dev, timeout=1.5):
                     resume = getattr(dev, "resume", None)
                     if callable(resume):
                         resume()
@@ -1363,7 +1296,8 @@ class Scheduler(threading.Thread):
             # transport.flash_firmware 收到 [OK] uploaded 后已经主动关了串口，
             # 从这里开始一个字节都不写，只做有界轮询等它重新枚举、回版本。
             self.flash_phase = "rebooting"
-            back, fw_text, why_back = self._wait_device_back(dev)
+            back, fw_text, why_back, attempts = wait_device_back(dev)
+            self._reboot_attempts = attempts
             if not back:
                 # 保持 suspend：设备不在时让通道安安静静，等用户拔插后重刷。
                 self.flash_phase = "failed"
@@ -1398,17 +1332,9 @@ class Scheduler(threading.Thread):
         """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。
 
         返回 `(ok, why, info)`。info 里带 `raw`（原始 25 600 B）、`sent`
-        （实际发出去的字节数）和 `fmt`（0/1），网页据此显示压缩比。
-
-        v1.0.4 之前固件只认 fmt=0：先按固件版本判断，版本未知或写失败
-        再退回裸 RGB565 重写一次（旧图/旧固件都能画出来）。
+        （实际发出去的字节数）和 `fmt`（0 为裸数据、1 为 RLE），网页据此显示压缩比。
         """
         payload, fmt = self.encode_asset_image(path)
-        fw = normalize_fw_version(getattr(
-            getattr(self.device, "transport", None), "fw_version", None))
-        if fmt and fw is not None and fw < RLE_MIN_FW:
-            # 旧固件不认 fmt=1：解回裸数据，走原来的 fmt=0 路径
-            payload, fmt = rle_decode_rgb565(payload), 0
         raw_len = ASSET_RAW_BYTES
         sent_len = len(payload)
         self._devcfg_pause_until = time.monotonic() + 12.0
@@ -1417,11 +1343,6 @@ class Scheduler(threading.Thread):
             if lock is not None:
                 lock.acquire()
             ok, why = self.device.asset_write(kind, slot, payload, fmt=fmt)
-            if not ok and fmt == 1:
-                # 可能是固件版本号没更新/不支持 fmt=1：直接用裸数据重试一次
-                raw = rle_decode_rgb565(payload)
-                ok, why = self.device.asset_write(kind, slot, raw)
-                payload, fmt = raw, 0
         finally:
             if lock is not None:
                 lock.release()
@@ -1442,8 +1363,7 @@ class Scheduler(threading.Thread):
         """只回读 20 B 槽头，拿到每张图的格式和长度（不整图回读）。
 
         返回 `{(kind, slot): {"fmt": 0|1, "len": N}}`；槽头 magic 不对或
-        读不到就不放进结果（网页按空槽显示）。老固件没有 `0A 0C` 时异常
-        返回空字典，网页退化成只显示 有图/空槽。
+        读不到就不放进结果（网页按空槽显示）。
         """
         result = {}
         if info is None:
@@ -1480,21 +1400,6 @@ class Scheduler(threading.Thread):
             result[(kind, slot)] = {"fmt": fmt, "len": leng}
         return result
 
-    def stage_devcfg(self):
-        import threading
-        ev = threading.Event()
-        ev.set()
-        return ev
-    def _devcfg_finish(self, ok):
-        """设备已经给出结论：唤醒等待的请求线程。"""
-        self._devcfg_ack_ok = bool(ok)
-        ev = self._devcfg_ack
-        self._devcfg_ack = None
-        if ev is not None:
-            ev.set()
-
-    def _flush_devcfg(self):
-        self._devcfg_dirty = False
     def find_widget(self, name):
         for w in self._widgets:
             if w.name == name:
@@ -1556,7 +1461,6 @@ class Scheduler(threading.Thread):
         self._sync_active_display()
         self.config["reverse"] = self.reverse
         self._save_config()
-        self._devcfg_dirty = True
         self._switch.set()
         log.info("翻转 -> %s（设备 %s）", self.reverse, self.active_channel.id)
         return True
@@ -1577,7 +1481,6 @@ class Scheduler(threading.Thread):
         self._save_config()
         self._ensure_supported()
         self._switch.set()
-        self._devcfg_dirty = True
         log.info("朝向 -> %s", self.orientation)
         return True
 
@@ -1590,7 +1493,6 @@ class Scheduler(threading.Thread):
         self._dim = v
         self.config.setdefault("display", {})["dim"] = v
         self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
-        self._devcfg_dirty = True        # 亮度也记到设备里
         self._force_send = True
         log.info("亮度 -> %d%%（设备 %s）", 100 - v, self.active_channel.id)
         return True
@@ -1639,10 +1541,18 @@ class Scheduler(threading.Thread):
         return True
 
     def _normalize_background_config(self):
-        """把背景图路径统一成 160×80 规范图（旧配置在这里懒迁移一次）。"""
+        """把背景图路径统一成 160x80 规范图。"""
         old_path = self._bg_path
-        old_paths = list(self._bg_paths)
-        new_paths, changed = _migrate_bg_paths(old_paths)
+        changed = False
+        new_paths = []
+        for p in self._bg_paths:
+            try:
+                new_paths.append(_normalize_bg_image(p))
+            except Exception as exc:
+                log.warning("背景图规范化失败（保留原路径）%s: %s", p, exc)
+                new_paths.append(p)
+        if new_paths != self._bg_paths:
+            changed = True
         new_path = old_path
         if old_path:
             try:
@@ -1719,7 +1629,7 @@ class Scheduler(threading.Thread):
         # 有 25 KB，每秒能发的帧数是有上限的；连续排帧会把数据压在设备侧，帧中间
         # 断流就表现为花屏、错位（尤其是动画背景图这种每帧全屏都变的场景）。
         # 多设备时取 tx_ms 的最小值：最慢的那台不会把整条流水线拖慢，它的通道队列
-        # 自己丢旧帧；单设备时与拆分前完全一致。
+        # 自己丢旧帧。
         paced = False
         txs = []
         for ch in list(self.channels):
@@ -1861,7 +1771,7 @@ class Scheduler(threading.Thread):
                            "dim": self._bg_dim, "blur": self._bg_blur,
                            "frames": len(self.background.frames)},
             # 每台设备各自的连接/版本/帧率（单设备时就是一个元素的数组，
-            # 旧字段全部保留，前端不改也不会坏）
+            # 前端按需要取用）
             "devices": [ch.snapshot() for ch in list(self.channels)],
             "device_count": len(self.channels),
             "active_device": (self.active_channel.id if self.active_channel else None),
@@ -2133,15 +2043,11 @@ class Scheduler(threading.Thread):
                             self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
                             last_mono = 0.0
                             last_bg_ts = 0.0
-                            self._devcfg_boot_sync()
                         else:
                             ch.try_rediscover()
                     if not self._any_connected():
                         # 一台都没连上：歇一会儿再看（插件热加载照样能跑）
                         time.sleep(1.0); continue
-
-                    if self._devcfg_dirty:
-                        self._flush_devcfg()
 
                     widgets = self._widgets
                     current = self._current
@@ -2298,7 +2204,7 @@ class Scheduler(threading.Thread):
             log.info("Scheduler 退出")
 
 def _default_config_path():
-    """选配置文件位置：程序目录（可写时）→ 家目录；都还没有文件时兼容旧版 ./config.json。"""
+    """选配置文件位置：程序目录（可写时）→ 家目录。"""
     local = _APP_DIR / "config.json"
     installed = "site-packages" in _APP_DIR.parts or "dist-packages" in _APP_DIR.parts
     if not installed:
@@ -2315,15 +2221,6 @@ def _default_config_path():
         target = home / "config.json"
     except Exception:
         return str(local)
-    # 已经决定用家目录、但那儿还没有配置时，继续用旧版放在当前目录的配置
-    if not target.exists():
-        try:
-            legacy = Path("./config.json")
-            if legacy.exists() and legacy.resolve() != target.resolve():
-                log.info("使用当前目录的配置文件: %s", legacy)
-                return str(legacy)
-        except Exception:
-            pass
     return str(target)
 
 DEFAULT_CONFIG_PATH = _default_config_path()
@@ -2483,12 +2380,7 @@ def _sanitize_device(dev, index):
 def _sanitize_devices(cfg):
     raw = cfg.get("devices")
     if not isinstance(raw, list) or not raw:
-        legacy = _device_default()
-        for key in ("port", "pages", "current_page", "orientation", "reverse",
-                    "portrait_rotate", "display", "background", "touch"):
-            if key in cfg:
-                legacy[key] = cfg[key]
-        raw = [legacy]
+        raw = [_device_default()]
     devices = []
     seen_ids = set()
     for i, dev in enumerate(raw[:8]):
@@ -2500,9 +2392,6 @@ def _sanitize_devices(cfg):
             n += 1
         seen_ids.add(item["id"])
         devices.append(item)
-    for key in ("port", "pages", "current_page", "orientation", "reverse",
-                "portrait_rotate", "display", "background", "touch"):
-        cfg.pop(key, None)
     cfg["devices"] = devices
     return devices
 
@@ -2510,21 +2399,12 @@ def _sanitize_config(cfg):
     gif_dir = cfg.get("gif_dir")
     cfg["gif_dir"] = gif_dir if isinstance(gif_dir, str) and gif_dir else str(DEFAULT_GIF_DIR)
     _sanitize_devices(cfg)
-    # 插件私有配置不在主文件里：先把老字段搬进 widget_config/ 下的独立文件，
-    # 再从文件读回内存（插件侧仍然读写 cfg["widget_config"]，代码不用改）。
-    wc = cfg.get("widget_config")
-    legacy = {k: dict(v) for k, v in wc.items()
-              if k in WIDGET_REGISTRY and isinstance(v, dict)} if isinstance(wc, dict) else {}
+    # 插件私有配置各自保存在 widget_config/<插件名>.json，这里读回内存。
     try:
-        moved = migrate_plugin_configs(legacy)
-        if moved:
-            log.info("已把 %d 个插件的配置迁移到 widget_config/ 目录", moved)
         cfg["widget_config"] = load_plugin_configs(list(WIDGET_REGISTRY.keys()))
-        for name, data in legacy.items():
-            cfg["widget_config"].setdefault(name, data)
-    except Exception as e:
-        log.warning("读取插件配置失败: %s", e)
-        cfg["widget_config"] = legacy
+    except Exception as exc:
+        log.warning("读取插件配置失败: %s", exc)
+        cfg["widget_config"] = {}
     font = cfg.get("font")
     cfg["font"] = font if isinstance(font, str) else ""
     web = cfg.get("web")
@@ -2538,14 +2418,20 @@ def _sanitize_config(cfg):
                                       "CRITICAL") else "INFO"
     return cfg
 
+def _visible_config(cfg):
+    """配置里真正会写进文件的键。
+
+    `_help` / `_available_widgets` 这类下划线开头的是运行时元数据（每次启动
+    重新生成），`widget_config` 则由各插件自己落盘，都不属于 config.json。
+    """
+    return {k: v for k, v in cfg.items()
+            if not str(k).startswith("_") and k != "widget_config"}
+
+
 def _write_config_raw(cfg, path):
     p = Path(path)
     tmp = p.with_name(p.name + ".tmp")
-    # `_help` / `_available_widgets` 这类下划线开头的是运行时元数据（每次启动
-    # 重新生成），别写进用户配置文件里，否则 config.json 又长又难读。
-    # `widget_config` 也剔掉：插件私有配置各自写到 widget_config/<插件名>.json。
-    clean = {k: v for k, v in cfg.items()
-             if not str(k).startswith("_") and k != "widget_config"}
+    clean = _visible_config(cfg)
     data = json.dumps(clean, indent=2, ensure_ascii=False)
     try:
         save_plugin_configs(cfg.get("widget_config") or {})
@@ -2612,7 +2498,7 @@ def ensure_config_file(path=None):
 
     merged = _sanitize_config(_deep_fill(_base_default_config(), user_cfg))
     merged["_available_widgets"] = meta
-    if merged != user_cfg:
+    if _visible_config(merged) != _visible_config(user_cfg):
         _write_config_raw(merged, p)
         log.info("配置已规范化: %s", p)
     return merged
@@ -2660,21 +2546,6 @@ def flush_config_saves():
             t.function()
         except Exception:
             pass
-
-def discover_and_open():
-    ports = list(serial.tools.list_ports.comports())
-    log.info("发现 %d 个串口: %s", len(ports), [p.device for p in ports])
-    if not ports:
-        return None
-    for p in ports:
-        dev = MiniDevice(p.device)
-        if dev.open():
-            return dev
-        if dev.transport.last_error:
-            log.info("  %s 不可用: %s", p.device, dev.transport.last_error)
-        dev.close()
-    log.error("未找到 MSU2_MINI。可能原因: 被其它程序占用 / 需提权")
-    return None
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -3006,7 +2877,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       <div class="card">
         <h3>固件升级</h3>
         <p class="hint">把新的 .hex 写进设备的板载 NOR，写完自动重启。
-          <b>v1.0.0 及以上</b>支持；第一次升级需要先用 ISP 刷一次 v1.0.0。</p>
+          <b>从设备板载 NOR</b>升级，无需拆机或短接。</p>
         <div class="row" style="align-items:center; gap:8px">
           <button id="fw-pick" onclick="pickFirmware()">选择固件…</button>
           <input id="fw-file" type="file" accept=".hex,.bin" style="display:none"
@@ -3331,10 +3202,6 @@ function devResult(j, okText, where) {
   const box = where || 'msg-display';
   if (!j || j.ok === false) {
     setMsg(box, (j && j.err) || '设置失败', true);
-    return;
-  }
-  if (j.stored === false) {
-    setMsg(box, '设备没有应答（可能没连设备）', true);
     return;
   }
   setMsg(box, okText, false);
@@ -4242,7 +4109,7 @@ async function refreshAsset() {
     if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
   }
   applyAssetVisibility();
-  if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件 v1.0.0）'; return; }
+  if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询'; return; }
   const slots = [];
   for (let i = 0; i < 16; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
   const bootSlot = (d.slots || []).find(s => s.kind === 0 && s.slot === 0);
@@ -4257,7 +4124,7 @@ async function refreshAsset() {
   if (repEl) {
     const rep = j.boot_report;
     if (rep === null || rep === undefined) {
-      repEl.textContent = '开机自检：设备没有回报（固件 v1.0.0）';
+      repEl.textContent = '开机自检：设备没有回报';
       repEl.style.color = '#888';
     } else {
       const names = [['FLASH', 1], ['TOUCH', 2], ['LCD', 4], ['USB', 8], ['CFG', 16]];
@@ -4763,8 +4630,8 @@ class DeviceManager:
     def describe(self):
         """每台设备的状态快照（WebUI 下拉/状态区、--devices 都用它）。
 
-        旧字段 id/port/connected/current/pages 都在，新加 version/fps/dropped
-        等等；offline 的模拟设备也列出来当占位。
+        含 id/port/connected/current/pages 以及 version/fps/dropped 等统计；
+        offline 的模拟设备也列出来当占位。
         """
         sched = self.scheduler
         out = []
@@ -5038,7 +4905,6 @@ class WebUI(threading.Thread):
                         "orientation": sched.orientation,
                         "reverse": sched.reverse,
                         "dim": getattr(sched, "_dim", 0),
-                        "debug": bool(getattr(sched, "_debug", False)),
                         "locked": sched._locked,
                         "background_enabled": sched._bg_enabled,
                         "background_path": sched._bg_path,
@@ -5198,29 +5064,22 @@ class WebUI(threading.Thread):
                         ok = sched.notify(text, secs)
                         self._json({"ok": ok, "err": "" if ok else "内容为空"})
                     elif self.path == "/api/reverse":
-                        ev = sched.stage_devcfg()
                         ok = sched.toggle_reverse()
                         if ok:
                             dcfg["reverse"] = sched.reverse
                             save_config(outer.cfg, cfg_path)
-                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": ok, "reverse": sched.reverse,
-                                    "stored": stored,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/orientation":
-                        ev = sched.stage_devcfg()
                         ok = sched.toggle_orientation()
                         if ok:
                             dcfg["orientation"] = sched.orientation
                             save_config(outer.cfg, cfg_path)
-                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": ok, "orientation": sched.orientation,
-                                    "stored": stored,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/dim":
                         body = self._read_json()
                         v = body.get("dim", 0)
-                        ev = sched.stage_devcfg()
                         sched.set_dim(v)
                         disp = dcfg.get("display")
                         if not isinstance(disp, dict):
@@ -5228,8 +5087,7 @@ class WebUI(threading.Thread):
                             dcfg["display"] = disp
                         disp["dim"] = sched._dim
                         save_config_soon(outer.cfg, cfg_path)   # 连续改时合并写盘
-                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
-                        self._json({"ok": True, "dim": sched._dim, "stored": stored})
+                        self._json({"ok": True, "dim": sched._dim})
                     elif self.path == "/api/pages":
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])
@@ -5373,7 +5231,7 @@ class WebUI(threading.Thread):
                         if paths is not None:
                             paths = [str(p) for p in paths if isinstance(p, str)]
                         if path or paths:
-                            # 启用的背景图统一成 160×80 规范图（旧图懒迁移）
+                            # 启用的背景图统一成 160×80 规范图
                             try:
                                 if path:
                                     path = _normalize_bg_image(path)
@@ -5774,7 +5632,7 @@ def _load_firmware_image(path):
 
 
 def cmd_flash(path, port=None):
-    """--flash：把固件写进设备板载 NOR 并重启（需要固件 v1.0.0 及以上）。"""
+    """--flash：把固件写进设备板载 NOR 并重启。"""
     try:
         data, note = _load_firmware_image(path)
     except Exception as e:
@@ -5794,12 +5652,6 @@ def cmd_flash(path, port=None):
         fw = tr.fw_version
         _console("  已连接 %s，当前固件 %s"
                  % (name, format_fw_version(fw)))
-        if not fw or fw < (1, 0, 0):
-            _console("  [FAIL] 设备固件 %s 过旧，请先用 ISP 刷一次 v1.0.0"
-                     % format_fw_version(fw))
-            tr.close()
-            continue
-
         def _prog(pos, total):
             pct = pos * 100 // max(1, total)
             sys.stderr.write("\r  写入 %3d%%（%d/%d 字节）" % (pct, pos, total))
@@ -6070,7 +5922,7 @@ def cmd_devices(cfg, cfg_path=None):
             fw = getattr(getattr(dev_obj, "transport", None), "fw_version", None)
             _console("  [%d] %-10s %-8s 在线  固件 %s  朝向 %s  亮度 %d%%  "
                      "翻转 %s  页 %s"
-                     % (i + 1, did, target, format_fw_version(fw) if fw else "旧版",
+                     % (i + 1, did, target, format_fw_version(fw) if fw else "未上报",
                         ori, 100 - dim, rev, cur))
         else:
             offline += 1
@@ -6227,7 +6079,7 @@ def main(argv=None):
     ap.add_argument("--all", dest="selftest_all", action="store_true",
                     help="配合 --selftest：配置里每台设备都自检一遍（任一失败退出码非 0）")
     ap.add_argument("--flash", default=None,
-                    help="\u628a\u56fa\u4ef6\u5199\u8fdb\u8bbe\u5907\u677f\u8f7d NOR\uff08\u56fa\u4ef6 v1.0.0\uff09")
+                    help="把固件写进设备板载 NOR")
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)
@@ -6294,8 +6146,11 @@ def main(argv=None):
     if args.init_config:
         p = Path(cfg_path)
         if p.exists():
-            try: p.unlink()
-            except Exception: pass
+            _console("配置文件已存在: %s" % p)
+            return 0
+        ensure_config_file(cfg_path)
+        _console("已生成默认配置: %s" % p)
+        return 0
 
     cfg = ensure_config_file(cfg_path)
     level_name = (args.log or args.log_level

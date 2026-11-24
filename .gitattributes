@@ -1,0 +1,15 @@
+# 统一换行：仓库内文本文件一律 LF，Windows 脚本保留 CRLF。
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.otf binary
+*.ttf binary

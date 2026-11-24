@@ -1,4 +1,4 @@
-"""v1.0.5 三件事的离线测试：握手、串口同步加固、RLE 待机淡入。
+"""离线测试：握手、串口同步、RLE 待机淡入与定界填充规则。
 
 运行：python -X utf8 -m unittest discover -s tests -v
 
@@ -55,7 +55,7 @@ class ScriptSerial:
         data = bytes(data)
         self.writes.append(data)
         if self.answer_version and data.startswith(b"\x00\x56"):
-            # 7 字节版本帧：56 01 00 05 00 1E AA（v1.0.5，触摸读数 30）
+            # 7 字节版本帧：56 01 00 05 00 1E AA（版本 1.0.5，触摸读数 0x001E）
             self.rx.extend(bytes([0x56, 1, 0, 5, 0x00, 0x1E, 0xAA]))
         return len(data)
 
@@ -78,7 +78,7 @@ def make_transport(rx=b"", answer_version=True):
 
 
 class OpmsuHandshakeTests(unittest.TestCase):
-    """任务 1：自研握手 \0OPMSU / \0OKMSU，版本只从 0x56 帧取。"""
+    """握手：设备发 \0OPMSU、主机回 \0OKMSU，版本只从 0x56 帧取。"""
 
     def test_opmsu_replies_okmsu_and_leaves_version_empty(self):
         tr, ser = make_transport(rx=b"\x00OPMSU")
@@ -97,19 +97,6 @@ class OpmsuHandshakeTests(unittest.TestCase):
         self.assertEqual(ser.writes[0], b"\x00OKMSU")
         self.assertEqual(ser.writes[1], bytes([0x00, 0x56, 0, 0, 0, 0]))
 
-    def test_msn02_still_supported(self):
-        tr, ser = make_transport(rx=b"\x00MSN02")
-        self.assertTrue(tr.handshake(timeout=0.3))
-        self.assertEqual(ser.writes, [b"\x00MSNCN"])
-        self.assertEqual(tr.version, "02")
-        self.assertTrue(tr.raw_mode, "MSN02 也是整段传输")
-
-    def test_msn01_is_not_raw_mode(self):
-        tr, _ser = make_transport(rx=b"\x00MSN01")
-        self.assertTrue(tr.handshake(timeout=0.3))
-        self.assertEqual(tr.version, "01")
-        self.assertFalse(tr.raw_mode)
-
     def test_half_frame_before_hello_does_not_break_handshake(self):
         # 上一次写到一半留下的 3 个残字节，后面跟着设备真正打招呼：按子串
         # 查找照样能认出来，不用拔插。
@@ -124,11 +111,10 @@ class OpmsuHandshakeTests(unittest.TestCase):
 
 
 class SyncPadTests(unittest.TestCase):
-    """任务 2：打开端口/重同步前先垫 6 个 0x00，让定界重新对齐。"""
+    """打开端口/重同步：先垫 6 个 0x00，让定界重新对齐。"""
 
     def test_open_writes_nothing_before_the_greeting(self):
-        # 1.0.5 加过一笔“对齐垫”，会在设备还没准备好时撞上 1 秒写超时；
-        # 现在改成只听不说，问候来了才回 OKMSU。
+        # 打开端口后只听不说：问候来了才回 OKMSU，不先写对齐垫。
         tr, ser = make_transport(rx=b"\x00OPMSU")
         self.assertTrue(tr.open())
         self.assertEqual(ser.writes[0], b"\x00OKMSU",
@@ -240,7 +226,7 @@ def component_distance(a, b):
 
 
 class RleFadeTests(unittest.TestCase):
-    """任务 3：fmt=1 待机图按 2 行带子流式解压再混色。"""
+    """fmt=1 待机图按 2 行带子流式解压再混色。"""
 
     def setUp(self):
         self.raw = gradient_rgb565()
@@ -296,7 +282,7 @@ class RleFadeTests(unittest.TestCase):
 class FwFrameParser:
     """固件主循环里“空闲跳填充 + 6 字节定界”的参考模型。
 
-    只实现与本任务有关的两条：完全空闲时连续 ≥8 个 0x00 按 6 的整数倍跳过
+    只实现本测试需要的两条：完全空闲时连续 ≥8 个 0x00 按 6 的整数倍跳过
     （多余的 0 留给下一帧），其它字节每 6 个一帧。
     """
 

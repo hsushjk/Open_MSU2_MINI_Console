@@ -47,3 +47,16 @@ keyboard_stats.json
 mouse_mileage.json
 dumps/
 widget_config/
+
+# 静态检查 / 测试缓存
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# 构建日志与一次性补丁脚本
+build_err.txt
+build_out.txt
+tools_add_*.js
+
+# 源码模式下的外挂插件目录
+widgets_ext/

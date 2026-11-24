@@ -2,7 +2,7 @@
 
 这里覆盖用户实际踩过的坑：
 - 表单改完没点应用，被 1 秒一次的状态轮询冲掉（dirty 标记 + node 实跑）；
-- 上传的背景图必须统一成 160×80、存进数据目录 backgrounds/，旧路径要懒迁移；
+- 上传的背景图必须统一成 160×80、存进数据目录 backgrounds/；
 - 开机/待机画面按模式显隐控件（JS 规则和 Python 规则必须一致）；
 - 固件升级上传的返回值结构（不再把字符串当对象用）；
 - favicon 指向 /favicon.ico；
@@ -229,7 +229,7 @@ class BackgroundNormalizeTests(unittest.TestCase):
         with Image.open(__import__("io").BytesIO(data)) as im:
             self.assertEqual(im.size, (96, 48))
 
-    def test_old_config_path_lazily_migrated_by_scheduler(self):
+    def test_scheduler_normalizes_background_path(self):
         src = self._make_big_image()
         cfg = {"pages": [], "background": {"enabled": False,
                                            "path": str(src)}}

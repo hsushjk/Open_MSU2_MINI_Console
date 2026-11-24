@@ -1,17 +1,12 @@
 """每个插件一份配置文件。
 
-主 `config.json` 只放全局设置（设备、端口、亮度、背景、Web、日志…）；
-插件私有的配置不再塞进主文件，而是写到：
+主 `config.json` 只放全局设置（设备、端口、亮度、背景、Web、日志等）；
+插件私有的配置写到：
 
     <程序目录>/widget_config/<插件名>.json
 
-一个插件一个文件，好处是：
-  · 主配置保持短小好读，不会被 17 个插件的字段撑爆；
-  · 想单独备份/对比/手改某个插件的配置，直接开那个文件；
-  · 插件升级换了配置结构，坏掉也只坏它自己那一份。
-
-兼容：老版本把插件配置放在 `config.json` 的 `widget_config` 里，
-启动时会自动搬进这些文件（`migrate_legacy`），之后主文件里就不再出现。
+一个插件一份文件：主配置保持短小，单独备份或手改某项配置只需打开对应文件，
+某个插件的配置结构坏掉也只影响它自己。
 """
 
 from __future__ import annotations
@@ -120,29 +115,3 @@ def save_all(mapping: dict) -> int:
     return written
 
 
-def migrate_legacy(legacy: dict) -> int:
-    """把老 config.json 里的 widget_config 搬进独立文件。
-
-    规则：文件已存在就以文件为准（用户可能手改过），只搬文件里没有的。
-    返回搬了几份。
-    """
-    moved = 0
-    if not isinstance(legacy, dict):
-        return 0
-    for name, data in legacy.items():
-        if not isinstance(data, dict) or not data:
-            continue
-        p = path_for(str(name))
-        if p.exists():
-            continue
-        if save_one(str(name), data):
-            moved += 1
-    return moved
-
-
-def list_files() -> list:
-    """列出目录里已有的配置文件（调试/统计用）。"""
-    d = store_dir()
-    if not d.is_dir():
-        return []
-    return sorted(p.name for p in d.glob("*.json"))

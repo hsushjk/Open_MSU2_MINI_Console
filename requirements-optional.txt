@@ -1,2 +1,4 @@
+# 可选依赖：键盘/鼠标统计需要 pynput；numpy 用于加速 RLE 与差分编码。
 pynput>=1.7.6
 numpy>=1.21.0
+pywin32>=306; sys_platform == "win32"

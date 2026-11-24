@@ -3,8 +3,8 @@
 一个 Scheduler 只渲染/合成一次，然后把同一张图交给每个通道；通道自己负责
 “按这台设备的显示设置后处理 + 排队 + 在独立线程里写串口”：
 
-* 单台设备时用 sync 模式 —— submit() 直接在渲染线程里同步发完，行为和拆分
-  之前的单设备实现逐字节一致（分块核对、回执、device.last 全都照旧）。
+* 单台设备时用 sync 模式 —— submit() 直接在渲染线程里同步发完，适合单设备
+  与测试路径。
 * 多台设备时用 async 模式 —— 每台一个发送线程 + 一个深度 2 的队列（满了
   丢最旧的一帧，永远发最新的画面）。一台设备慢、掉线、卡住只影响它自己的
   线程，渲染循环和其它设备照常跑，所以不会互相拖住。
@@ -70,7 +70,7 @@ class DeviceChannel:
         self.id = str(dev_id or "dev1")
         self.config = config if isinstance(config, dict) else {}
         self.device = device
-        # sync=True：submit() 在调用线程里直接发（单设备/测试路径，行为与旧实现一致）
+        # sync=True：submit() 在调用线程里直接发（单设备/测试路径）
         # sync=False：submit() 只入队，独立线程消费（多设备路径）
         self.sync = bool(sync)
         self._discover = discover
@@ -97,9 +97,8 @@ class DeviceChannel:
     def _read_display(self):
         """每台自己的显示设置。
 
-        亮度看 display.dim（每台的权威来源）；朝向/翻转/竖屏旋转沿用该设备
-        配置里的顶层键（旧配置本来就有），display 里的同名键只作为镜像，
-        方便外部工具/前端一次读全。
+        亮度看 display.dim（每台的权威来源）；朝向/翻转/竖屏旋转读该设备的
+        顶层键，display 里的同名键只作为镜像，方便外部工具/前端一次读全。
         """
         cfg = self.config
         disp = cfg.get("display")

@@ -11,7 +11,7 @@ from .protocol import (
     MiniProtocol, SCREEN_H, SCREEN_W, TILE_N, lcd_segment_payload,
 )
 from .transport import (
-    SerialTransport, _normalize_port, format_fw_version, normalize_fw_version,
+    SerialTransport, _normalize_port, normalize_fw_version,
 )
 
 try:
@@ -259,10 +259,7 @@ class MiniDevice:
             fwv = normalize_fw_version(
                 getattr(self.transport, "fw_version", None))
             if fwv is None:
-                log.info("固件没有回版本号（proto25 或更早），按老固件处理")
-            elif fwv < (1, 0, 0):
-                log.warning("固件版本 %s 过旧，请升级到 v1.0.0",
-                            format_fw_version(fwv))
+                log.info("固件没有回版本号")
         return ok
 
     def close(self):  self.transport.close()

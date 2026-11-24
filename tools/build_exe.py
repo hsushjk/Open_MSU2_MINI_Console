@@ -23,7 +23,7 @@ HIDDEN = (
     "pywintypes",
     "pythoncom",
 )
-COLLECT = ("msu2_core", "widgets", "PIL", "mss")
+COLLECT = ("msu2_core", "widgets", "PIL")
 
 
 def main(argv=None):
@@ -66,8 +66,10 @@ def main(argv=None):
     else:
         cmd.append("--windowed")
     icon = Path(args.icon) if args.icon else ROOT / "icon.ico"
-    if os.name == "nt" and icon.is_file():
-        cmd += ["--icon", str(icon.resolve())]
+    if icon.is_file():
+        cmd += ["--add-data", "%s%s%s" % (icon.resolve(), SEP, ".")]
+        if os.name == "nt":
+            cmd += ["--icon", str(icon.resolve())]
     for name in DATA_DIRS:
         src = ROOT / name
         if src.is_dir():

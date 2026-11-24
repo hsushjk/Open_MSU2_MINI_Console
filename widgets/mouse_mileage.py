@@ -22,27 +22,12 @@ _SAVE_NAME = "mouse_mileage.json"
 
 
 def _data_dir():
-    """所有插件数据都放程序同目录（exe 与主 py 旁边），不再散落到 LOCALAPPDATA。"""
+    """所有插件数据都放程序同目录（exe 与主 py 旁边）。"""
     try:
         from msu2_core.branding import data_dir
         return data_dir()
     except Exception:
         return Path(__file__).resolve().parent.parent
-
-
-def _migrate_legacy(path):
-    r"""把旧版放在 %LOCALAPPDATA%\MSU2_MINI 里的数据搬过来。"""
-    try:
-        import shutil
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
-        if not base:
-            return
-        legacy = Path(base) / "MSU2_MINI" / path.name
-        if legacy.exists() and not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(legacy), str(path))
-    except Exception:
-        pass
 
 
 def _load_saved():

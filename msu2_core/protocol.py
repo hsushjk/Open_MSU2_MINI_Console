@@ -77,7 +77,7 @@ def rle_encode_rgb565(data):
 
 
 def rle_decode_rgb565(payload):
-    """`rle_encode_rgb565()` 的逆过程；测试往返、旧固件回退时用。"""
+    """`rle_encode_rgb565()` 的逆过程；测试与离线工具用。"""
     out = bytearray()
     i = 0
     while i + 3 <= len(payload):
@@ -134,7 +134,7 @@ class MiniProtocol:
         return MiniProtocol._frame(0x09, 0x02, dim, orient, reverse, page)
 
 
-    # --- 资产（v1.0.0）：开机/待机画面存在板载 NOR，class 0x0A（16 槽） ---
+    # --- 资产：开机/待机画面存在板载 NOR，class 0x0A（16 槽） ---
     ASSET_BOOT = 0x00
     ASSET_STANDBY = 0x01
 
@@ -144,11 +144,10 @@ class MiniProtocol:
 
     @staticmethod
     def asset_begin(kind, slot, length, fmt=0):
-        """`0A 01`：开始写图。kind 最高位携带数据格式（固件 v1.0.4 起）。
+        """`0A 01`：开始写图。kind 最高位携带数据格式。
 
-        fmt=0 是裸 RGB565（25 600 B，老固件/老图都走这条），fmt=1 是 RLE，
-        此时 length 是压缩后长度。低 7 位仍是 kind（0 开机 / 1 待机），
-        所以旧固件收到高位为 0 的 kind 时行为完全不变。
+        fmt=0 是裸 RGB565（25 600 B），fmt=1 是 RLE，此时 length 是压缩后
+        长度；低 7 位仍是 kind（0 开机 / 1 待机）。
         """
         if fmt:
             kind |= 0x80

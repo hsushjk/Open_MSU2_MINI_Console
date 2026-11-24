@@ -3,8 +3,7 @@
 偏好（行宽、引号、空行）把人卡住。
 
 优先用 ruff（`python -m ruff check --select F821,F811,F401,F841`），没装 ruff
-就退回 pyflakes。两者都没装时只打印提示并以 0 退出 —— 门禁尽量严格，但绝不
-因为开发机没装 linter 就把构建/测试硬卡死。
+就退回 pyflakes；两者都必须安装其中之一，否则以退出码 2 报错，避免检查被跳过。
 
 用法（仓库根目录，提交前跑）：
 
@@ -135,9 +134,9 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     backend = detect_backend()
     if backend is None:
-        print("未安装 ruff / pyflakes，跳过未定义名检查（不算失败）。")
-        print("建议：python -m pip install ruff")
-        return 0
+        print("未安装 ruff / pyflakes，无法执行静态检查。")
+        print("请先安装：python -m pip install ruff")
+        return 2
     files = source_files(argv)
     if not files:
         print("没有找到可扫描的 .py 文件")

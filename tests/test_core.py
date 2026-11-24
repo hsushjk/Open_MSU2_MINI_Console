@@ -328,7 +328,7 @@ class CompositeTests(unittest.TestCase):
 
 
 class MultiDeviceTests(unittest.TestCase):
-    """任务⑮：一份内容扇出到多台设备，每台自己的 diff 缓存 / 队列 / dim。"""
+    """同一份内容扇出到多台设备，每台维护自己的差分缓存、写队列与亮度。"""
 
     def channels(self, dims=(0, 0), reverses=(False, False), devices=None):
         chans = []
@@ -505,8 +505,8 @@ class BackgroundSchedulingTests(unittest.TestCase):
                 self.assertTrue(sched.background.shuffle)
                 self.assertEqual(len(sched.background.groups), 2)
 
-    def test_legacy_fade_config_key_is_silently_ignored(self):
-        # 老配置里可能还留着 fade/fade_secs：不报错、不影响 interval。
+    def test_unknown_background_keys_are_ignored(self):
+        # 未知键（例如已废弃的选项）不报错、不影响 interval。
         with tempfile.TemporaryDirectory() as td:
             data = Path(td, "data")
             bg_dir = Path(data, "backgrounds")
@@ -560,7 +560,7 @@ class CapturingSerial:
 class ScripedRebootDevice:
     """假设备：open() 按脚本返回，用来测升级后的有界重连轮询。"""
 
-    def __init__(self, reopen_calls=1, version=(1, 0, 4, 0)):
+    def __init__(self, reopen_calls=1, version=(1, 0, 9, 0)):
         self.port = "COM_fake"
         self.connected = False
         self._suspended = False
@@ -569,7 +569,7 @@ class ScripedRebootDevice:
         self.version = version
         self.flashed = []
         self.transport = type("T", (), {})()
-        self.transport.fw_version = (1, 0, 3)
+        self.transport.fw_version = (1, 0, 9)
         self.transport.query_version = (
             lambda timeout=0.4: self.version)
 
@@ -626,7 +626,7 @@ class FirmwareFlashTests(unittest.TestCase):
     def test_device_flash_suspends_channel_writes(self):
         dev = M.MiniDevice("COM_fake")
         dev.transport = type("T", (), {
-            "fw_version": (1, 0, 3),
+            "fw_version": (1, 0, 9),
             "flash_firmware": lambda self, data, progress=None: (
                 True, "uploaded")})()
         ok, _why = dev.flash_firmware(bytes(256))
@@ -635,17 +635,15 @@ class FirmwareFlashTests(unittest.TestCase):
         self.assertFalse(dev.show_image(Image.new("RGB", (160, 80))))
 
     def test_wait_device_back_success(self):
-        sched = self.make()
         dev = ScripedRebootDevice(reopen_calls=2)
-        back, fw, why = sched._wait_device_back(dev, poll=0.01, timeout=2.0)
+        back, fw, why, _n = M.wait_device_back(dev, poll=0.01, timeout=2.0)
         self.assertTrue(back, why)
-        self.assertEqual(fw, "1.0.4")
+        self.assertEqual(fw, "1.0.9")
         self.assertEqual(len(dev.flashed), 0)
 
     def test_wait_device_back_timeout(self):
-        sched = self.make()
         dev = ScripedRebootDevice(reopen_calls=10 ** 9)
-        back, fw, why = sched._wait_device_back(dev, poll=0.01, timeout=0.08)
+        back, fw, why, _n = M.wait_device_back(dev, poll=0.01, timeout=0.08)
         self.assertFalse(back)
         self.assertEqual(fw, "")
         self.assertIn("拔插", why)
@@ -664,7 +662,7 @@ class FirmwareFlashTests(unittest.TestCase):
             os.unlink(fw_path)
         self.assertTrue(res["ok"], res)
         self.assertTrue(res["rebooted"])
-        self.assertEqual(res["fw"], "1.0.4")
+        self.assertEqual(res["fw"], "1.0.9")
         self.assertIn("升级完成", res["msg"])
         self.assertEqual(dev.flashed, [256])
         self.assertFalse(dev.suspended, "设备回来之后要恢复发帧")
@@ -680,9 +678,9 @@ class FirmwareFlashTests(unittest.TestCase):
             fw_path = fh.name
         try:
             with mock.patch.object(
-                    sched, "_wait_device_back",
+                    M, "wait_device_back",
                     return_value=(False, "",
-                                  "设备没有回来，请拔插一次 USB 再重试")):
+                                  "设备没有回来，请拔插一次 USB 再重试", 3)):
                 res = sched.flash_firmware_safe(fw_path)
         finally:
             os.unlink(fw_path)
@@ -693,7 +691,7 @@ class FirmwareFlashTests(unittest.TestCase):
 
 
 class AssetRleTests(unittest.TestCase):
-    """任务 A：fmt=1 RLE 编解码、选型规则、老 fmt=0 路径兼容。"""
+    """资产 RLE 编解码与下发格式选型。"""
 
     def test_round_trip_gradient(self):
         data = bytes((i * 73 + (i >> 5) * 19) & 0xFF for i in range(25600))
@@ -722,28 +720,24 @@ class AssetRleTests(unittest.TestCase):
         self.assertEqual(raw, noise)
         self.assertEqual(len(raw), 25600)
 
-    def test_begin_command_legacy_kind_byte(self):
+    def test_begin_command_kind_byte(self):
         raw = M.MiniProtocol.asset_begin(1, 3, 25600)
-        self.assertEqual(raw[2], 1, "fmt=0 的 kind 字节必须还是 1（老固件认这个）")
+        self.assertEqual(raw[2], 1, "裸数据的 kind 字节是 1")
         rle = M.MiniProtocol.asset_begin(1, 3, 0x0200, fmt=1)
         self.assertEqual(rle[2], 0x81, "fmt=1 用 kind 最高位标记")
         self.assertEqual(rle[4:6], b"\x02\x00")
 
 
 class FakeAssetDevice:
-    """假设备：记录资产写入的格式和长度，用来测压缩/回退分支。"""
+    """假设备：记录资产写入的格式和长度。"""
 
-    def __init__(self, fw=(1, 0, 4), fail_rle=False):
+    def __init__(self):
         self.calls = []
-        self.fail_rle = fail_rle
         tr = type("T", (), {})()
-        tr.fw_version = fw
         tr._lock = None
         self.transport = tr
 
     def asset_write(self, kind, slot, payload, fmt=0):
-        if fmt == 1 and self.fail_rle:
-            return False, "设备拒绝接收（begin 回 0x15）"
         self.calls.append((kind, slot, len(payload), fmt))
         return True, "ok"
 
@@ -752,11 +746,11 @@ class FakeAssetDevice:
 
 
 class AssetUploadTests(unittest.TestCase):
-    """上传链路：新固件走 RLE，老固件/失败要退回裸 RGB565。"""
+    """上传链路：按压缩比选 RLE 或裸数据，写入长度与槽位信息一致。"""
 
-    def make(self, fw, fail_rle=False):
+    def make(self):
         sched = M.Scheduler(M.OfflineDevice(), {"pages": []})
-        sched.device = FakeAssetDevice(fw, fail_rle=fail_rle)
+        sched.device = FakeAssetDevice()
         return sched
 
     def png(self, td):
@@ -764,10 +758,10 @@ class AssetUploadTests(unittest.TestCase):
         Image.new("RGB", (160, 80), (30, 120, 200)).save(src)
         return src
 
-    def test_new_firmware_uses_rle(self):
+    def test_upload_uses_rle(self):
         with tempfile.TemporaryDirectory() as td:
             src = self.png(td)
-            sched = self.make((1, 0, 4))
+            sched = self.make()
             ok, why, info = sched.upload_asset(1, 0, src)
         self.assertTrue(ok, why)
         self.assertEqual(info["raw"], 25600)
@@ -776,28 +770,9 @@ class AssetUploadTests(unittest.TestCase):
         self.assertEqual(sched.device.calls[-1][3], 1)
         self.assertEqual(sched.device.calls[-1][2], info["sent"])
 
-    def test_old_firmware_falls_back_to_raw(self):
-        with tempfile.TemporaryDirectory() as td:
-            src = self.png(td)
-            sched = self.make((1, 0, 3))
-            ok, why, info = sched.upload_asset(1, 0, src)
-        self.assertTrue(ok, why)
-        self.assertEqual(info["fmt"], 0, "v1.0.3 只认 fmt=0")
-        self.assertEqual(info["sent"], 25600)
-        self.assertEqual(sched.device.calls[-1][3], 0)
-
-    def test_write_failure_retries_with_raw(self):
-        with tempfile.TemporaryDirectory() as td:
-            src = self.png(td)
-            sched = self.make((1, 0, 4), fail_rle=True)
-            ok, why, info = sched.upload_asset(0, 0, src)
-        self.assertTrue(ok, why)
-        self.assertEqual(info["fmt"], 0, "RLE 被拒后必须用裸数据重写")
-        self.assertEqual(info["sent"], 25600)
-
 
 class OtaChannelTests(unittest.TestCase):
-    """任务 B：--selftest 的 OTA 通道项（写暂存区 + 回读头，绝不 apply）。"""
+    """--selftest 的 OTA 通道项：写暂存区、回读头，绝不 apply。"""
 
     def make(self):
         tr = M.SerialTransport("COM_fake")
@@ -886,13 +861,13 @@ class CloseFlushTests(unittest.TestCase):
 
 
 class WaitDeviceBackModuleTests(unittest.TestCase):
-    """任务 C：cmd_flash 复用模块级 wait_device_back（200 ms 轮询、15 s 上限）。"""
+    """cmd_flash 复用模块级 wait_device_back（200 ms 轮询、15 s 上限）。"""
 
     def test_module_function_returns_fw_and_attempts(self):
         dev = ScripedRebootDevice(reopen_calls=1)
         back, fw, why, attempts = M.wait_device_back(dev, poll=0.01, timeout=2.0)
         self.assertTrue(back, why)
-        self.assertEqual(fw, "1.0.4")
+        self.assertEqual(fw, "1.0.9")
         self.assertGreaterEqual(attempts, 2)
         self.assertEqual(why, "")
 

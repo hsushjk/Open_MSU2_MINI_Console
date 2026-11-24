@@ -67,18 +67,6 @@ class PluginStoreTests(unittest.TestCase):
         (self.dir / "bad.json").write_text("{not json", "utf-8")
         self.assertEqual(ps.load_one("bad"), {})
 
-    def test_migrate_legacy_writes_only_missing_non_empty(self):
-        ps.save_one("todo", {"items": ["existing"]})
-        moved = ps.migrate_legacy({
-            "todo": {"items": ["legacy"]},   # 已有文件 → 不覆盖
-            "clock": {},                      # 空 → 不建文件
-            "gif": {"dir": "D:/gif"},         # 没有文件 → 迁移
-        })
-        self.assertEqual(moved, 1)
-        self.assertEqual(ps.load_one("todo"), {"items": ["existing"]})
-        self.assertEqual(ps.load_one("gif"), {"dir": "D:/gif"})
-        self.assertFalse((self.dir / "clock.json").exists())
-
     def test_load_all_covers_every_name(self):
         ps.save_one("todo", {"items": ["x"]})
         got = ps.load_all(["todo", "clock"])
@@ -113,15 +101,17 @@ class MainConfigIntegrationTests(unittest.TestCase):
         self.assertEqual(written["gif_dir"], "X")
         self.assertEqual(ps.load_one("todo"), {"items": ["x"]})
 
-    def test_sanitize_migrates_legacy_field(self):
+    def test_sanitize_loads_plugin_configs_from_files(self):
         import msu2_mini as M
 
+        ps.save_one("todo", {"items": ["来自文件"]})
         cfg = M._base_default_config()
-        cfg["widget_config"] = {"todo": {"items": ["老数据"]}}
+        cfg["widget_config"] = {"todo": {"items": ["内存里的旧值"]}}
         M._sanitize_config(cfg)
-        self.assertEqual(ps.load_one("todo"), {"items": ["老数据"]})
-        self.assertIsInstance(cfg["widget_config"], dict)
-        self.assertEqual(cfg["widget_config"].get("todo"), {"items": ["老数据"]})
+        self.assertEqual(cfg["widget_config"].get("todo"),
+                         {"items": ["来自文件"]})
+        self.assertEqual(ps.load_one("todo"), {"items": ["来自文件"]},
+                         "只读不写，不该反过来覆盖文件")
 
 
 if __name__ == "__main__":

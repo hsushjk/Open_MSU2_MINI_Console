@@ -267,14 +267,15 @@ class MiniDevice:
         """把整帧按 2 KB 分块、带间隔写进串口（限速可自适应）。
 
         间隔不是可省的“等待”，而是数据完整性的前提：设备端 USB 环只有 8 KB，
-        主机灌得比它消化得快时尾部像素会被丢掉（Windows 上实测 2 KB/块、间隔
-        6.5 ms 起稳定，7 ms 仍偶发丢块，单块放大到 4 KB 以上任何间隔都丢）。
-        取 8 ms 留出余量，线上速率约 160 KB/s。Linux 写路径不同但同一固件，
-        用同一上限。
+        主机灌得比它消化得快时尾部像素会被丢掉。实测（Windows，fw 1.0.9）：
+        2 KB/块、间隔 10 ms 连续 40 帧全对；8 ms 空转同样能过，但接上 WebUI
+        与渲染的真实负载会出现尾部 30/50 块丢失；4 KB/块即便等到 15 ms，连续
+        发送 40 帧仍有 17 帧丢尾部。10 ms 是经得起这些场景的安全值（线上速率
+        约 140 KB/s），不要为了几十毫秒再往下压。
         """
         seg_write = 2048
         rate = max(120000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
-        gap = min(0.008, seg_write / rate)
+        gap = min(0.010, seg_write / rate)
         for i in range(0, len(payload), seg_write):
             if not self.transport.write(payload[i:i + seg_write]):
                 return False

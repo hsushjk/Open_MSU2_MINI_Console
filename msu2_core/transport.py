@@ -141,6 +141,13 @@ class SerialTransport:
     def close(self):
         with self._lock:
             if self._ser:
+                # 先把驱动缓冲里还没发完的字节发完再关：6 字节帧只发了一半就
+                # close，设备会把剩下的当成新帧头，从此整条命令通道对不上号
+                # （实测踩过一次，表现为设备还在打招呼却不再回任何命令）。
+                try:
+                    self._ser.flush()
+                except Exception:
+                    pass
                 try: self._ser.close()
                 except Exception: pass
             self._ser = None
@@ -657,6 +664,24 @@ class SerialTransport:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_draw(kind, slot))
         st = self._asset_reply(0x04, timeout)
+        if st == 0x06:
+            return True, "ok"
+        if st is None:
+            return False, "设备没有回执"
+        return False, "设备上那个槽还没有图（先写入再预览）"
+
+    @_serial_locked
+    def asset_blit(self, kind, slot, x, y, timeout=6.0):
+        """`0A 18`：把槽里的图贴到屏幕 (x, y)（有符号，允许负偏移裁剪）。
+
+        固件 v1.0.4 起对 fmt=1 用滚动 RLE 解压后贴图；回包 `[0A,18,06/15,...]`。
+        返回 `(ok, why)`。
+        """
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
+        self.write(MiniProtocol._frame(0x0A, 0x18, kind & 0xFF, slot & 0xFF,
+                                       x & 0xFF, y & 0xFF))
+        st = self._asset_reply(0x18, timeout)
         if st == 0x06:
             return True, "ok"
         if st is None:

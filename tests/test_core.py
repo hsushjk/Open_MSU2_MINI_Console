@@ -495,6 +495,10 @@ class CapturingSerial:
     def __init__(self):
         self.writes = []
         self.closed = False
+        self.flushed = False
+
+    def flush(self):
+        self.flushed = True
 
     def write(self, data):
         if self.closed:
@@ -797,6 +801,47 @@ class OtaChannelTests(unittest.TestCase):
         src = open(os.path.join(ROOT, "msu2_mini.py"), encoding="utf-8").read()
         self.assertIn("OTA 通道：写入/回读/校验通过", src)
         self.assertIn("ota_channel_probe(ota_data)", src)
+
+
+class AssetBlitTests(unittest.TestCase):
+    """`0A 18` 贴图：坐标按有符号字节发，负偏移交给固件裁剪。"""
+
+    def make(self):
+        tr = M.SerialTransport("COM_fake")
+        ser = CapturingSerial()
+        tr._ser = ser
+        tr._connected = True
+        tr._handshaked = True
+        tr._asset_reply = lambda sub, timeout=3.0: 0x06
+        return tr, ser
+
+    def test_negative_offset_is_sent_as_int8(self):
+        tr, ser = self.make()
+        ok, why = tr.asset_blit(1, 2, -40, 10)
+        self.assertTrue(ok, why)
+        self.assertEqual(ser.writes[-1],
+                         bytes([0x0A, 0x18, 1, 2, 0xD8, 0x0A]))
+
+    def test_missing_slot_reports_reason(self):
+        tr, _ser = self.make()
+        tr._asset_reply = lambda sub, timeout=3.0: 0x15
+        ok, why = tr.asset_blit(1, 2, 0, 0)
+        self.assertFalse(ok)
+        self.assertIn("还没有图", why)
+
+
+class CloseFlushTests(unittest.TestCase):
+    """关串口前要 flush，别把半个 6 字节帧留在设备接收侧造成错位。"""
+
+    def test_close_flushes_before_closing(self):
+        tr = M.SerialTransport("COM_fake")
+        ser = CapturingSerial()
+        tr._ser = ser
+        tr._connected = True
+        tr._handshaked = True
+        tr.close()
+        self.assertTrue(ser.flushed, "关串口前必须 flush 发送缓冲")
+        self.assertTrue(ser.closed)
 
 
 class WaitDeviceBackModuleTests(unittest.TestCase):

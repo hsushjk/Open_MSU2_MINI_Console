@@ -205,12 +205,13 @@ spec 里已经固定了这些设置，手工改命令时别漏：
 ## 测试
 
 `powershell
-python -m unittest discover -s tests -v   # 101 个用例，不接设备
+python -m unittest discover -s tests -v   # 104 个用例，不接设备
 `
 
 覆盖编码器（整帧 / 差分 / RLE / 分块签名）、触控状态机、协议帧字段、配置夹取、
 `--flash` 的 Intel HEX 解析、资产 RLE 往返与「压缩不比原始小就保持 fmt=0」、
-老固件回退、OTA 通道自检（只写暂存区不 apply）、`wait_device_back` 有界重连，
+老固件回退、OTA 通道自检（只写暂存区不 apply）、`0A 18` 贴图的有符号坐标、
+关串口前 flush（半个帧会把设备的接收侧顶错位）、`wait_device_back` 有界重连，
 以及「坏块补画 / 整帧重发 / 仍不同步则整屏重画」的分支。
 
 提交前再跑一遍未定义名门禁（优先 ruff，没装就退回 pyflakes，两者都没有则跳过）：

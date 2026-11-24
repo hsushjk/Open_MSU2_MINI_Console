@@ -460,6 +460,9 @@ class MiniDevice:
     def asset_draw(self, kind, slot):
         return self.transport.asset_draw(kind, slot)
 
+    def asset_blit(self, kind, slot, x, y):
+        return self.transport.asset_blit(kind, slot, x, y)
+
     def asset_erase(self, kind, slot):
         return self.transport.asset_erase(kind, slot)
 

@@ -1034,24 +1034,6 @@ class SerialTransport:
             return False
 
     @_serial_locked
-    def set_debug(self, on):
-        """开/关屏上调试标记；设备会自己写进 NOR，掉电也记得。"""
-        with self._lock:
-            if not self._connected or not self._ser:
-                return False
-            try:
-                self._ser.write(MiniProtocol.set_debug(on))
-                time.sleep(0.02)
-                tmp = bytearray()
-                while True:
-                    n = self._ser.in_waiting
-                    if not n:
-                        break
-                    tmp.extend(self._ser.read(n))
-                return True
-            except Exception as e:
-                log.warning("设置调试模式失败: %s", e)
-                return False
 
 
     @_serial_locked
@@ -1522,8 +1504,6 @@ class MiniDevice:
     def devcfg_write(self, dim, orient, reverse, flags=0):
         return self.transport.devcfg_write(dim, orient, reverse, flags)
 
-    def set_debug(self, on):
-        return self.transport.set_debug(on)
 
     def asset_info(self):
         return self.transport.asset_info()
@@ -2433,20 +2413,6 @@ class Scheduler(threading.Thread):
         log.info("亮度 -> %d%%", 100 - v)
         return True
 
-    def set_debug(self, on):
-        """开/关屏上的调试标记（联机点、完整性角标）。设备会把它写进 NOR。"""
-        on = bool(on)
-        self._debug = on
-        self.config.setdefault("display", {})["debug"] = on
-        self._save_config(delay=0.5)
-        try:
-            ok = self.device.set_debug(on)
-        except Exception as e:
-            log.warning("设置调试模式失败: %s", e)
-            return False
-        if ok:
-            log.info("调试模式 -> %s", "开" if on else "关")
-        return ok
 
     def toggle_lock(self, from_touch=False):
         self._locked = not self._locked
@@ -5247,10 +5213,6 @@ class WebUI(threading.Thread):
                     self._json({"ok": True,
                                 "dim": getattr(sched, "_dim", 0) if sched else 0}); return
 
-                if path == "/api/debug":
-                    self._json({"ok": True,
-                                "on": bool(getattr(sched, "_debug", False)) if sched else False}); return
-
                 if path == "/api/asset":
                     info = None
                     if sched is not None:
@@ -5346,16 +5308,6 @@ class WebUI(threading.Thread):
                         save_config_soon(outer.cfg, cfg_path)   # 连续改时合并写盘
                         stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
                         self._json({"ok": True, "dim": sched._dim, "stored": stored})
-                    elif self.path == "/api/debug":
-                        body = self._read_json()
-                        ev = sched.stage_devcfg()
-                        ok = sched.set_debug(bool(body.get("on")))
-                        dcfg["debug"] = bool(getattr(sched, "_debug", False))
-                        save_config_soon(outer.cfg, cfg_path)
-                        stored = bool(ev.wait(3.0) and sched._devcfg_ack_ok)
-                        self._json({"ok": ok, "on": bool(getattr(sched, "_debug", False)),
-                                    "stored": stored,
-                                    "err": "" if ok else "设备没有回应"})
                     elif self.path == "/api/pages":
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])

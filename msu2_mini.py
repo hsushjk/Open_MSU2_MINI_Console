@@ -6376,7 +6376,16 @@ def main(argv=None):
 
     try:
         if sim_id:
-            run_offline_window(manager, stop_event, sim_id)
+            try:
+                run_offline_window(manager, stop_event, sim_id)
+            except Exception as e:
+                # 没有图形环境（Linux 服务器 / SSH 会话里没有 DISPLAY）时别甩
+                # tkinter 堆栈，给一句人话再退出：这个模式只是本机离线预览，
+                # 无图形环境请直接用 WebUI。
+                log.error("离线模拟窗口打不开（%s）：需要一个图形环境（DISPLAY）。"
+                          "在 Linux 上请直接用 WebUI（默认 http://<本机IP>:8765）",
+                          e)
+                stop_event.set()
         while not stop_event.is_set():
             time.sleep(0.2)
     finally:

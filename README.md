@@ -1,10 +1,10 @@
 # Open_MSU2_MINI_Console
 
-MSU2_MINI 小屏的 Windows 上位机 **v1.0.2**：一个本地 WebUI（默认 `http://0.0.0.0:8765`）把插件页、截屏、背景图、开机/待机画面、OTA 升级和全局触控手势全放在一个页面里，另带 `--selftest` / `--flash` / `--simulate` 等命令行入口。
+MSU2_MINI 小屏的上位机 **v1.0.13**（Windows / Linux）：一个本地 WebUI（默认 `http://0.0.0.0:8765`）把插件页、截屏、背景图、开机/待机画面、OTA 升级和全局触控手势全放在一个页面里，另带 `--selftest` / `--flash` / `--simulate` 等命令行入口。
 
 ## 关键特性
 
-- **17 个内置插件页**（时钟、日历、待办、音乐、CPU/网络/磁盘、剪贴板、GIF…），外挂插件目录即插即用。
+- **16 个内置插件页**（时钟、日历、待办、音乐、CPU/网络/磁盘、剪贴板、GIF…），外挂插件目录即插即用。
 - **每帧 1 字节裁决**：设备回 `0x06` 才认为这帧画对了，回 `0x15` 就整帧重发；帧级串口锁保证别处插进来的命令不会把像素流切坏。
 - **拔插自恢复**：串口掉线自动重连，换 COM 号也能找回来；单实例互斥防止两个进程抢同一个口。
 - **开机 / 待机画面都写进板载 NOR**：开机图 1 槽 + 待机图 16 槽，写完不连电脑也生效；固件 v1.0.4 起支持 **RLE 压缩**，网页会显示每张图「原始 / 压缩后 / 省百分比」。
@@ -31,7 +31,17 @@ python msu2_mini.py
 
 ### 方式二：预编译 exe
 
-`dist/MSU2_Console.exe`（或 `MSU2_Console_Open.exe`）双击即用，无需 Python。首次运行会在 `%LOCALAPPDATA%\MSU2_MINI\` 生成配置、日志与缓存。
+`dist/MSU2_Console.exe`（或 `MSU2_Console_Open.exe`）双击即用，无需 Python。配置、日志与插件数据都在程序同目录（`config.json`、`console.log`、`widget_config\`、`uploads\`…），整个目录拷走就是完整备份。
+
+### 方式三：Linux
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install pyserial pillow psutil      # 可选：pynput（键鼠统计）、dbus-python（音乐）
+python msu2_mini.py --port /dev/serial/by-id/usb-MSU2_MSU2_MINI_*
+```
+
+设备每次重启后节点号可能从 `/dev/ttyACM0` 变成 `ttyACM1`，所以推荐用 `/dev/serial/by-id/` 下的软链接（OTA 之后上位机也按这个路径等设备回来）。`--headless` 是「不启动 WebUI」的意思；Linux 服务器上要看界面就不要加它。实测数据、已修问题与未覆盖项见 [docs/LINUX.md](docs/LINUX.md)。
 
 ### 依赖
 

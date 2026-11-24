@@ -919,6 +919,19 @@ class SerialTransport:
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True
             time.sleep(0.01)
+        # 兜底：设备可能正在待机/交叉淡入，问候包要等好几秒才补发一次，
+        # 干等会误判成“没设备”。主动问版本帧（0x56），能回就说明链路通。
+        for _ in range(4):
+            try:
+                if self.query_version(timeout=0.35) is not None:
+                    self.version = ""
+                    self.raw_mode = True
+                    log.info("设备没发问候包，但版本帧有回应，按整段传输继续")
+                    self._handshaked = True
+                    return True
+            except Exception as exc:
+                log.debug("握手兜底探活失败: %s", exc)
+            time.sleep(0.05)
         return False
 
 

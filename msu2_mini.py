@@ -47,7 +47,7 @@ def _icon_bytes():
     return b""
 
 
-__version__ = "2.2.2"
+__version__ = "1.0.0"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
@@ -523,18 +523,18 @@ class SerialTransport:
             if chunk:
                 buf += chunk
                 idx = buf.find(b"\x0a\x00")
-                while idx >= 0 and len(buf) - idx >= 12:
-                    frame = buf[idx:idx + 12]
-                    if frame[11] == 0xAA:
+                while idx >= 0 and len(buf) - idx >= 14:
+                    frame = buf[idx:idx + 14]
+                    if frame[13] == 0xAA:
                         return {
                             "boot_valid": bool(frame[2]),
-                            "standby_mask": frame[3],
-                            "boot_mode": frame[4],
-                            "standby_mode": frame[5],
-                            "count": frame[6],
-                            "dwell": (frame[7] << 8) | frame[8],
-                            "fw": frame[9],
-                            "boot_hold": frame[10] or 4,
+                            "standby_mask": frame[3] | (frame[4] << 8),
+                            "boot_mode": frame[5],
+                            "standby_mode": frame[6],
+                            "count": frame[7],
+                            "dwell": (frame[8] << 8) | frame[9],
+                            "fw": frame[10],
+                            "boot_hold": frame[11] or 4,
                         }
                     buf = buf[idx + 1:]
                     idx = buf.find(b"\x0a\x00")
@@ -1416,8 +1416,8 @@ class MiniDevice:
             fwv = getattr(self.transport, "fw_version", None)
             if fwv is None:
                 log.info("固件没有回版本号（proto25 或更早），按老固件处理")
-            elif fwv < (13, 0):
-                log.warning("固件版本 %d.%d 太旧，请烧 MSU2_open_v17.hex", fwv[0], fwv[1])
+            elif fwv < (1, 0):
+                log.warning("固件版本 %d.%d 过旧，请升级到 v1.0.0", fwv[0], fwv[1])
         return ok
 
     def close(self):  self.transport.close()
@@ -1511,7 +1511,7 @@ class MiniDevice:
         if not self._tiles_ok:
             return
         fw = getattr(self.transport, "fw_version", None)
-        if not fw or fw < (56, 0):
+        if not fw or fw < (1, 0):
             return
         if not getattr(self.encoder, "last_full", False):
             return
@@ -2322,8 +2322,8 @@ class Scheduler(threading.Thread):
             return False, "固件太大（%d 字节，上限 48000）" % len(data)
         fw = getattr(self.device.transport, "fw_version", None) or getattr(
             self.device, "fw_version", None)
-        if fw is not None and fw < (60, 0):
-            return False, "设备固件 %d.%d 不支持自更新，请先用 ISP 刷一次 v60" % fw
+        if fw is not None and fw < (1, 0):
+            return False, "设备固件 %d.%d 不支持自更新，请先用 ISP 刷一次 v1.0.0" % fw
         log.info("固件升级：写入 %d 字节", len(data))
 
         def _run():
@@ -4597,7 +4597,7 @@ function renderSlotList(d, used) {
   const box = document.getElementById('asset-slot-list');
   if (!box) return;
   let html = '';
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 16; i++) {
     const has = !!(d && (d.standby_mask & (1 << i)));
     html += '<div style="margin-top:3px">' +
       '<span style="display:inline-block;width:3.2em;color:#666">槽 ' + (i + 1) + '</span>' +
@@ -4634,7 +4634,7 @@ async function refreshAsset() {
   if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件需要 v32+）'; return; }
   const slots = [];
-  for (let i = 0; i < 8; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
+  for (let i = 0; i < 16; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
   document.getElementById('asset-state').textContent =
     '设备固件 v' + (d.fw || '?') +
     '；开机图 ' + (d.boot_valid ? '有' : '无') +
@@ -4661,7 +4661,7 @@ async function saveAssetSettings() {
   const body = {
     boot_mode: parseInt(document.getElementById('asset-boot').value, 10) || 0,
     standby_mode: parseInt(document.getElementById('asset-standby').value, 10),
-    count: 8,
+    count: 16,
     dwell: parseInt(document.getElementById('asset-dwell').value, 10) || 3,
     boot_hold: parseInt(document.getElementById('asset-boot-hold').value, 10) || 3,
   };
@@ -5812,8 +5812,8 @@ def cmd_flash(path, port=None):
         fw = tr.fw_version
         _console("  已连接 %s，当前固件 %s"
                  % (name, ("%d.%d" % fw) if fw else "未知"))
-        if not fw or fw < (60, 0):
-            _console("  [FAIL] 设备固件 %s 不支持自更新，请先用 ISP 刷一次 v60"
+        if not fw or fw < (1, 0):
+            _console("  [FAIL] 设备固件 %s 过旧，请先用 ISP 刷一次 v1.0.0"
                      % (("%d.%d" % fw) if fw else "未知"))
             tr.close()
             continue
@@ -5918,7 +5918,7 @@ def cmd_selftest(port=None):
 
         # 2.5) 分块签名核对（v56 起）：刚才最后一帧的 50 个块，设备认为有几块没画对
         fwmaj0 = (fw[0] if fw else 0)
-        if fwmaj0 >= 56:
+        if fwmaj0 >= 1:
             sig0 = getattr(getattr(dev, "encoder", None), "last_tile_sig", None)
             mask0 = tr.tile_check(sig0) if sig0 else None
             if mask0 is None:
@@ -5932,7 +5932,7 @@ def cmd_selftest(port=None):
 
         # 3) 复位面包屑（v53 起）
         fwmaj = (fw[0] if fw else 0)
-        if fwmaj >= 53:
+        if fwmaj >= 1:
             tr_ = tr.boot_trace()
             names_ = {0: "刚上电", 1: "main 开始", 2: "usb_init 完成", 3: "开机画面",
                       4: "主循环", 5: "收像素", 6: "写资产", 7: "淡入淡出",
@@ -5964,12 +5964,12 @@ def cmd_selftest(port=None):
 
         # 5) 资产 CRC 回读（v53 起）：设备把槽里的图重读一遍算 CRC
         info2 = tr.asset_info()
-        if fwmaj >= 53 and info2:
+        if fwmaj >= 1 and info2:
             slots = []
             if info2.get("boot_valid"):
                 slots.append((0, 0, "开机图"))
             mask = info2.get("standby_mask") or 0
-            for i in range(8):
+            for i in range(16):
                 if mask & (1 << i):
                     slots.append((1, i, "待机图槽 %d" % (i + 1)))
             if slots:
@@ -5985,7 +5985,7 @@ def cmd_selftest(port=None):
                 _console("  资产回读：设备上没有存图")
 
         # 6) 待机动画逐帧（v53 起）：让设备自己跑 10 次心跳
-        if fwmaj >= 53:
+        if fwmaj >= 1:
             st = tr.asset_settings(0, 3, 8, 3, boot_hold=3)
             dur = tr.anim_probe(10)
             if dur is None:

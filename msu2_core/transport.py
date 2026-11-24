@@ -9,6 +9,7 @@ import logging
 import sys
 import threading
 import time
+import zlib
 
 import serial
 

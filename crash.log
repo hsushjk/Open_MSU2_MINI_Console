@@ -1,2 +1,21 @@
 
 ===== 2026-11-24 10:18:17 启动 pid=45864 =====
+
+===== 2026-11-24 11:57:10 启动 pid=46048 =====
+
+--- 未捕获异常 ---
+Traceback (most recent call last):
+  File "C:\Users\hsush\Desktop\happy\Open_MSU2_MINI_Console\msu2_mini.py", line 5348, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "C:\Users\hsush\Desktop\happy\Open_MSU2_MINI_Console\msu2_mini.py", line 5211, in main
+    return cmd_flash(args.flash, args.port)
+  File "C:\Users\hsush\Desktop\happy\Open_MSU2_MINI_Console\msu2_mini.py", line 4785, in cmd_flash
+    ok, why = tr.flash_firmware(data, progress=_prog)
+              ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hsush\Desktop\happy\Open_MSU2_MINI_Console\msu2_core\transport.py", line 38, in wrapper
+    return fn(self, *args, **kwargs)
+  File "C:\Users\hsush\Desktop\happy\Open_MSU2_MINI_Console\msu2_core\transport.py", line 434, in flash_firmware
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+          ^^^^
+NameError: name 'zlib' is not defined. Did you forget to import 'zlib'?

@@ -198,10 +198,6 @@ class Background:
     MAX_FRAMES = 300
     MODES = ("fit", "fill", "stretch")
     PLAYLIST_SECS = 12.0
-    # 0.45 s 在真机上只能推 3–4 帧（25 KB 整帧约 130–180 ms），淡入还没开始
-    # 就结束了，眼睛看到的是“一帧黑 -> 硬切”，所以拉长到 1.0 s：按实测帧
-    # 间隔 0.12–0.20 s 算，一次淡入有 5–8 个中间帧，渐变肉眼可见。
-    CROSSFADE_SECS = 1.0        # 背景图切换/首次出现时的交叉淡入淡出时长
 
     def __init__(self):
         self.path = ""
@@ -218,11 +214,9 @@ class Background:
         self.t_last = None
         self.pl_interval = self.PLAYLIST_SECS
         self.shuffle = False
-        self._fade_from = None
-        self._fade_start = None
-        self._fade_pending = False
-        self._fade_frames = 0
-        self._last_frame = None
+        # 换图计时诊断用：上次真正换图的时刻 / 已换图次数。
+        self.switch_count = 0
+        self.switch_ts = None
 
     def configure(self, dim=0, blur=0):
         self.dim = 0            # 暗化搬到全局显示设置，背景不再压暗
@@ -241,39 +235,16 @@ class Background:
                 pass
         return out
 
-    def _begin_fade(self, from_img=None):
-        """下一帧从 from_img（默认全黑）交叉淡入到当前帧。"""
-        try:
-            self._fade_from = (from_img or Image.new(
-                "RGB", (SCREEN_W, SCREEN_H), "black")).convert("RGB")
-        except Exception:
-            self._fade_from = Image.new("RGB", (SCREEN_W, SCREEN_H), "black")
-        self._fade_start = None
-        self._fade_pending = True
-        self._fade_frames = 0
-
-    def _reset_fade(self):
-        self._fade_from = None
-        self._fade_start = None
-        self._fade_pending = False
-        self._fade_frames = 0
-
-    @property
-    def fading(self):
-        """交叉淡入淡出是否还没走完（Scheduler 靠它决定要不要继续要帧）。"""
-        return self._fade_from is not None
-
     def needs_frames(self, now):
         """现在是否还必须继续合成/发送新帧。
 
-        三个来源：
-        - 交叉淡入淡出进行中：时间在走，必须持续推帧才能看到渐变；
+        两个来源：
         - 背景轮播到点：该换下一组图了；
         - 动图帧到点：GIF/目录多帧动画该翻页了。
         插件静止（不渲染）时 Scheduler 也要靠这个继续要帧，否则背景会冻住。
+
+        注意：换图是**硬切**——到点后一帧就是新图，没有中间过渡帧。
         """
-        if self._fade_from is not None:
-            return True
         if len(self.groups) > 1 and self.group_ts is not None:
             if now - self.group_ts >= self.pl_interval:
                 return True
@@ -285,34 +256,6 @@ class Background:
             if dur > 0.0 and (self.t_last is None or now - self.t_last >= dur):
                 return True
         return False
-
-    def _apply_fade(self, img, now):
-        """把某一帧和淡出起点混合；没有淡入任务时原样返回。"""
-        if self._fade_from is None:
-            return img
-        if self._fade_pending:
-            self._fade_pending = False
-            self._fade_start = now
-        span = max(0.01, float(self.CROSSFADE_SECS))
-        t = 0.0 if self._fade_start is None else (now - self._fade_start) / span
-        if t >= 1.0:
-            started = self._fade_start
-            frames = self._fade_frames
-            self._fade_from = None
-            self._fade_start = None
-            self._fade_frames = 0
-            if frames:
-                elapsed = (now - started) if started is not None else span
-                log.info("背景交叉淡入完成：%.2f s 内推了 %d 个中间帧",
-                         elapsed, frames)
-            return img
-        t = max(0.0, min(1.0, t))
-        self._fade_frames += 1
-        try:
-            return Image.blend(self._fade_from, img.convert("RGB"), t)
-        except Exception:
-            self._reset_fade()
-            return img
 
     def load_playlist(self, paths, mode=None, interval=None, shuffle=None):
         if mode is not None:
@@ -341,12 +284,10 @@ class Background:
         if self.groups:
             self.raw, self.durations = list(self.groups[0][0]), list(self.groups[0][1])
             self.frames = [self._decorate(f) for f in self.raw]
-        log.info("背景轮播已加载: %d 组 (%s, 模式 %s)", len(self.groups),
-                 self.path, self.mode)
-        if self.frames:
-            self._begin_fade()
-        else:
-            self._reset_fade()
+        log.info("背景轮播已加载: %d 组 (%s, 模式 %s, 间隔 %.1f s)",
+                 len(self.groups), self.path, self.mode, self.pl_interval)
+        self.switch_count = 0
+        self.switch_ts = None
 
     def _read_path(self, p):
         if not p.exists():
@@ -394,16 +335,13 @@ class Background:
         self.idx = 0
         self.t_last = None
         self.group_ts = None
+        self.switch_count = 0
+        self.switch_ts = None
         if not path:
-            self._reset_fade()
             return
         self._read_path(Path(path))
         self.frames = [self._decorate(f) for f in self.raw]
         log.info("背景图已加载: %s (%d 帧, 模式 %s)", path, len(self.frames), self.mode)
-        if self.frames:
-            self._begin_fade()
-        else:
-            self._reset_fade()
 
     def _frame(self, img):
         tw, th = SCREEN_W, SCREEN_H
@@ -431,8 +369,16 @@ class Background:
         if len(self.groups) > 1:
             if self.group_ts is None:
                 self.group_ts = now
+                self.switch_ts = now
             elif now - self.group_ts >= self.pl_interval:
-                self.group_ts = now
+                prev_ts = self.group_ts
+                # 固定节拍：按“上次计划时刻 + 间隔”推进，别用 now 覆盖，
+                # 否则每轮被链路排队拖后的一点时间会一直累加（5 s 跑成
+                # 5.2 s、再成 5.4 s）。落后超过一整轮（掉线/主循环卡住）
+                # 才重新对齐到现在，不做补播式连切。
+                self.group_ts = prev_ts + self.pl_interval
+                if now - self.group_ts >= self.pl_interval:
+                    self.group_ts = now
                 if self.shuffle and len(self.groups) > 1:
                     nxt = self.group_idx
                     while nxt == self.group_idx:
@@ -444,8 +390,16 @@ class Background:
                 self.frames = [self._decorate(f) for f in self.raw]
                 self.idx = 0
                 self.t_last = None
-                log.debug("背景切换到第 %d 组", self.group_idx + 1)
-                self._begin_fade(self._last_frame)
+                # 硬切：这一帧返回的就是新组的图，不再有中间过渡帧。
+                # 日志带上实际间隔/迟到量，方便核对用户设的 interval 是否
+                # 因为计时起点被拖后而变成两倍。
+                gap = now - (self.switch_ts if self.switch_ts is not None else prev_ts)
+                late = now - (prev_ts + self.pl_interval)
+                self.switch_ts = now
+                self.switch_count += 1
+                log.info("背景切换 #%d：第 %d/%d 组（实际间隔 %.2f s，设定 %.1f s，滞后 %.2f s）",
+                         self.switch_count, self.group_idx + 1, len(self.groups),
+                         gap, self.pl_interval, late)
         if not self.frames:
             return None
         if len(self.frames) == 1:
@@ -458,8 +412,7 @@ class Background:
                 self.idx = (self.idx + 1) % len(self.frames)
                 self.t_last = now
             out = self.frames[self.idx]
-        self._last_frame = out
-        return self._apply_fade(out, now)
+        return out
 
 def _background_dir():
     """上位机数据目录下专门放规范化背景图的目录。"""
@@ -904,10 +857,9 @@ class Scheduler(threading.Thread):
         self.background = Background()
         self.background.configure(self._bg_dim, self._bg_blur)
         if self._bg_enabled:
-            if self._bg_paths:
-                self.background.load_playlist(self._bg_paths, self._bg_mode)
-            elif self._bg_path:
-                self.background.load(self._bg_path, self._bg_mode)
+            # 启动装载必须走和 _apply_background 同一条路径，否则配置里的
+            # 轮播间隔/乱序会被 load_playlist 的默认值（PLAYLIST_SECS）顶掉。
+            self._load_background_image()
 
         self._overlay = None
         self._overlay_until = 0.0
@@ -1713,6 +1665,21 @@ class Scheduler(threading.Thread):
         bg["paths"] = list(new_paths)
         self._save_config(delay=0.8)
 
+    def _load_background_image(self):
+        """按当前 _bg_* 字段装载背景：启动和 _apply_background 共用这一处。
+
+        轮播的间隔/乱序必须在这里一起传下去。以前启动路径漏传，
+        load_playlist 就退回 PLAYLIST_SECS（12 s）：配置写 5 s 也照样按
+        12 s 换图，只有用户重新点一次「应用」才会变快。
+        """
+        if self._bg_enabled and self._bg_source == "playlist" and self._bg_paths:
+            self.background.load_playlist(self._bg_paths, self._bg_mode,
+                                          self._bg_interval, self._bg_shuffle)
+        elif self._bg_enabled and self._bg_path:
+            self.background.load(self._bg_path, self._bg_mode)
+        else:
+            self.background.load("", self._bg_mode)
+
     def _apply_background(self):
         self._normalize_background_config()
         # 拖模糊/暗化时只有修饰变了，图不用重新解码：按关键字段判断
@@ -1721,20 +1688,15 @@ class Scheduler(threading.Thread):
                self._bg_interval, self._bg_shuffle)
         same = key == getattr(self, "_bg_loaded_key", None)
         self.background.configure(self._bg_dim, self._bg_blur)
-        if self._bg_enabled and self._bg_source == "playlist" and self._bg_paths:
-            if not same or not self.background.groups:
-                self.background.load_playlist(self._bg_paths, self._bg_mode,
-                                              self._bg_interval, self._bg_shuffle)
-        elif self._bg_enabled and self._bg_path:
-            if not same or not self.background.raw:
-                self.background.load(self._bg_path, self._bg_mode)
-        elif not same:
-            self.background.load("", self._bg_mode)
+        if not same or not (self.background.groups or self.background.raw):
+            self._load_background_image()
         self._bg_loaded_key = key
         self._switch.set()
-        log.info("背景 -> enabled=%s mode=%s dim=%d blur=%d path=%s",
-                 self._bg_enabled, self._bg_mode, self._bg_dim, self._bg_blur,
-                 self._bg_path)
+        log.info("背景 -> enabled=%s mode=%s source=%s interval=%.1f shuffle=%s "
+                 "dim=%d blur=%d path=%s",
+                 self._bg_enabled, self._bg_mode, self._bg_source,
+                 self._bg_interval, self._bg_shuffle, self._bg_dim,
+                 self._bg_blur, self._bg_path)
 
     def notify(self, text, secs=5):
         text = str(text or "").strip()
@@ -1793,13 +1755,13 @@ class Scheduler(threading.Thread):
         self._frames_window.append((mono, delta))
 
     def _bg_step_secs(self):
-        """背景淡入/动图连续推帧的节拍：跟上一帧实际占用的链路时间对齐。
+        """背景连续推帧的节拍：跟上一帧实际占用的链路时间对齐。
 
-        0.45 s 的旧淡入只能塞进 3–4 帧，看上去就是硬切。这里按上一帧的发送
-        耗时（_count_frame 里的 _send_gap，已经带了 15% 余量）决定下一帧最早
-        什么时候排；链路空闲（离线/测试设备）时用 80 ms 兜底，保证 1.0 s 的
-        淡入有 ≥12 次合成请求。真正发不出去时 _send_frame 返回 False，
-        主循环会在 0.1 s 后用 _force_send 重试，不会卡死。
+        换图是硬切，用不到这个节拍；它只给动图（GIF/多帧目录）翻页用：
+        按上一帧的发送耗时（_count_frame 里的 _send_gap，已经带了 15% 余量）
+        决定下一帧最早什么时候排；链路空闲（离线/测试设备）时用 80 ms 兜底。
+        真正发不出去时 _send_frame 返回 False，主循环会在 0.1 s 后用
+        _force_send 重试，不会卡死。
         """
         gap = float(getattr(self, "_send_gap", 0.0) or 0.0)
         if gap <= 0.0:
@@ -1807,7 +1769,7 @@ class Scheduler(threading.Thread):
         return max(0.04, min(0.30, gap))
 
     def _bg_due(self, mono, last_bg_ts):
-        """这一轮要不要为背景图再合成/推一帧（淡入、动图、轮播换图都算）。"""
+        """这一轮要不要为背景再合成/推一帧（轮播到点换图、动图翻页都算）。"""
         return (self._bg_enabled
                 and self.background.needs_frames(mono)
                 and mono - last_bg_ts >= self._bg_step_secs())
@@ -2204,9 +2166,9 @@ class Scheduler(threading.Thread):
                     wctx.orientation = self.orientation
 
                     need_render = (mono - last_mono >= w.interval)
-                    # 背景是否“还在动”：淡入淡出、轮播换图、动图翻页都算。
-                    # 以前这里要求 len(frames) > 1，单张静态背景的淡入永远推不
-                    # 出去，屏幕上只能看到“一帧黑 -> 硬切”（还以为是设备逐行刷新）。
+                    # 背景是否到点要动：轮播换图、动图翻页都算。
+                    # 以前这里要求 len(frames) > 1，单张静态背景的轮播换图就
+                    # 只能等插件自己下一次渲染，间隔根本不听话。
                     need_bg = self._bg_due(mono, last_bg_ts)
                     need_heartbeat = (not need_render and not need_bg and
                                       mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
@@ -2237,7 +2199,7 @@ class Scheduler(threading.Thread):
                         overlay = None
 
                     # 上一帧发失败（设备忙/掉线/正在重启）：0.1 s 后重试一次，
-                    # 不要等到插件自己的 interval 才动，否则淡入会停在半透明。
+                    # 不要等到插件自己的 interval 才动，否则换图那一帧会丢。
                     need_retry = (self._force_send and not need_render and
                                   not need_bg and overlay is None and
                                   mono >= self._devcfg_pause_until and

@@ -243,71 +243,101 @@ class BackgroundNormalizeTests(unittest.TestCase):
                          (self.root / "backgrounds").resolve())
 
 
-class BackgroundCrossfadeTests(unittest.TestCase):
-    def test_load_fades_in_from_black(self):
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "white.png"
-            Image.new("RGB", (160, 80), (255, 255, 255)).save(src)
-            bg = M.Background()
-            bg.load(str(src))
-            self.assertIsNotNone(bg._fade_from, "load 之后应该进入淡入状态")
-            first = bg.tick(0.0)
-            self.assertEqual(first.convert("RGB").getpixel((80, 40)), (0, 0, 0))
-            mid = bg.tick(M.Background.CROSSFADE_SECS / 2.0)
-            px = mid.convert("RGB").getpixel((80, 40))
-            self.assertTrue(0 < px[0] < 255, "淡入中间态应该是黑到白的过渡")
-            done = bg.tick(M.Background.CROSSFADE_SECS + 1.0)
-            self.assertEqual(done.convert("RGB").getpixel((80, 40)),
-                             (255, 255, 255))
+class BackgroundHardCutTests(unittest.TestCase):
+    """背景换图是硬切：一帧就是新图，没有任何淡入/过渡状态。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _png(self, name, color):
+        p = self.root / name
+        Image.new("RGB", (160, 80), color).save(p)
+        return str(p)
+
+    def test_load_paints_full_image_on_first_frame(self):
+        bg = M.Background()
+        bg.load(self._png("white.png", (255, 255, 255)))
+        self.assertFalse(hasattr(bg, "CROSSFADE_SECS"), "淡入常量应该删掉了")
+        self.assertFalse(hasattr(bg, "fading"), "淡入状态应该删掉了")
+        self.assertEqual(bg.tick(0.0).convert("RGB").getpixel((80, 40)),
+                         (255, 255, 255), "装载后第一帧就是完整新图")
+        self.assertEqual(bg.tick(0.01).convert("RGB").getpixel((80, 40)),
+                         (255, 255, 255))
 
     def test_direct_frames_assignment_stays_sharp(self):
-        # 旧的 CompositeTests 直接塞 frames，不能被淡入影响（保持像素精确）
+        # 旧的 CompositeTests 直接塞 frames，必须原样返回（像素精确）
         bg = M.Background()
         bg.frames = [Image.new("RGB", (160, 80), (7, 8, 9))]
         self.assertEqual(bg.tick(0.0).getpixel((0, 0)), (7, 8, 9))
 
-    def test_needs_frames_keeps_asking_until_fade_done(self):
-        # 问题 1+2：静态插件下没人再请求合成，淡入只发出第一帧（还是黑的）。
-        # needs_frames() 必须在整个过渡窗口里一直为真，主循环才会逐帧推。
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "white.png"
-            Image.new("RGB", (160, 80), (255, 255, 255)).save(src)
-            bg = M.Background()
-            bg.load(str(src))
-            self.assertTrue(bg.fading, "load 之后应该在淡入")
-            self.assertTrue(bg.needs_frames(0.0), "淡入开始就要请求帧")
+    def test_playlist_switch_is_hard_cut(self):
+        a = self._png("a.png", (255, 0, 0))
+        b = self._png("b.png", (0, 0, 255))
+        bg = M.Background()
+        bg.load_playlist([a, b], "fill", 5.0, False)
+        bg.tick(0.0)                       # 首次 tick 才开始计时
+        self.assertFalse(bg.needs_frames(4.9), "没到 5 s 不该换图")
+        self.assertEqual(bg.tick(4.9).convert("RGB").getpixel((80, 40)),
+                         (255, 0, 0))
+        self.assertTrue(bg.needs_frames(5.0), "到点就该请求一帧")
+        # 到点这一帧直接是新图：没有 0<x<255 的混色中间态
+        self.assertEqual(bg.tick(5.0).convert("RGB").getpixel((80, 40)),
+                         (0, 0, 255))
+        self.assertEqual(bg.switch_count, 1)
+        self.assertFalse(bg.needs_frames(5.4), "换完图不该再推淡入帧")
 
-            ticks = 0
-            grays = set()
-            t = 0.0
-            while t < M.Background.CROSSFADE_SECS + 0.5:
-                if bg.needs_frames(t):
-                    frame = bg.tick(t).convert("RGB")
-                    grays.add(frame.getpixel((80, 40))[0])
-                    ticks += 1
-                t += 0.05
-            self.assertGreaterEqual(ticks, 8,
-                                    "1.0 s 淡入至少要推 8 次合成（≈0.08–0.12 s 一步）")
-            self.assertFalse(bg.fading)
-            self.assertGreaterEqual(len(grays), 3,
-                                    "中间帧要有多个灰度级，肉眼才看得出渐变")
-            self.assertFalse(bg.needs_frames(t + 1.0), "淡入结束后不该再请求帧")
+    def test_playlist_interval_matches_configured_seconds(self):
+        a = self._png("a.png", (255, 0, 0))
+        b = self._png("b.png", (0, 0, 255))
+        bg = M.Background()
+        bg.load_playlist([a, b], "fill", 2.0, False)
+        bg.tick(0.0)
+        stamps = []
+        last = 0
+        for i in range(0, 1000):           # 0 … 9.99 s，步进 0.01 s
+            t = i / 100.0
+            if bg.needs_frames(t):
+                bg.tick(t)
+                if bg.switch_count != last:
+                    last = bg.switch_count
+                    stamps.append(t)
+        self.assertEqual(stamps, [2.0, 4.0, 6.0, 8.0],
+                         "interval=2 的换图时刻：%s" % (stamps,))
+
+    def test_playlist_cadence_does_not_drift_when_late(self):
+        a = self._png("a.png", (255, 0, 0))
+        b = self._png("b.png", (0, 0, 255))
+        bg = M.Background()
+        bg.load_playlist([a, b], "fill", 2.0, False)
+        bg.tick(0.0)
+        bg.tick(2.3)                       # 主循环晚 0.3 s 才轮到换图
+        self.assertEqual(bg.switch_count, 1)
+        stamps = []
+        for i in range(230, 650):
+            t = i / 100.0
+            if bg.needs_frames(t):
+                bg.tick(t)
+                stamps.append(t)
+        self.assertEqual(stamps, [4.0, 6.0],
+                         "节拍按计划时刻推进，迟到不能累加成漂移：%s" % (stamps,))
 
     def test_needs_frames_for_animated_background(self):
-        # 多帧 GIF / 轮播换图也走同一条持续推帧路径。
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "anim.gif"
-            a = Image.new("RGB", (160, 80), (255, 0, 0))
-            b = Image.new("RGB", (160, 80), (0, 0, 255))
-            a.save(src, save_all=True, append_images=[b], duration=80, loop=0)
-            bg = M.Background()
-            bg.load(str(src))
-            bg.tick(0.0)
-            bg.tick(M.Background.CROSSFADE_SECS + 0.2)   # 走完淡入
-            self.assertFalse(bg.fading)
-            self.assertGreaterEqual(len(bg.frames), 2)
-            self.assertTrue(bg.needs_frames(M.Background.CROSSFADE_SECS + 5.0),
-                            "动图翻页必须靠主循环持续要帧")
+        src = self.root / "anim.gif"
+        a = Image.new("RGB", (160, 80), (255, 0, 0))
+        b = Image.new("RGB", (160, 80), (0, 0, 255))
+        a.save(src, save_all=True, append_images=[b], duration=80, loop=0)
+        bg = M.Background()
+        bg.load(str(src))
+        self.assertGreaterEqual(len(bg.frames), 2)
+        bg.tick(0.0)
+        self.assertFalse(bg.needs_frames(0.01), "还没到帧时长，不用推帧")
+        self.assertTrue(bg.needs_frames(0.2), "动图翻页必须靠主循环持续要帧")
+        self.assertEqual(bg.tick(0.2).convert("RGB").getpixel((80, 40)),
+                         (0, 0, 255))
 
 
 class ClockColorTests(unittest.TestCase):

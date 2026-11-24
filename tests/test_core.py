@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 import zlib
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -446,39 +447,79 @@ class MultiDeviceTests(unittest.TestCase):
 
 
 class BackgroundSchedulingTests(unittest.TestCase):
-    """问题 1+2：背景淡入/动图期间，主循环必须持续请求合成帧。
-
-    以前 need_bg 要求 len(frames) > 1，单张静态背景的淡入永远只推第一帧
-    （黑屏），屏幕上看着像“硬切 + 逐行刷新”。
-    """
+    """背景换图：插件静止时主循环也得按时要帧，节奏跟配置的 interval 走。"""
 
     def make(self, **cfg):
         cfg.setdefault("pages", [])
         return M.Scheduler(M.OfflineDevice(), cfg)
 
-    def test_bg_due_true_through_fade_then_stops(self):
+    def _png(self, td, name, color):
+        p = os.path.join(td, name)
+        Image.new("RGB", (160, 80), color).save(p)
+        return p
+
+    def test_bg_due_fires_at_playlist_interval(self):
+        # 插件静止（不渲染）时，轮播到点也必须靠 _bg_due 继续要帧，
+        # 否则背景会一直停在旧图上。
         sched = self.make()
         with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, "white.png")
-            Image.new("RGB", (160, 80), (255, 255, 255)).save(src)
+            a = self._png(td, "a.png", (255, 0, 0))
+            b = self._png(td, "b.png", (0, 0, 255))
             sched._bg_enabled = True
-            sched.background.load(src)
-            last = 0.0
-            ticks = 0
-            t = 0.0
-            while t < M.Background.CROSSFADE_SECS + 0.5:
-                if sched._bg_due(t, last):
-                    self.assertIsNotNone(sched.background.tick(t))
-                    self.assertTrue(sched._send_frame(None, t))
-                    last = t
-                    ticks += 1
-                t += 0.01
-            self.assertGreaterEqual(ticks, 8,
-                                    "1.0 s 淡入至少推 8 帧（离线设备 80 ms 一步）")
-            self.assertGreaterEqual(sched.device.frames, 8)
-            self.assertFalse(sched.background.fading)
-            self.assertFalse(sched._bg_due(t + 1.0, last),
-                             "淡入结束后不该继续空推帧")
+            sched.background.load_playlist([a, b], "fill", 5.0, False)
+            sched.background.tick(0.0)          # 首次 tick 才开始计时
+            self.assertFalse(sched._bg_due(4.9, 0.0), "没到 5 s 不该换图")
+            self.assertTrue(sched._bg_due(5.0, 0.0), "到 5 s 必须请求换图帧")
+            self.assertIsNotNone(sched.background.tick(5.0))
+            self.assertEqual(sched.background.switch_count, 1)
+            self.assertFalse(sched._bg_due(5.4, 5.0), "换完立刻停，不再空推帧")
+
+    def test_bg_due_step_follows_link_gap(self):
+        # 换图是硬切，只有动图翻页才需要按链路占用排节拍。
+        sched = self.make()
+        with tempfile.TemporaryDirectory() as td:
+            a = self._png(td, "a.png", (255, 0, 0))
+            b = self._png(td, "b.png", (0, 0, 255))
+            sched._bg_enabled = True
+            sched.background.load_playlist([a, b], "fill", 2.0, False)
+            sched.background.tick(0.0)
+            sched._send_gap = 0.2
+            self.assertFalse(sched._bg_due(2.15, 2.0), "刚发完一帧，链路还没空")
+            self.assertTrue(sched._bg_due(2.25, 2.0))
+
+    def test_startup_uses_configured_interval_and_shuffle(self):
+        # 回归：启动路径以前调 load_playlist 时漏传 interval/shuffle，
+        # 配置写 5 s 实际按默认 12 s 换图（“设 5 秒实际 10 秒”的根因）。
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td, "data")
+            bg_dir = Path(data, "backgrounds")
+            bg_dir.mkdir(parents=True)
+            a = self._png(str(bg_dir), "a.png", (255, 0, 0))
+            b = self._png(str(bg_dir), "b.png", (0, 0, 255))
+            with mock.patch.object(M, "_data_dir", lambda: Path(data)):
+                sched = self.make(background={
+                    "enabled": True, "source": "playlist", "paths": [a, b],
+                    "mode": "fill", "interval": 5, "shuffle": True})
+                self.assertEqual(sched._bg_interval, 5.0)
+                self.assertEqual(sched.background.pl_interval, 5.0)
+                self.assertTrue(sched.background.shuffle)
+                self.assertEqual(len(sched.background.groups), 2)
+
+    def test_legacy_fade_config_key_is_silently_ignored(self):
+        # 老配置里可能还留着 fade/fade_secs：不报错、不影响 interval。
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td, "data")
+            bg_dir = Path(data, "backgrounds")
+            bg_dir.mkdir(parents=True)
+            a = self._png(str(bg_dir), "a.png", (255, 0, 0))
+            b = self._png(str(bg_dir), "b.png", (0, 0, 255))
+            with mock.patch.object(M, "_data_dir", lambda: Path(data)):
+                sched = self.make(background={
+                    "enabled": True, "source": "playlist", "paths": [a, b],
+                    "mode": "fill", "interval": 2,
+                    "fade": True, "fade_secs": 1.0})
+                self.assertEqual(sched.background.pl_interval, 2.0)
+                self.assertFalse(hasattr(sched.background, "fading"))
 
     def test_bg_step_matches_link_rate(self):
         sched = self.make()

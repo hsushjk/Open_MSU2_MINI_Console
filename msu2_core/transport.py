@@ -100,6 +100,12 @@ class SerialTransport:
                     self.last_error = f"打开 {self.port} 失败: {e}"
                     return False
             self._connected = True
+            # 对齐垫：上一会话若在驱动/设备里留下 1..5 个残字节，6 字节定界
+            # 就永久错位（设备还在打招呼，但所有命令都不回，只能拔插）。先写
+            # 一整帧 0x00：class 0 未知 sub 固件直接忽略；完全空闲时连续 0 也会
+            # 被当填充丢掉。写完等一会儿，让设备按“100 ms 无新字节”清残包。
+            self.write(b"\x00" * 6)
+            time.sleep(0.15)
             if not self._handshaked and not self.handshake(
                     timeout=handshake_timeout):
                 self.close(); return False
@@ -203,6 +209,11 @@ class SerialTransport:
                 # 看起来就像“设备死了”。v43 固件自己会超时放弃半截流，这里只要
                 # 安静一会儿，再补一条收流命令把状态清干净即可。
                 time.sleep(0.45)
+                self._ser.reset_input_buffer()
+                # 对齐垫（与 open() 同一套）：先补一整帧 0x00，再等设备自己把
+                # 半帧残包按“空闲 100 ms”丢掉，然后才清接收缓冲、发空帧。
+                self._ser.write(b"\x00" * 6)
+                time.sleep(0.25)
                 self._ser.reset_input_buffer()
                 self._ser.write(END_FRAME)        # 0 像素的收流：flush + 归零 + 裁决
                 time.sleep(0.05)
@@ -888,16 +899,18 @@ class SerialTransport:
                 buf.extend(chunk)
                 idx = buf.find(b"\x00OPM")
                 if idx >= 0 and len(buf) >= idx + 6:
-                    self.version = "02"
+                    # 自研握手：设备发 \0OPMSU，主机回 \0OKMSU。握手串里没有
+                    # 版本数字（版本只从 0x56 版本帧取），所以 version 留空。
+                    self.version = ""
                     self.raw_mode = True
-                    log.info("检测到 OPMSU 设备（整段传输）")
-                    self.write(b"\x00OPEND")
+                    log.info("检测到 OPMSU 设备（自研握手，整段传输）")
+                    self.write(b"\x00OKMSU")
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True
                 idx = buf.find(b"\x00MSN")
                 if idx >= 0 and len(buf) >= idx + 6:
-                    # 老固件（存档点/proto25）：整段传输协议一样，只是没有
-                    # 版本查询、没有裁决字节、ADC 恒 0。
+                    # 原厂/老固件（MSN02）：整段传输协议一样，回 \0MSNCN，
+                    # 版本字母就在握手串里（buf[4..5]），继续兼容。
                     self.version = chr(buf[idx + 4]) + chr(buf[idx + 5])
                     self.raw_mode = (self.version == "02")
                     log.info("检测到 MSN 设备, 版本=%s%s", self.version,

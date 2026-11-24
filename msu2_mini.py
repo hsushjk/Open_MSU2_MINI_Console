@@ -196,9 +196,6 @@ class MiniProtocol:
     def devcfg_write(dim, orient, reverse, page):
         return MiniProtocol._frame(0x09, 0x02, dim, orient, reverse, page)
 
-    @staticmethod
-    def devcfg_clear():
-        return MiniProtocol._frame(0x09, 0x03, 0, 0, 0, 0)
 
     # --- 资产（v1.0.0）：开机/待机画面存在板载 NOR，class 0x0A（16 槽） ---
     ASSET_BOOT = 0x00
@@ -355,12 +352,9 @@ class MiniProtocol:
 
 # 同步栅栏：坏帧之后连发这几个字节，设备无论停在收像素还是等命令，
 # 都会认出来、把现场清干净并回一个 0x06。像素里出现它的概率是 2^-48。
-SYNC_FENCE = bytes((0xA5, 0x5A, 0xA5, 0x5A, 0x0E, 0x07))
 END_FRAME = bytes((0x02, 0x03, 0x09, 0x00, 0x00, 0x00))
 # v16 起：空闲探询。设备只有在“上一帧的字节全吃完、没有半开的段”时才能
 # 解析到这条命令并回包，所以收到回包 = 设备确实空下来了。
-QUERY_IDLE = bytes((0x00, 0x57, 0x00, 0x00, 0x00, 0x00))
-IDLE_REPLY = b"\x57IDLE\xaa"
 
 
 def _serial_locked(fn):
@@ -930,86 +924,7 @@ class SerialTransport:
             return True, "画面设置已保存；开机停留秒数需要固件 v37 及以上"
         return True, "ok"
 
-    @_serial_locked
-    def wait_idle(self, timeout=0.8):
-        """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
 
-        设备把一帧的字节从接收环里消费完才会回到命令解析，所以能回这个
-        包就说明“现在发触摸/心跳是安全的”。收不到就整帧重发，绝不能把
-        命令字节塞进还没吃完的像素流里——那会被当成像素吃掉，整条流错位。
-        """
-        with self._lock:
-            if not self._connected or not self._ser:
-                return False
-            t_end = time.monotonic() + max(timeout, 0.05)
-            while time.monotonic() < t_end:
-                try:
-                    self._ser.reset_input_buffer()
-                    self._ser.write(QUERY_IDLE)
-                except Exception:
-                    self._connected = False; self._handshaked = False
-                    return False
-                deadline = time.monotonic() + 0.06
-                buf = bytearray()
-                while time.monotonic() < deadline:
-                    n = self._ser.in_waiting
-                    if n:
-                        buf.extend(self._ser.read(n))
-                        if IDLE_REPLY in bytes(buf):
-                            return True
-                    time.sleep(0.002)
-            return False
-
-    @_serial_locked
-    def read_verdicts(self, count, timeout=0.4):
-        """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。
-
-        调试模式（`0x5A 01`）下设备对每个 0x09 回的是 11 字节详情帧
-        `55 done_lo done_hi drop px_lo px_hi win_lo win_hi ms_hi ms_lo AA`，
-        这里一并认下（当成“这帧收了”，并顺手把 px/win 记到 self.last_status），
-        否则会误判成“设备没回执”进而重连、断在半帧里。
-        """
-        with self._lock:
-            if not self._connected or not self._ser:
-                return False, 0
-            got = 0
-            bad = False
-            buf = bytearray()
-            t0 = time.monotonic()
-            while got < count and time.monotonic() - t0 < timeout:
-                n = self._ser.in_waiting
-                if n:
-                    buf.extend(self._ser.read(n))
-                while buf:
-                    b = buf[0]
-                    if b == 0x55:
-                        if len(buf) < 11:
-                            break                     # 等详情帧收齐
-                        frame = bytes(buf[:11])
-                        if frame[10] != 0xAA:
-                            del buf[0]
-                            continue
-                        px = frame[4] | (frame[5] << 8)
-                        win = frame[6] | (frame[7] << 8)
-                        self.last_status = {
-                            "done": frame[1] | (frame[2] << 8),
-                            "drop": frame[3], "px": px, "win": win,
-                            "ms": frame[8] * 256 + frame[9],
-                        }
-                        if win and px != win:
-                            bad = True
-                        del buf[:11]
-                        got += 1
-                        continue
-                    del buf[0]
-                    if b == 0x06:
-                        got += 1
-                    elif b == 0x15:
-                        got += 1
-                        bad = True
-                if got < count:
-                    time.sleep(0.003)
-            return (got >= count and not bad), got
 
     @_serial_locked
     def read_all(self):
@@ -1137,49 +1052,6 @@ class SerialTransport:
                 log.warning("设置调试模式失败: %s", e)
                 return False
 
-    @_serial_locked
-    def read_status(self, timeout=0.12):
-        """收流后设备回的 16 字节状态帧（0x55 ... 0xAA）。
-
-        返回 dict（done/drop/px/win/aborts/ms/ovf）或 None。px 是本帧实际
-        画进屏的像素数，win 是这次开流声明的窗口像素数 —— 两者不等就说明
-        中间丢过字节，必须整帧重发。
-        """
-        with self._lock:
-            if not self._connected or not self._ser:
-                return None
-            t0 = time.monotonic()
-            buf = bytearray()
-            while time.monotonic() - t0 < timeout:
-                try:
-                    n = self._ser.in_waiting
-                    if n:
-                        buf.extend(self._ser.read(n))
-                except Exception:
-                    self._connected = False; self._handshaked = False
-                    return None
-                while len(buf) >= 1:
-                    if buf[0] != 0x55:
-                        del buf[0]
-                        continue
-                    if len(buf) < 18:
-                        break
-                    if buf[17] != 0xAA:
-                        del buf[0]
-                        continue
-                    st = {
-                        "done": (buf[2] << 8) | buf[1],
-                        "drop": (buf[4] << 8) | buf[3],
-                        "px":   (buf[6] << 8) | buf[5],
-                        "win":  (buf[8] << 8) | buf[7],
-                        "aborts": (buf[10] << 8) | buf[9],
-                        "ms":   (buf[12] << 8) | buf[11],
-                        "ovf":  (buf[14] << 8) | buf[13],
-                        "tmo":  (buf[16] << 8) | buf[15],
-                    }
-                    return st
-                time.sleep(0.004)
-            return None
 
     @_serial_locked
     def read_adc(self, ch, timeout=0.05):
@@ -1259,6 +1131,16 @@ def _tile_signatures(raw):
     return bytes(sig)
 
 
+def _full_frame(raw, encoder):
+    """把整帧 RGB565 包装成 0x07..0x09 报文（整帧重发用）。"""
+    out = bytearray()
+    out += MiniProtocol.lcd_set_xy(0, 0)
+    out += MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
+    out += MiniProtocol.lcd_enter_direct_mode()
+    out += encoder._encode_full(bytes(raw))
+    return bytes(out)
+
+
 def _tile_frame(raw, tx, ty):
     """只画一个 16x16 块的帧：整块 512 字节，一次段事务。"""
     rows = bytearray()
@@ -1331,15 +1213,21 @@ class FrameEncoder:
         out += MiniProtocol.lcd_enter_direct_mode()
 
         if raw_mode:
-            # 整帧发送：每帧都是一个完整的 0x07..0x09 事务，设备对
-            # 每一帧都给裁决字节。v28 的长测证明这条路是稳的；差分
-            # 一旦某块丢失就永久残留，比多花几毫秒糟得多。
+            # 差分 + RLE：只发相对上一帧变化的 16x16 块（每段自动在
+            # RLE/原样之间取小的）。丢块不会永久残留 —— 每帧都用分块
+            # 签名（0A 11）核对，坏块补画或整帧重发。
             self._force_full = False
-            self._last_tile_raw = raw
-            self.last_full = True
             self.last_raw = raw
             self.last_tile_sig = _tile_signatures(raw)
-            return bytes(out + self._encode_full(raw))
+            body = self._encode_tiles(raw)
+            if not body:
+                return b""
+            if getattr(self, "last_full", False):
+                # 整帧：必须先给全屏窗口头（0x07），设备会据此重置所有块的签名
+                return bytes(out + body)
+            # 差分帧：每块自带 set_xy/set_size/开流，绝不能带全屏头 ——
+            # 那会让设备把没重发的 45 个块的签名清零，逐帧核对必然误报。
+            return bytes(body)
 
         total = len(raw)
         n_segs = (total + 255) // 256
@@ -1456,7 +1344,6 @@ class MiniDevice:
         ok = self.transport.open()
         if ok:
             self.encoder.reset()
-            self._verify_acks = None          # 重新连上就重新相信设备
             self._ack_fails = 0
             self._zero_acks = 0
             fwv = getattr(self.transport, "fw_version", None)
@@ -1562,7 +1449,7 @@ class MiniDevice:
         fw = getattr(self.transport, "fw_version", None)
         if not fw or fw < (1, 0):
             return True
-        if not getattr(self.encoder, "last_full", False):
+        if getattr(self.encoder, "last_raw", None) is None:
             return True
         raw = getattr(self.encoder, "last_raw", None)
         sig = getattr(self.encoder, "last_tile_sig", None)
@@ -1584,7 +1471,7 @@ class MiniDevice:
                             len(bad), TILE_N, (TILE_N + 3) // 4, mask)
             if len(bad) * 100 >= TILE_N * 60:
                 log.warning("整屏不同步，改为整帧重发（第 %d 轮）", _round + 1)
-                if not self._write_paced(raw):
+                if not self._write_paced(_full_frame(raw, self.encoder)):
                     return False
                 self._full_resends = getattr(self, "_full_resends", 0) + 1
                 time.sleep(0.02)
@@ -1601,22 +1488,23 @@ class MiniDevice:
             self.tile_repairs += 1
             log.info("分块自检：补画 %d 块（掩码 %0*x）", fixed, (TILE_N + 3) // 4, mask)
             time.sleep(0.01)
-        now = time.monotonic()
-        if now - getattr(self, "_last_repair_warn", 0.0) > 30.0:
-            self._last_repair_warn = now
-            log.warning("分块自检：%d 轮后仍有块不一致，先继续跑（下一帧会整屏重画）", total)
+        left = self.transport.tile_check(sig)
+        if left:
+            log.warning("分块自检：%d 轮后仍有 %d 块不一致，整帧重发一次",
+                        total, len([b for b in range(TILE_N) if (left >> b) & 1]))
+            if self._write_paced(_full_frame(raw, self.encoder)):
+                self._full_resends = getattr(self, "_full_resends", 0) + 1
+                time.sleep(0.03)
+                left = self.transport.tile_check(sig)
+        if left:
+            self.encoder.reset()  # 下一帧整帧重画
+            now = time.monotonic()
+            if now - getattr(self, "_last_repair_warn", 0.0) > 30.0:
+                self._last_repair_warn = now
+                log.error("画面仍然不同步（掩码 %0*x），已让下一帧整屏重画",
+                          (TILE_N + 3) // 4, left)
         return True
 
-    def _recover(self):
-        """设备可能停在“等像素”里：等它自己的 400 ms 看门狗作废该段，
-        再把像素计数喂到 0。"""
-        try:
-            if not getattr(self.transport, "connected", False):
-                return
-            time.sleep(0.45)
-            self.transport.resync()
-        except Exception:
-            pass
 
     def set_reverse(self, reverse):
         self.screen_reversed = bool(reverse)
@@ -3768,6 +3656,18 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <div class="hint" id="msg-flash"></div>
       </div>
 
+  <div class="card">
+    <h2>网络</h2>
+    <div style="margin-top:6px;font-size:13px">
+      绑定地址 <input id="web-host" style="width:120px" placeholder="0.0.0.0">
+      端口 <input id="web-port" style="width:64px" placeholder="8765">
+      <button onclick="applyWeb()">应用并重开</button>
+    </div>
+    <div style="margin-top:6px;font-size:12px;color:#666">
+      0.0.0.0 = 局域网内其它设备也能打开；127.0.0.1 = 只有本机能打开。改完页面会切到新地址。
+    </div>
+    <div id="msg-web" style="margin-top:4px;font-size:12px;color:#a11"></div>
+  </div>
 <div class="card shutdown-card">
   <h2>关闭程序</h2>
   <div style="color:#666; font-size:12px; margin-bottom:.6em">
@@ -4808,6 +4708,34 @@ async function wipeAsset() {
   refreshAsset();
 }
 
+async function loadWeb() {
+  try {
+    const j = await getJSON('/api/web');
+    if (!j || !j.ok) return;
+    document.getElementById('web-host').value = j.host || '0.0.0.0';
+    document.getElementById('web-port').value = j.port || 8765;
+  } catch (e) {}
+}
+async function applyWeb() {
+  const host = (document.getElementById('web-host').value || '').trim() || '0.0.0.0';
+  const port = parseInt(document.getElementById('web-port').value || '8765', 10);
+  const msg = document.getElementById('msg-web');
+  msg.style.color = '#666';
+  msg.textContent = '正在切换…';
+  try {
+    const j = await postJSON('/api/web', {host: host, port: port});
+    if (j && j.ok) {
+      msg.style.color = '#161';
+      msg.textContent = '已切到 http://' + j.host + ':' + j.port + ' ，请用新地址重新打开页面';
+    } else {
+      msg.style.color = '#a11';
+      msg.textContent = '失败：' + ((j && j.err) || '未知错误');
+    }
+  } catch (e) {
+    msg.style.color = '#a11';
+    msg.textContent = '失败：' + e;
+  }
+}
 async function shutdownApp() {
   if (!confirm('确定要关闭 MSU2_MINI 上位机吗？\n关闭后需要重新启动才能继续使用。')) {
     return;
@@ -4841,6 +4769,7 @@ async function shutdownApp() {
 }
 
 loadTouch();
+loadWeb();
 loadDim(); refreshAsset();
 loadDevices();
 setBgSource();
@@ -5055,6 +4984,9 @@ class WebUI(threading.Thread):
         self._stop = threading.Event()
         self._pv = {}
         self._pv_lock = threading.RLock()
+        self._restart = threading.Event()
+        self._pending_rebind = None
+        self._rebind_lock = threading.Lock()
 
     @property
     def scheduler(self):
@@ -5073,6 +5005,12 @@ class WebUI(threading.Thread):
                 except Exception:
                     pass
             self._pv.clear()
+
+    def rebind(self, host, port):
+        """换绑定地址/端口：先等当前服务停掉，再在新的地址上重开。"""
+        with self._rebind_lock:
+            self._pending_rebind = (str(host or "0.0.0.0"), int(port))
+        self._restart.set()
 
     def run(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -5186,6 +5124,11 @@ class WebUI(threading.Thread):
                         self._send(ico, "image/x-icon")
                     else:
                         self.send_error(404)
+                    return
+
+                if path == "/api/web":
+                    self._json({"ok": True, "host": outer.host,
+                                "port": outer.port})
                     return
 
                 if path == "/api/devices":
@@ -5330,6 +5273,23 @@ class WebUI(threading.Thread):
             def do_POST(self):
                 try:
                     sched, dcfg = self._dev()
+                    if self.path == "/api/web":
+                        body = self._read_json()
+                        host = str(body.get("host", "") or "0.0.0.0").strip()
+                        port = _coerce_int(body.get("port"), 8765, 1, 65535)
+                        if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", host):
+                            self._json({"ok": False, "err": "地址格式不对"})
+                            return
+                        webcfg = outer.cfg.setdefault("web", {})
+                        webcfg["host"] = host
+                        webcfg["port"] = port
+                        save_config(outer.cfg, cfg_path)
+                        threading.Timer(
+                            0.25, outer.rebind, args=(host, port)
+                        ).start()
+                        log.info("Web UI 绑定改为 %s:%d（正在重开）", host, port)
+                        self._json({"ok": True, "host": host, "port": port})
+                        return
                     if self.path == "/api/select":
                         body = self._read_json()
                         did = str(body.get("id", ""))
@@ -5610,21 +5570,33 @@ class WebUI(threading.Thread):
                     log.exception("POST %s 异常", self.path)
                     self._json({"ok": False, "err": str(e)})
 
-        try:
-            srv = ThreadingHTTPServer((self.host, self.port), Handler)
-            srv.daemon_threads = True
-            log.info("Web UI 已启动: http://%s:%d", self.host, self.port)
+        while True:
+            try:
+                srv = ThreadingHTTPServer((self.host, self.port), Handler)
+                srv.daemon_threads = True
+                log.info("Web UI 已启动: http://%s:%d", self.host, self.port)
 
-            def watch():
-                while not self._stop.is_set():
-                    time.sleep(0.2)
-                srv.shutdown()
+                def watch(_srv=srv):
+                    while not (self._stop.is_set() or self._restart.is_set()):
+                        time.sleep(0.2)
+                    _srv.shutdown()
 
-            threading.Thread(target=watch, daemon=True).start()
-            srv.serve_forever(poll_interval=0.3)
-            srv.server_close()
-        except Exception as e:
-            log.warning("Web UI 启动失败: %s", e)
+                threading.Thread(target=watch, daemon=True).start()
+                srv.serve_forever(poll_interval=0.3)
+                srv.server_close()
+            except Exception as e:
+                log.warning("Web UI 启动失败: %s", e)
+                time.sleep(0.5)
+            if self._stop.is_set() or not self._restart.is_set():
+                break
+            self._restart.clear()
+            with self._rebind_lock:
+                pending = self._pending_rebind
+                self._pending_rebind = None
+            if not pending:
+                break
+            self.host, self.port = pending
+            log.info("Web UI 重新绑定: http://%s:%d", self.host, self.port)
 
 _NEW_WIDGET_TEMPLATE = '''from PIL import Image, ImageDraw
 

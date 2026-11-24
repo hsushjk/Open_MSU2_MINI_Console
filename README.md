@@ -75,6 +75,7 @@ python msu2_mini.py --headless                  # 只跑服务，不开浏览器
 | 状态 | 帧率、字节数、当前页、重发次数等运行指标 |
 | 开机 / 待机画面 | 开机模式 + 停留秒数；待机模式 + 每张秒数；选图即写、16 槽列表、预览、擦除单槽、保存设置、抹掉板载 NOR、读回设备侧自检结果 |
 | 固件升级 | 选 `.hex` / `.bin` 直接 OTA，带进度与失败原因 |
+| 网络 | 改 WebUI 绑定地址与端口（0.0.0.0 = 局域网可访问，127.0.0.1 = 仅本机），应用后服务自动重开 |
 | 关闭程序 | 停服务、释放串口 |
 
 > 亮度说明：硬件背光是 5 V 直连、没有调光电路，所以 100% 以上不存在、“亮度”实际是上位机把合成后的像素整体压暗（内部存 0..90 的压暗量）。要真正调光得改板（把 R1 换成低边 N-MOSFET，栅极接 PA9）。
@@ -167,28 +168,37 @@ python msu2_mini.py --headless                  # 只跑服务，不开浏览器
 
 ## 打包
 
-```powershell
-# Windows，带控制台窗口
-.\build.bat
+`powershell
+# 一条命令，用仓库里的 spec（已剔除用不到的 PIL AVIF 插件，省约 4.3 MB）
+python -m PyInstaller --noconfirm --clean MSU2_Console_Open.spec
+# 产物：dist\\MSU2_Console_Open.exe
+`
 
-# Windows，无控制台（发布用）
-.\build-noconsole.bat
+spec 里已经固定了这些设置，手工改命令时别漏：
 
-# macOS / Linux
-./build.sh
-```
+- --onefile --console --icon icon.ico
+- --add-data "icon.ico;." --add-data "msu2_core;msu2_core" --add-data "widgets;widgets"
+  （msu2_core/ 与 widgets/ 必须一起打进去，插件是运行时按目录发现的）
+- --collect-submodules msu2_core/widgets/mss/pynput/PIL
+- --optimize 1
+- spec 末尾把 vif 从 inaries/datas 里过滤掉：PIL\\_avif.pyd 一个就 7.5 MB，只用于 AVIF 图片，界面与插件都用不到
 
-等价的 PyInstaller 关键参数：
+可选依赖 pynput / mss 不装也能启动，只是对应动作/插件提示不可用。
 
-```powershell
-pyinstaller --onefile --clean --name "MSU2_Console" `
-  --icon icon.ico `
-  --add-data "msu2_core;msu2_core" --add-data "widgets;widgets" `
-  --collect-submodules=msu2_core --collect-submodules=widgets `
-  --optimize=1 msu2_mini.py
-```
+## 测试
 
-`msu2_core/` 与 `widgets/` 必须一起打进去（插件是运行时按目录发现的），可选依赖 `pynput` / `mss` 不装也能启动，只是对应动作/插件提示不可用。
+`powershell
+python -m unittest discover -s tests -v   # 22 个用例，不接设备
+`
+
+覆盖编码器（整帧 / 差分 / RLE / 分块签名）、触控状态机、协议帧字段、配置夹取、
+--flash 的 Intel HEX 解析、以及「坏块补画 / 整帧重发 / 仍不同步则整屏重画」的分支。
+
+真机自检（接上设备）：
+
+`powershell
+python msu2_mini.py --selftest
+`
 
 ## 插件开发
 

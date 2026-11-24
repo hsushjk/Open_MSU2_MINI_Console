@@ -5875,7 +5875,7 @@ def cmd_selftest(port=None):
                         "开" if info["reverse"] else "关",
                      "开" if (info.get("flags") or 0) & 1 else "关"))
         else:
-            _console("  设备存档不可用（v30 之前，或 NOR 读不到）")
+            _console("  设备存档未写入（NOR 里还没有配置，属于正常初态）")
 
         # 1) 触摸：连读 10 次，看有没有非 0 值
         vals = []

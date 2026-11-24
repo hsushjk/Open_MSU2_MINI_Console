@@ -711,8 +711,22 @@ class SerialTransport:
         self._ser.write(MiniProtocol.lcd_raw_end())
         time.sleep(0.05)
         self._ser.reset_input_buffer()
-        self._ser.write(MiniProtocol.flash_begin(total))
-        r = self._reply_byte(0x0A, 0x12, 3.0)
+        r = None
+        for attempt in range(3):
+            self._ser.write(MiniProtocol.flash_begin(total))
+            r = self._reply_byte(0x0A, 0x12, 6.0)
+            if r == 0x06:
+                break
+            # 设备可能卡在上一轮没收尾的流里：发一个 0 像素收流把它拉回来，再来一次
+            log.warning("上传握手没有回应（第 %d 次，0x%02X），收尾后重试", attempt + 1,
+                        r if r is not None else 0)
+            self._drain_upload_window()
+            self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
+            self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
+            self._ser.write(MiniProtocol.lcd_enter_direct_mode())
+            self._ser.write(MiniProtocol.lcd_raw_end())
+            time.sleep(0.4)
+            self._ser.reset_input_buffer()
         if r != 0x06:
             self._drain_upload_window()
             return False, "device refused the upload (0x%02X)" % (r if r is not None else 0)

@@ -178,7 +178,9 @@ class CountdownWidget(Widget):
         fs = max(9, min(15, H // 6))
         f_lbl = get_font(fs, cjk=True)
         y1 = max(8, H // 5)
-        cy = H - max(12, H // 4)
+        # 大号数字原来贴底（H - H/4），视觉上太靠下；放到中线上方一点，
+        # 与顶部标签留出呼吸感。
+        cy = int(H * 0.60)
         unit = "天"
         if delta > 0:
             gap = max(2, W // 40)

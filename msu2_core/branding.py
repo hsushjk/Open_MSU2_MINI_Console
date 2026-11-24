@@ -51,6 +51,11 @@ SCREENSHOT_DIR = _APP_DIR / "screenshots"
 DEFAULT_GIF_DIR = _asset_dir("gif")
 
 
+def data_dir():
+    """程序同目录（配置、插件数据、上传、日志、转储都放这里）。"""
+    return _data_dir()
+
+
 def _data_dir():
     """日志、崩溃记录、上传文件都放在程序同目录；目录不可写才退回用户目录。"""
     bases = [_APP_DIR]

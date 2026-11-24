@@ -43,3 +43,6 @@ crash.log
 console.log
 uploads/
 backgrounds/
+keyboard_stats.json
+mouse_mileage.json
+dumps/

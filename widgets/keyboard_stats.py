@@ -1,11 +1,59 @@
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from collections import deque
 
 from PIL import Image, ImageDraw
 
 from msu2_core import Widget, register, BOTH, LANDSCAPE, Field, get_font
+
+
+_SAVE_NAME = "keyboard_stats.json"
+_SAVE_EVERY = 30.0
+
+
+def _data_dir():
+    """插件数据与程序同目录（exe / 主 py 旁边）。"""
+    try:
+        from msu2_core.branding import data_dir
+        return data_dir()
+    except Exception:
+        return Path(__file__).resolve().parent.parent
+
+
+def _today_key():
+    import datetime
+    return datetime.date.today().isoformat()
+
+
+def _load_saved():
+    try:
+        import json
+        path = _data_dir() / _SAVE_NAME
+        with open(str(path), "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        day = str(obj.get("day") or "")
+        n = int(obj.get("count") or 0)
+        if n < 0:
+            return None
+        return day, n
+    except Exception:
+        return None
+
+
+def _save_saved(day, count):
+    try:
+        import json
+        path = _data_dir() / _SAVE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(str(tmp), "w", encoding="utf-8") as f:
+            json.dump({"day": day, "count": int(count)}, f, ensure_ascii=False)
+        os.replace(str(tmp), str(path))
+    except Exception:
+        pass
 
 log = logging.getLogger("msu2.widgets.keyboard_stats")
 
@@ -50,6 +98,17 @@ class KeyboardStatsWidget(Widget):
         st["_started_ts"] = 0.0
         st["_health_ts"] = 0.0
         st["_active"] = True
+        # 恢复今天的计数（以前只在内存里，重启就丢）
+        try:
+            saved = _load_saved()
+            if saved is not None and saved[0] == _today_key():
+                st["today"] = int(saved[1])
+            elif saved is not None:
+                st["today"] = 0
+            st["_saved_count"] = int(st.get("today") or 0)
+        except Exception:
+            st["_saved_count"] = 0
+        st["_save_ts"] = 0.0
         self._stop_watch(st)
         self._stop_listener(st)
         try:
@@ -170,6 +229,15 @@ class KeyboardStatsWidget(Widget):
             if not isinstance(recent, deque):
                 return None
             now = time.time()
+            # 每 30 秒把今天计数写一次盘（只在数字变了的时候写）
+            try:
+                if (mono - float(st.get("_save_ts") or 0.0) >= _SAVE_EVERY
+                        and int(st.get("today") or 0) != int(st.get("_saved_count") or 0)):
+                    st["_save_ts"] = mono
+                    st["_saved_count"] = int(st.get("today") or 0)
+                    _save_saved(_today_key(), st["_saved_count"])
+            except Exception:
+                pass
             with lock:
                 while recent and now - recent[0] > 60:
                     recent.popleft()

@@ -391,15 +391,8 @@ class Background:
                 self.idx = 0
                 self.t_last = None
                 # 硬切：这一帧返回的就是新组的图，不再有中间过渡帧。
-                # 日志带上实际间隔/迟到量，方便核对用户设的 interval 是否
-                # 因为计时起点被拖后而变成两倍。
-                gap = now - (self.switch_ts if self.switch_ts is not None else prev_ts)
-                late = now - (prev_ts + self.pl_interval)
                 self.switch_ts = now
                 self.switch_count += 1
-                log.info("背景切换 #%d：第 %d/%d 组（实际间隔 %.2f s，设定 %.1f s，滞后 %.2f s）",
-                         self.switch_count, self.group_idx + 1, len(self.groups),
-                         gap, self.pl_interval, late)
         if not self.frames:
             return None
         if len(self.frames) == 1:
@@ -2533,7 +2526,10 @@ def _sanitize_config(cfg):
 def _write_config_raw(cfg, path):
     p = Path(path)
     tmp = p.with_name(p.name + ".tmp")
-    data = json.dumps(cfg, indent=2, ensure_ascii=False)
+    # `_help` / `_available_widgets` 这类下划线开头的是运行时元数据（每次启动
+    # 重新生成），别写进用户配置文件里，否则 config.json 又长又难读。
+    clean = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+    data = json.dumps(clean, indent=2, ensure_ascii=False)
     with _CONFIG_LOCK:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)

@@ -264,29 +264,36 @@ class MiniDevice:
                 _lock.release()
 
     def _write_paced(self, payload):
-        """把整帧按 2 KB 分块写进串口，每块之后等驱动把在途字节送完再送下一块。
+        """整帧原子写入：分块 + 块间等驱动排空，全程持锁（见 transport.write_paced）。
 
-        设备的 USB 接收环只有 8 KB，主机一口气排进四块就顶满；顶满之后写入会
-        撞超时，Windows 上还可能把串口卡到只能拔插。等 ``out_waiting`` 归零再
-        发下一块，就把在途字节压到一块以内，接收环永远不会溢出。
-
-        块与块之间再留 4 ms：纯属给设备主循环一点喘息的余量。实测（Windows，
-        fw 1.0.9，连续 200 帧整屏噪声）：4 ms 与 6 ms 都是 200/200 全对、
-        平均 188/196 ms 一帧；2 ms 开始出现丢尾块。更早版本里“8 ms 不安全”
-        是另外两个缺陷（NAK 标志卡死、帧尾裁决顶掉签名回包）造成的误判。
+        间隔与分块不是可省的“等待”，而是数据完整性的前提：设备的 USB 接收环
+        只有 8 KB，主机一口气排进四块就顶满；顶满之后写入会撞超时，Windows 上
+        还可能把串口卡到只能拔插。等 ``out_waiting`` 归零再发下一块，在途字节
+        就始终不超过一块。块间再留 10 ms 给设备主循环喘息：实测（Windows，
+        fw 1.0.9）只有原样段的噪声帧 4 ms 也能过，但含行程编码的整帧
+        （投屏画面就是这一类，整帧 15–23 KB）在 4 ms 下设备会作废整帧
+        （帧尾裁决 0x15，顶部 30 块没落地），6 ms 偶发、8 ms 起稳定；
+        留 10 ms 作余量。
         """
+        if self._suspended:
+            return False
         seg_write = 2048
         rate = max(120000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
-        gap = min(0.004, seg_write / rate)
-        ser = getattr(self.transport, "_ser", None)
-        for i in range(0, len(payload), seg_write):
-            if not self.transport.write(payload[i:i + seg_write]):
-                return False
-            if i + seg_write < len(payload):
-                # 等驱动把这一块真正送出去，再送下一块。
-                self._wait_tx_drain(ser, 0.3)
-                time.sleep(gap)
-        return True
+        gap = min(0.010, seg_write / rate)
+        try:
+            paced = getattr(self.transport, "write_paced", None)
+            if paced is not None:
+                return paced(payload, seg_write, gap)
+            # 测试替身只实现了 write()：按同样的分块与间隔发一遍。
+            for i in range(0, len(payload), seg_write):
+                if not self.transport.write(payload[i:i + seg_write]):
+                    return False
+                if i + seg_write < len(payload):
+                    time.sleep(gap)
+            return True
+        except Exception as e:
+            log.warning("图片帧写入失败: %s", e)
+            return False
 
     @staticmethod
     def _wait_tx_drain(ser, timeout):
@@ -344,6 +351,13 @@ class MiniDevice:
         self._ack_fails = 0
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms
         self.frame_bytes = len(frame)
+        if self.last_verdict == 0x15:
+            # 设备自己判了“这帧不完整”（帧尾裁决 0x15）：像素数对不上窗口，
+            # 屏上只落了一部分。不必再跑分块自检 —— 那时掩码必然是顶部几十块，
+            # 徒然多一次往返和一行误导性的告警；清掉差分基线直接整帧重发。
+            self.encoder.reset()
+            log.debug("设备作废了整帧（裁决 0x15），整帧重发")
+            return False
         self._repair_tiles()
         return True
 

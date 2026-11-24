@@ -227,6 +227,52 @@ class SerialTransport:
         return sent
 
     @_serial_locked
+    def write_paced(self, payload, chunk=2048, gap=0.004, drain_timeout=0.3):
+        """把一整帧按 chunk 分块写出去，整个过程一直持锁。
+
+        设备收到 “开流” 命令后就按 raw_left 逐字节吃像素：帧写到一半时若别的
+        线程插进一条 6 字节命令，它会被当成 3 个像素，后面的字节随之整体错位，
+        随机几个块画错。所以一帧的写入必须是原子的 —— 不能像原来那样每块单独
+        调 ``write()``，那等于把锁让出去十几次。
+        """
+        if self._ser is None:
+            return False
+        total = len(payload)
+        if total <= 0:
+            return True
+        try:
+            for i in range(0, total, chunk):
+                piece = payload[i:i + chunk]
+                if i + chunk >= total:
+                    # 最后一块：走普通 write 收尾（仍持锁）
+                    return bool(self.write(piece))
+                if not self.write(piece):
+                    return False
+                self._drain_output(drain_timeout)
+                if gap > 0:
+                    time.sleep(gap)
+        except Exception as e:
+            log.warning("写入失败: %s", e)
+            self._connected = False
+            self._handshaked = False
+            return False
+        return True
+
+    def _drain_output(self, timeout):
+        """等驱动把已排队的字节真正送出去（超时也返回，由调用方决定怎么处理）。"""
+        ser = self._ser
+        if ser is None:
+            return
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            try:
+                if ser.out_waiting <= 0:
+                    return
+            except Exception:
+                return
+            time.sleep(0.001)
+
+    @_serial_locked
     def _purge_stale_stream(self, total=32004):
         # 灌一整帧还多一点的 0x00，把设备“等像素”的 raw_left 填平。
         # 每次写出的字节数都必须是 6 的整数倍，否则 6 字节定界会被推错位。

@@ -136,6 +136,32 @@ class OpmsuHandshakeTests(unittest.TestCase):
                              "兜底只允许写版本查询，不能写别的东西")
 
 
+class WriteBackpressureTests(unittest.TestCase):
+    """写超时 = 设备接收环满的背压，不是链路故障。"""
+
+    def test_write_timeout_is_retried_not_fatal(self):
+        import serial as pyserial
+
+        class BusySerial(ScriptSerial):
+            def __init__(self, busy_times):
+                super().__init__(answer_version=False)
+                self.busy = busy_times
+
+            def write(self, data):
+                if self.busy > 0:
+                    self.busy -= 1
+                    raise pyserial.SerialTimeoutException("Write timeout")
+                return super().write(data)
+
+        tr, ser = make_transport()
+        ser.__class__ = BusySerial
+        ser.busy = 2
+        tr._connected = True
+        tr._handshaked = True
+        self.assertTrue(tr.write(b"\x00" * 16), "写超时应重试后成功")
+        self.assertTrue(tr.connected, "重试成功不能把连接标记成断开")
+        self.assertEqual(ser.writes, [b"\x00" * 16])
+
 class SyncPadTests(unittest.TestCase):
     """任务 2：打开端口/重同步前先垫 6 个 0x00，让定界重新对齐。"""
 

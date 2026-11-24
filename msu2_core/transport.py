@@ -172,6 +172,7 @@ class SerialTransport:
                 view = memoryview(bytes(data))
                 total = len(view)
                 sent = 0
+                stalled = False
                 t0 = time.monotonic()
                 while sent < total:
                     try:
@@ -180,6 +181,10 @@ class SerialTransport:
                         # 设备接收环满时会 NAK，驱动的写缓冲很快也满，于是
                         # write() 抛超时。这是“设备暂时忙”，不是链路坏了：
                         # 等它把环吃掉再续写，只要还在 3 秒窗口内就不算失败。
+                        if not stalled:
+                            stalled = True
+                            log.info("设备接收环满了，写入等一会儿再续（已写 %d/%d 字节）",
+                                     sent, total)
                         if time.monotonic() - t0 > 3.0:
                             raise
                         time.sleep(0.005)
@@ -192,6 +197,9 @@ class SerialTransport:
                         continue
                     sent += n
                 self.bytes_written += total
+                if stalled:
+                    log.info("写入已恢复（本次阻塞 %.0f ms）",
+                             (time.monotonic() - t0) * 1000.0)
                 return True
             except Exception as e:
                 log.warning("写入失败: %s", e)

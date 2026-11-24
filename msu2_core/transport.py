@@ -305,21 +305,19 @@ class SerialTransport:
     def resync(self, timeout=0.5):
         """把设备从“等像素”拉回“等命令”。
 
-        以前是往串口灌 25 KB 的收流帧，靠“喂饱像素计数”把设备顶出来；问题是
-        那堆字节在设备凑够像素之后会被当命令解析，可能拼出 class 3（flash）之类
-        的野命令。v39 固件自己会在“30 ms 没字节”或“一帧超过 400 ms”时作废
-        未完成的段，所以这里只要闭嘴等一会儿，再发一帧 0 像素的空帧就够：
-        设备放弃半截像素流、回到命令解析，状态的残留也一起清零。
+        设备停在收流状态时会把收到的字节全部当作像素。固件在“30 ms 没有字节”
+        或“一帧超过 400 ms”时会作废未完成的段并回到命令解析，所以这里不灌
+        字节：安静等一段时间，再补一帧 0 像素的空帧，残留状态一并清掉。
         """
         with self._lock:
             if not self._connected or not self._ser:
                 return False
             try:
                 self._ser.reset_input_buffer()
-                # 千万不能再发“开流(0x07)”：那等于告诉设备“准备好收 25600 个像素”，
-                # 主机又不会真发，设备就一直等着吃字节、把所有命令都当像素吞掉，
-                # 看起来就像“设备死了”。v43 固件自己会超时放弃半截流，这里只要
-                # 安静一会儿，再补一条收流命令把状态清干净即可。
+                # 发“开流(0x07)”等于告诉设备准备好收 25600 个像素；主机不真发，
+                # 设备就会一直等字节、把所有命令当像素吞掉，看起来像设备死了。
+                # 固件会自行超时放弃半截流，这里安静一会儿，再补一条收流命令
+                # 把状态清干净即可。
                 time.sleep(0.45)
                 self._ser.reset_input_buffer()
                 # 对齐垫（与 open() 同一套）：先补一整帧 0x00，再等设备自己把
@@ -380,7 +378,7 @@ class SerialTransport:
 
     @_serial_locked
     def boot_report(self, timeout=1.0):
-        """读开机自检结果位图（v47 起）：bit0 FLASH / bit1 TOUCH / bit2 LCD / bit3 USB / bit4 CFG"""
+        """读开机自检结果位图：bit0 FLASH / bit1 TOUCH / bit2 LCD / bit3 USB / bit4 CFG"""
         if self._ser is None:
             return None
         try:
@@ -551,8 +549,8 @@ class SerialTransport:
         if total <= 0 or total > 48000:
             return False, "image size out of range (%d bytes)" % total
         self._ser.reset_input_buffer()
-        # Close any half-open frame and reset the device's per-session byte budget
-        # (firmware >= v59 drops everything once 40 KB has gone through without a reset).
+        # 先收尾可能残留的半截帧，同时让固件清空本次会话的像素字节预算
+        # （未收尾就超过 40 KB 会被整体丢弃）。
         self._write_raw(MiniProtocol.lcd_set_xy(0, 0))
         self._write_raw(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
         self._write_raw(MiniProtocol.lcd_enter_direct_mode())
@@ -605,7 +603,7 @@ class SerialTransport:
 
     @_serial_locked
     def nor_read(self, addr, n=16, timeout=1.2):
-        """读板载 NOR 原始字节（固件 v52 起，命令 0A 0C），用于自检抽查。"""
+        """读板载 NOR 原始字节（0A 0C），用于自检抽查。"""
         n = max(1, min(int(n), 48))
         self._ser.reset_input_buffer()
         self._write_raw(MiniProtocol._frame(0x0A, 0x0C,
@@ -693,7 +691,7 @@ class SerialTransport:
         return True, "ok", total
 
     def boot_trace(self, timeout=1.2, tries=3):
-        """复位面包屑（固件 v53 起）：上次停在哪一步、累计复位次数。"""
+        """复位面包屑：上次停在哪一步、累计复位次数。"""
         for _attempt in range(max(1, int(tries))):
             got = self._boot_trace_once(timeout)
             if got is not None:
@@ -717,12 +715,12 @@ class SerialTransport:
 
     @_serial_locked
     def tile_check(self, sigs, timeout=2.5):
-        """分块签名核对（固件 v58）：命令与 100 字节签名一次写完，设备回 10 字节掩码。
+        """分块签名核对：命令与 100 字节签名一次写完，设备回 10 字节掩码。
 
         不设“开始收”的 ack：那需要一个来回，而设备的 EP3 只有一笔在途缓冲，
         心跳一来就把 ack 顶掉了；顶掉之后设备还停着等 100 字节，后面所有命令
         都被当成签名吃掉 —— 一个丢包就能让整机像死了一样。
-        v58 起设备只是按序收下紧跟命令的 100 字节，收满就回包，不需要握手。
+        设备按序收下紧跟命令的 100 字节，收满就回包，不需要握手。
         """
         if self._ser is None or len(sigs) != TILE_N * 2:
             return None
@@ -753,7 +751,7 @@ class SerialTransport:
 
     @_serial_locked
     def asset_verify_check(self, kind, slot, timeout=8.0):
-        """让设备把槽里的图回读一遍算 CRC（固件 v53 起），返回 (ok, crc16)。"""
+        """让设备把槽里的图回读一遍算 CRC，返回 (ok, crc16)。"""
         self._ser.reset_input_buffer()
         self._write_raw(MiniProtocol.asset_verify(kind, slot))
         end = time.monotonic() + timeout
@@ -767,7 +765,7 @@ class SerialTransport:
 
     @_serial_locked
     def anim_probe(self, n=10, timeout=20.0):
-        """让设备自己跑 n 次待机心跳（固件 v53 起），用来验证动画不会卡死。"""
+        """让设备自己跑 n 次待机心跳，用来验证动画不会卡死。"""
         self._ser.reset_input_buffer()
         t0 = time.monotonic()
         self._write_raw(MiniProtocol.anim_probe(n))
@@ -820,12 +818,16 @@ class SerialTransport:
 
     @_serial_locked
     def asset_wipe(self, timeout=25.0):
-        """抹掉板载 NOR 里的全部图片与设置（逐槽擦 4K，约 0.3 秒）。"""
+        """抹掉板载 NOR 的全部内容（恢复出厂）：带 A5 5A 令牌，整片擦除需要数秒。"""
         if self._ser is not None:
             self._ser.reset_input_buffer()
         self.write(MiniProtocol.asset_wipe())
         st = self._asset_reply(0x0A, timeout)
-        return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认抹除（%r）" % (st,))
+        if st == 0x06:
+            return True, "ok"
+        if st is None:
+            return False, "设备没有回执（可能不在空闲状态）"
+        return False, "设备拒绝了抹除（回 0x%02X）" % st
 
     @_serial_locked
     def asset_settings(self, boot_mode, standby_mode, count, dwell,
@@ -840,8 +842,7 @@ class SerialTransport:
         self.write(MiniProtocol.asset_boot_hold(boot_hold))
         st = self._asset_reply(0x09, timeout)
         if st != 0x06:
-            # v37 之前没有这条命令：画面设置已经存进去了，只是停留秒数不生效
-            return True, "画面设置已保存；开机停留秒数需要固件 v37 及以上"
+            return False, "设备没有确认开机停留设置（回 %r）" % (st,)
         return True, "ok"
 
 

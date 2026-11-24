@@ -111,7 +111,12 @@ class FrameEncoder:
             raw[2 * k + 1] = v & 0xFF
         return bytes(raw)
 
-    def encode(self, img, raw_mode=False):
+    def encode(self, img):
+        """把一帧画面编码成串口报文；画面没有变化时返回空字节串。
+
+        始终按 16x16 块做差分：首帧或变化块过多时整屏重发，其余情况只发
+        变化的块。整帧报文带全屏窗口头，差分报文由每块自带窗口。
+        """
         if img.size != (SCREEN_W, SCREEN_H):
             img = img.resize((SCREEN_W, SCREEN_H))
         if img.mode != "RGB":
@@ -121,65 +126,21 @@ class FrameEncoder:
         if raw == self._last_raw and not self._force_full:
             return b""
         self._last_raw = raw
+        self._force_full = False
+        self.last_raw = raw
+        self.last_tile_sig = _tile_signatures(raw)
+        body = self._encode_tiles(raw)
+        if not body:
+            return b""
+        if self.last_full:
+            header = (MiniProtocol.lcd_set_xy(0, 0)
+                      + MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
+                      + MiniProtocol.lcd_enter_direct_mode())
+            return bytes(header + body)
+        return bytes(body)
 
-        out = bytearray()
-        out += MiniProtocol.lcd_set_xy(0, 0)
-        out += MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H)
-        out += MiniProtocol.lcd_enter_direct_mode()
-
-        if raw_mode:
-            # 差分 + RLE：只发相对上一帧变化的 16x16 块（每段自动在
-            # RLE/原样之间取小的）。丢块不会永久残留 —— 每帧都用分块
-            # 签名（0A 11）核对，坏块补画或整帧重发。
-            self._force_full = False
-            self.last_raw = raw
-            self.last_tile_sig = _tile_signatures(raw)
-            body = self._encode_tiles(raw)
-            if not body:
-                return b""
-            if getattr(self, "last_full", False):
-                # 整帧：必须先给全屏窗口头（0x07），设备会据此重置所有块的签名
-                return bytes(out + body)
-            # 差分帧：每块自带 set_xy/set_size/开流，绝不能带全屏头 ——
-            # 那会让设备把没重发的 45 个块的签名清零，逐帧核对必然误报。
-            return bytes(body)
-
-        total = len(raw)
-        n_segs = (total + 255) // 256
-        for si in range(n_segs):
-            seg = bytearray(raw[si * 256:(si + 1) * 256])
-            if len(seg) < 256:
-                seg += b"\xff" * (256 - len(seg))
-            units = [bytes(seg[k:k + 4]) for k in range(0, 256, 4)]
-            counts = {}
-            for u in units:
-                counts[u] = counts.get(u, 0) + 1
-            fill = max(counts, key=counts.get)
-            out += MiniProtocol.lcd_set_fill(*fill)
-            if sum(1 for u in units if u != fill) > 44:
-                for idx, u in enumerate(units):
-                    out += MiniProtocol.lcd_data_block(idx, *u)
-            else:
-                for idx, u in enumerate(units):
-                    if u != fill:
-                        out += MiniProtocol.lcd_data_block(idx, *u)
-            out += MiniProtocol.lcd_segment_end_full()
-        return bytes(out)
-
-    # ---- v2 分块增量 -------------------------------------------------
-    #
-    # 160x80 切成 16x16 的块，共 10x5 = 50 块，每块 512 字节。
-    # 与上一帧逐块比较，只发变化的块；每块自带窗口，独立成一次流。
-    # 变化块超过 32 个时退回整帧传输，避免重复的窗口开销反而更慢。
-    # ---- 4 位索引色 --------------------------------------------------
-    #
-    # 一帧 160x80 = 12800 像素。RGB565 是 25600 字节，索引色只要 6400 字节，
-    # 加上每帧 32 字节调色板，整帧报文从 25.6 KB 降到约 13 KB。
-    # 调色板用 PIL 的自适应量化（中位切分），16 色；解码在固件里做。
-    # 固定 16 色调色板：4 级灰 + 6 个基色 + 2 个深色。
-    # 顺序与取值都不随画面变化，抖动图案因此逐帧稳定，静态区域不会闪烁。
-    # 有序抖动的 Bayer 8×8 矩阵（0..1）
     def _encode_tiles(self, raw):
+        """逐块比较，只发相对上一帧变化的 16x16 块（每块 512 字节）。"""
         T = self.TILE
         prev = self._last_tile_raw
         raw = bytes(raw)
@@ -233,13 +194,13 @@ class MiniDevice:
         self.transport = SerialTransport(port)
         self.encoder = FrameEncoder()
         self.screen_reversed = False
-        # 发送限速（字节/秒）。设备的消费者是主循环 + 屏 DMA，实测能吃下
-        # 180–230 KB/s。默认 180 KB/s：丢了就降速，连续收齐再慢慢抬头。
+        # 发送限速（字节/秒）：设备的消费者是主循环与屏 DMA。收齐就缓慢提速，
+        # 收到裁决失败就降速，下限见 _write_paced()。
         self._pace_bps = 140000.0
         # 学到的安全上限：撞过一次 0x15 就把上限压到失败速率的 85%，
         # 之后慢慢往上试，但不再直接冲回失败过的那个速率。
         self._pace_max = 240000.0
-        # 分块自检（固件 v56）：每帧发完让设备回一张“哪些块没画对”的掩码，
+        # 分块自检：每帧发完让设备回一张“哪些块没画对”的掩码，
         # 只补画坏块。整帧重绘要 25 KB，补一块只要 0.5 KB。
         self.tile_repairs = 0
         self._full_resends = 0
@@ -256,9 +217,7 @@ class MiniDevice:
             self.encoder.reset()
             self._ack_fails = 0
             self._zero_acks = 0
-            fwv = normalize_fw_version(
-                getattr(self.transport, "fw_version", None))
-            if fwv is None:
+            if getattr(self.transport, "fw_version", None) is None:
                 log.info("固件没有回版本号")
         return ok
 
@@ -318,8 +277,7 @@ class MiniDevice:
 
     def _show_image_once_locked(self, img):
         t0 = time.perf_counter()
-        frame = self.encoder.encode(
-            img, raw_mode=getattr(self.transport, "raw_mode", False))
+        frame = self.encoder.encode(img)
         self.enc_ms = (time.perf_counter() - t0) * 1000.0
         if not frame:
             return True
@@ -343,7 +301,7 @@ class MiniDevice:
                 pass
             return False
         # 整帧已经写进串口了：不再等任何回执。
-        # 为什么：从 v38 起每帧都是整屏全量重绘（encode() 恒走 _encode_full），
+        # 为什么：每帧都是整屏全量重绘（encode() 恒走 _encode_full），
         # 某一帧在路上丢了几个字节，下一帧也会把整屏重新盖一遍，坏帧最多闪一下。
         # 相反，逐帧等回执会把“设备忙得没空回话”误判成“设备坏了”，接着重连，
         # 而重连发生在设备正停在半帧里的时刻，于是后续命令全被当成像素吃掉 ——

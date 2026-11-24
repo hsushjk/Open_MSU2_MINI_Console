@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover - 没装 numpy 时退化为原样发送
 # 屏幕几何（横向 160x80）
 SCREEN_W, SCREEN_H = LANDSCAPE_SIZE
 
-# 160x80 屏 = 10x5 个 16x16 块（固件 v56 的 0A 11 核对用）
+# 160x80 屏 = 10x5 个 16x16 块（0A 11 分块核对用）
 TILE_N = 50
 
 
@@ -111,12 +111,10 @@ def lcd_segment_payload(chunk):
 
 
 class Cmd:
-    SFR = 0x00; LCD = 0x02; FLASH = 0x03; BULK = 0x04; ADC = 0x08
-    LCD_SET_XY = 0x00; LCD_SET_SIZE = 0x01; LCD_SET_COLOR = 0x02
+    SFR = 0x00; LCD = 0x02; BULK = 0x04; ADC = 0x08
+    LCD_SET_XY = 0x00; LCD_SET_SIZE = 0x01
     LCD_DRAW = 0x03
     DRAW_LOAD_ADDR = 0x07; DRAW_DATA = 0x08
-    DRAW_DIRECTION = 0x0A
-    FILL_COLOR = 0x04
 
 
 class MiniProtocol:
@@ -124,7 +122,7 @@ class MiniProtocol:
     def _frame(*vals):
         return bytes(v & 0xFF for v in vals)
 
-    # --- 设备端配置存档（v30+）：亮/朝向/翻转/页，存在板载 NOR 里 ---
+    # --- 设备端配置存档：亮度/朝向/翻转/页，存在板载 NOR 里 ---
     @staticmethod
     def devcfg_info():
         return MiniProtocol._frame(0x09, 0x01, 0, 0, 0, 0)
@@ -192,8 +190,8 @@ class MiniProtocol:
 
     @staticmethod
     def asset_wipe():
-        """抹掉全部资产与设置：`0A 0A`"""
-        return MiniProtocol._frame(0x0A, 0x0A, 0, 0, 0, 0)
+        """抹掉整片 NOR（恢复出厂）：`0A 0A`，b2/b3 必须是确认令牌 A5 5A。"""
+        return MiniProtocol._frame(0x0A, 0x0A, 0xA5, 0x5A, 0, 0)
 
     @staticmethod
     def boot_trace():
@@ -253,24 +251,6 @@ class MiniProtocol:
                                    Cmd.DRAW_LOAD_ADDR, 0, 0, 0)
 
     @staticmethod
-    def lcd_set_fill(b0, b1, b2, b3):
-        return MiniProtocol._frame(Cmd.LCD, Cmd.FILL_COLOR, b0, b1, b2, b3)
-
-    @staticmethod
-    def lcd_data_block(idx, b0, b1, b2, b3):
-        return MiniProtocol._frame(Cmd.BULK, idx, b0, b1, b2, b3)
-
-    @staticmethod
-    def lcd_segment_end_full():
-        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW,
-                                   Cmd.DRAW_DATA, 0x01, 0x00, 0x00)
-
-    @staticmethod
-    def lcd_segment_end_tail(tail):
-        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW,
-                                   Cmd.DRAW_DATA, 0x00, tail & 0xFF, 0x00)
-
-    @staticmethod
     def lcd_raw_segment(data):
         n = len(data)
         return (MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x0C,
@@ -287,11 +267,6 @@ class MiniProtocol:
     @staticmethod
     def lcd_raw_end():
         return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW, 0x09, 0, 0, 0)
-
-    @staticmethod
-    def lcd_direction(reverse):
-        return MiniProtocol._frame(Cmd.LCD, Cmd.LCD_DRAW,
-                                   Cmd.DRAW_DIRECTION, reverse & 0x01, 0, 0)
 
     @staticmethod
     def read_adc(ch):

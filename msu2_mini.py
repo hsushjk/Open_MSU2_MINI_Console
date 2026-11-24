@@ -5705,7 +5705,7 @@ def cmd_selftest(port=None):
         else:
             _console("  固件版本未知（v8 及更早没有版本帧）")
 
-        # 0) 设备存档（v30 起：板载 NOR 记得亮度/朝向/翻转/页）
+        # 0) 设备存档：板载 NOR 记得亮度/朝向/翻转/页
         info = tr.devcfg_info()
         if info:
             _console("  存档 NOR=%s 有效=%s 亮度=%d%% 朝向=%s 翻转=%s 调试=%s"
@@ -5755,7 +5755,7 @@ def cmd_selftest(port=None):
                  % (ok_full, int(getattr(dev, "tx_ms", 0) or 0),
                     int(getattr(dev, "frame_bytes", 0) or 0)))
 
-        # 2.5) 分块签名核对（v56 起）：刚才最后一帧的 50 个块，设备认为有几块没画对
+        # 2.5) 分块签名核对：刚才最后一帧的 50 个块，设备认为有几块没画对
         fwmaj0 = (fw[0] if fw else 0)
         if fwmaj0 >= 1:
             sig0 = getattr(getattr(dev, "encoder", None), "last_tile_sig", None)
@@ -5769,7 +5769,7 @@ def cmd_selftest(port=None):
                          % (bin(mask0).count("1"), mask0,
                             int(getattr(dev, "tile_repairs", 0) or 0)))
 
-        # 3) 复位面包屑（v53 起）
+        # 3) 复位面包屑
         fwmaj = (fw[0] if fw else 0)
         if fwmaj >= 1:
             tr_ = tr.boot_trace()
@@ -5814,7 +5814,7 @@ def cmd_selftest(port=None):
                 _console("  [FAIL] OTA 通道：%s" % ota_why)
                 bad += 1
 
-        # 5) 资产 CRC 回读（v53 起）：设备把槽里的图重读一遍算 CRC
+        # 5) 资产 CRC 回读：设备把槽里的图重读一遍算 CRC
         info2 = tr.asset_info()
         if fwmaj >= 1 and info2:
             slots = []
@@ -5836,7 +5836,7 @@ def cmd_selftest(port=None):
             else:
                 _console("  资产回读：设备上没有存图")
 
-        # 6) 待机动画逐帧（v53 起）：让设备自己跑 10 次心跳
+        # 6) 待机动画逐帧：让设备自己跑 10 次心跳
         if fwmaj >= 1:
             saved = None
             try:

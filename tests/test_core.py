@@ -34,7 +34,7 @@ def solid(w=160, h=80, color=(0, 0, 0)):
 class FrameEncoderTests(unittest.TestCase):
     def test_first_frame_is_full_and_rle_compressed(self):
         enc = M.FrameEncoder()
-        body = enc.encode(solid(), raw_mode=True)
+        body = enc.encode(solid())
         self.assertTrue(enc.last_full)
         self.assertGreater(len(body), 0)
         # 纯黑整屏：RLE 应该远小于 25.6 KB 原样
@@ -43,10 +43,10 @@ class FrameEncoderTests(unittest.TestCase):
     def test_small_change_sends_only_that_tile(self):
         enc = M.FrameEncoder()
         img = solid()
-        first = enc.encode(img, raw_mode=True)
+        first = enc.encode(img)
         img2 = img.copy()
         img2.paste((255, 0, 0), (32, 16, 48, 32))
-        second = enc.encode(img2, raw_mode=True)
+        second = enc.encode(img2)
         self.assertFalse(enc.last_full)
         self.assertGreater(len(first), len(second))
         self.assertLess(len(second), 200)
@@ -54,14 +54,14 @@ class FrameEncoderTests(unittest.TestCase):
     def test_identical_frame_sends_nothing(self):
         enc = M.FrameEncoder()
         img = solid((10, 20, 30))
-        enc.encode(img, raw_mode=True)
-        self.assertEqual(enc.encode(img, raw_mode=True), b"")
+        enc.encode(img)
+        self.assertEqual(enc.encode(img), b"")
 
     def test_large_change_falls_back_to_full_frame(self):
         enc = M.FrameEncoder()
-        enc.encode(solid(), raw_mode=True)
+        enc.encode(solid())
         noisy = Image.effect_noise((160, 80), 64).convert("RGB")
-        enc.encode(noisy, raw_mode=True)
+        enc.encode(noisy)
         self.assertTrue(enc.last_full)
 
     def test_rgb565_is_high_byte_first(self):
@@ -78,7 +78,7 @@ class FrameEncoderTests(unittest.TestCase):
 
     def test_full_frame_helper_is_a_complete_transaction(self):
         enc = M.FrameEncoder()
-        enc.encode(solid(), raw_mode=True)
+        enc.encode(solid())
         frame = M._full_frame(enc.last_raw, enc)
         self.assertTrue(frame.startswith(M.MiniProtocol.lcd_set_xy(0, 0)))
         self.assertTrue(frame.endswith(M.MiniProtocol.lcd_raw_end()))
@@ -202,7 +202,7 @@ class RepairTests(unittest.TestCase):
         dev.transport = self.FakeTransport(masks)
         dev._tiles_ok = True
         enc = M.FrameEncoder()
-        enc.encode(solid(), raw_mode=True)
+        enc.encode(solid())
         dev.encoder = enc
         dev.frame_bytes = 1234
         dev.tx_ms = 10.0

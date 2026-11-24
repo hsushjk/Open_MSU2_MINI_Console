@@ -174,7 +174,16 @@ class SerialTransport:
                 sent = 0
                 t0 = time.monotonic()
                 while sent < total:
-                    n = self._ser.write(view[sent:]) or 0
+                    try:
+                        n = self._ser.write(view[sent:]) or 0
+                    except serial.SerialTimeoutException:
+                        # 设备接收环满时会 NAK，驱动的写缓冲很快也满，于是
+                        # write() 抛超时。这是“设备暂时忙”，不是链路坏了：
+                        # 等它把环吃掉再续写，只要还在 3 秒窗口内就不算失败。
+                        if time.monotonic() - t0 > 3.0:
+                            raise
+                        time.sleep(0.005)
+                        continue
                     if n <= 0:
                         # 短写：给驱动喘口气，别把半帧当成整帧发出去
                         if time.monotonic() - t0 > 3.0:
@@ -903,7 +912,7 @@ class SerialTransport:
                     # 版本数字（版本只从 0x56 版本帧取），所以 version 留空。
                     self.version = ""
                     self.raw_mode = True
-                    log.info("检测到 OPMSU 设备（自研握手，整段传输）")
+                    log.info("检测到 OPMSU 设备（整段传输）")
                     self.write(b"\x00OKMSU")
                     time.sleep(0.05); self.read_all()
                     self._handshaked = True; return True

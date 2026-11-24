@@ -1448,6 +1448,8 @@ class MiniDevice:
         # 分块自检（固件 v56）：每帧发完让设备回一张“哪些块没画对”的掩码，
         # 只补画坏块。整帧重绘要 25 KB，补一块只要 0.5 KB。
         self.tile_repairs = 0
+        self._full_resends = 0
+        self._last_repair_warn = 0.0
         self._tiles_ok = True
 
     def open(self):
@@ -1492,6 +1494,18 @@ class MiniDevice:
             if _lock is not None:
                 _lock.release()
 
+    def _write_paced(self, payload):
+        """把整帧按 2 KB 分块、带间隔写进串口（限速可自适应）。"""
+        seg_write = 2048
+        rate = max(40000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
+        gap = seg_write / rate
+        for i in range(0, len(payload), seg_write):
+            if not self.transport.write(payload[i:i + seg_write]):
+                return False
+            if i + seg_write < len(payload):
+                time.sleep(gap)
+        return True
+
     def _show_image_once_locked(self, img):
         t0 = time.perf_counter()
         frame = self.encoder.encode(
@@ -1507,16 +1521,7 @@ class MiniDevice:
         # Write in 2 KB pieces with a tiny gap: the device ring is 8 KB and its
         # consumer is the main loop, so never push a whole 25 KB frame in one
         # burst. This costs ~25 ms per frame and removes the overflow entirely.
-        ok = True
-        seg_write = 2048
-        rate = max(40000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
-        gap = seg_write / rate
-        for i in range(0, len(payload), seg_write):
-            if not self.transport.write(payload[i:i + seg_write]):
-                ok = False
-                break
-            if i + seg_write < len(payload):
-                time.sleep(gap)
+        ok = self._write_paced(payload)
         if not ok:
             # 写失败/截断：设备可能停在“等像素”中间，此时再发任何命令都会被
             # 当作像素吃掉。用同步栅栏把它拉回命令模式，再整帧重发。
@@ -1548,37 +1553,59 @@ class MiniDevice:
     def _repair_tiles(self, rounds=2):
         """分块自检：让设备报出没画对的 16x16 块，只补画这些块。
 
-        为什么需要它：整帧 25 KB 走串口，偶发丢字节会被裁决字节抓到（整帧重发）；
-        但屏那一侧（SPI + DMA）偶尔也会漏像素，这种情况点数是对的、画面却是错的，
-        只有逐块对账才发现得了。坏了就地补一块，不用整屏刷。
+        超过六成的块都不对，说明整帧根本没落地，逐块补不划算 —— 直接整帧重发。
+        逐块补画也要限速：50 块约 26 KB 一口气灌进 8 KB 接收环，主机被 NAK
+        卡住超过固件那 30 ms 段超时，正在收的块就会被作废（表现为底部几行反复坏）。
         """
         if not self._tiles_ok:
-            return
+            return True
         fw = getattr(self.transport, "fw_version", None)
         if not fw or fw < (1, 0):
-            return
+            return True
         if not getattr(self.encoder, "last_full", False):
-            return
+            return True
         raw = getattr(self.encoder, "last_raw", None)
         sig = getattr(self.encoder, "last_tile_sig", None)
         if not raw or not sig:
-            return
-        for _round in range(max(1, int(rounds))):
+            return True
+        raw = bytes(raw)
+        told = False
+        total = max(1, int(rounds))
+        for _round in range(total):
             mask = self.transport.tile_check(sig)
             if mask is None or mask == 0:
-                return
+                return True
+            bad = [bit for bit in range(TILE_N) if (mask >> bit) & 1]
+            if not told:
+                told = True
+                log.warning("画面不同步：%d B / %.0f ms / 坏块 %d/%d（掩码 %0*x）",
+                            getattr(self, "frame_bytes", 0),
+                            getattr(self, "tx_ms", 0.0),
+                            len(bad), TILE_N, (TILE_N + 3) // 4, mask)
+            if len(bad) * 100 >= TILE_N * 60:
+                log.warning("整屏不同步，改为整帧重发（第 %d 轮）", _round + 1)
+                if not self._write_paced(raw):
+                    return False
+                self._full_resends = getattr(self, "_full_resends", 0) + 1
+                time.sleep(0.02)
+                continue
             fixed = 0
-            for bit in range(TILE_N):
-                if not (mask >> bit) & 1:
-                    continue
+            for n, bit in enumerate(bad):
                 tx = (bit % (SCREEN_W // 16)) * 16
                 ty = (bit // (SCREEN_W // 16)) * 16
                 if not self.transport.write(_tile_frame(raw, tx, ty)):
-                    return
+                    return False
                 fixed += 1
+                if (n + 1) % 8 == 0:
+                    time.sleep(0.010)
             self.tile_repairs += 1
-            log.info("分块自检：补画 %d 块（掩码 %07x）", fixed, mask)
+            log.info("分块自检：补画 %d 块（掩码 %0*x）", fixed, (TILE_N + 3) // 4, mask)
             time.sleep(0.01)
+        now = time.monotonic()
+        if now - getattr(self, "_last_repair_warn", 0.0) > 30.0:
+            self._last_repair_warn = now
+            log.warning("分块自检：%d 轮后仍有块不一致，先继续跑（下一帧会整屏重画）", total)
+        return True
 
     def _recover(self):
         """设备可能停在“等像素”里：等它自己的 400 ms 看门狗作废该段，

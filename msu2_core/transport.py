@@ -120,7 +120,15 @@ class SerialTransport:
                 self._purge_stale_stream()
                 time.sleep(0.05)
                 if not self.handshake(timeout=handshake_timeout):
-                    self.close(); return False
+                    # 设备可能正忙（待机淡入/写 NOR）没空发问候，但命令照收：
+                    # 主动问一次版本，有回应就算连上。
+                    self._purge_stale_stream(total=6)
+                    fw = self.query_version(timeout=0.5)
+                    if fw is None:
+                        self.close(); return False
+                    self.raw_mode = True
+                    self._handshaked = True
+                    log.info("设备没发问候包，但版本帧有回应，按整段传输继续")
                 log.info("设备刚才卡在半截帧里，已灌字节冲掉，重新握手成功")
             log.info("串口已打开: %s @ %d", self.port, self.baud)
             ver = self.query_version()
@@ -212,8 +220,21 @@ class SerialTransport:
                 total = len(view)
                 sent = 0
                 t0 = time.monotonic()
+                stuck = 0
                 while sent < total:
-                    n = self._ser.write(view[sent:]) or 0
+                    try:
+                        n = self._ser.write(view[sent:]) or 0
+                    except serial.SerialTimeoutException:
+                        # 设备接收环满了（NAK）：这不是链路坏了，等一会儿再续。
+                        # 只要 3 秒内还有进展就不算失败，日志降成 DEBUG 免得刷屏。
+                        if time.monotonic() - t0 > 3.0:
+                            raise
+                        stuck += 1
+                        if stuck % 50 == 1:
+                            log.debug("设备接收环满，等待续写（已写 %d/%d 字节）",
+                                      sent, total)
+                        time.sleep(0.02)
+                        continue
                     if n <= 0:
                         # 短写：给驱动喘口气，别把半帧当成整帧发出去
                         if time.monotonic() - t0 > 3.0:

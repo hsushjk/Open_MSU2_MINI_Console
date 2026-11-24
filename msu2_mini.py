@@ -81,6 +81,7 @@ from msu2_core.branding import (  # noqa: E402
 from msu2_core.protocol import (  # noqa: E402
     Cmd, END_FRAME, MiniProtocol, TILE_N,  # noqa: F401
     _rle_payload, lcd_segment_payload,  # noqa: F401
+    compress_asset_payload, rle_decode_rgb565, rle_encode_rgb565,  # noqa: F401
 )
 from msu2_core.transport import (  # noqa: E402
     SCREEN_BAUD, SerialTransport, _normalize_port, _serial_locked,  # noqa: F401
@@ -108,6 +109,64 @@ HEARTBEAT_INTERVAL = 2.0
 REBOOT_POLL_SECS = 0.2
 REBOOT_TIMEOUT = 15.0
 REBOOT_HANDSHAKE_TIMEOUT = 0.35
+
+# 资产槽在 NOR 里的位置（与固件 assets.c 一致）：开机图 1 槽 + 待机图 16 槽。
+# 槽头 20 B，fmt 在偏移 8、len 在偏移 10（小端），网页用它显示原始/压缩。
+ASSET_BOOT_ADDR = 0x000000
+ASSET_STANDBY_BASE = 0x008000
+ASSET_SLOT_SIZE = 0x6800
+ASSET_HDR_SIZE = 20
+ASSET_RAW_BYTES = SCREEN_W * SCREEN_H * 2
+# 从这个固件版本起资产槽支持 fmt=1（RLE）；更老的固件只能写裸 RGB565。
+RLE_MIN_FW = (1, 0, 4)
+
+
+def _open_device(dev, timeout=2.0):
+    """调设备 open()，兼容不接受 handshake_timeout 的实现（测试替身）。"""
+    open_fn = getattr(dev, "open", None)
+    if not callable(open_fn):
+        return False
+    try:
+        return bool(open_fn(handshake_timeout=timeout))
+    except TypeError:
+        return bool(open_fn())
+
+
+def wait_device_back(dev, poll=REBOOT_POLL_SECS, timeout=REBOOT_TIMEOUT):
+    """固件写完后的有界轮询：每 200 ms 试一次，最多 15 s。
+
+    设备重启时串口会消失再出现，调用方通常已经关掉了旧句柄，所以这里只
+    open() + query_version()，绝不写像素帧。返回
+    `(是否回来, "x.y.z", 失败说明, 尝试次数)`；CLI 的 `--flash` 和 Web OTA
+    共用这一套逻辑（以前 `--flash` 只睡 2 秒就下结论，和网页版不一致）。
+    """
+    poll = REBOOT_POLL_SECS if poll is None else float(poll)
+    deadline = time.monotonic() + (REBOOT_TIMEOUT if timeout is None
+                                   else float(timeout))
+    attempts = 0
+    while time.monotonic() < deadline:
+        attempts += 1
+        try:
+            if _open_device(dev, timeout=REBOOT_HANDSHAKE_TIMEOUT):
+                tr = getattr(dev, "transport", None)
+                ver = None
+                if tr is not None:
+                    try:
+                        ver = tr.query_version(timeout=0.4)
+                    except Exception:
+                        ver = None
+                if ver:
+                    return True, format_fw_version(
+                        normalize_fw_version(ver) or ver), "", attempts
+            try:
+                if getattr(dev, "connected", False):
+                    dev.close()
+            except Exception:
+                pass
+        except Exception as exc:
+            log.debug("等待设备回来（第 %d 次）：%s", attempts, exc)
+        time.sleep(poll)
+    return False, "", "设备没有回来，请拔插一次 USB 再重试", attempts
 
 # favicon 允许浏览器缓存一小时：版本号在 URL 查询串里（?v=2），换图标时改它。
 FAVICON_CACHE_CONTROL = "public, max-age=3600"
@@ -1212,14 +1271,23 @@ class Scheduler(threading.Thread):
     # ---------- 开机 / 待机画面（存在设备 NOR 里） ----------
     @staticmethod
     def encode_asset_image(path):
-        """把任意图片转成 160x80 RGB565 小端字节（铺满，不保持比例）。"""
+        """把任意图片转成 160x80 RGB565，并挑更省 NOR 的那种格式。
+
+        返回 `(payload, fmt)`：
+        - fmt=0：裸 RGB565，25 600 B；
+        - fmt=1：3 字节一包的 RLE（`[cnt, hi, lo]`，cnt 1..255），
+          `len` 与 `crc32` 都按压缩后的数据算。
+
+        只有 RLE 真的更短时才用 fmt=1（渐变图/纯色收益大，照片常常更大，
+        那就老实留 fmt=0）。字节序必须和帧编码器（_to_rgb565）一致：
+        **高字节在前**，否则屏上红蓝互换 + 麻点。
+        """
         from PIL import Image
 
         img = Image.open(path).convert("RGB").resize(
             (SCREEN_W, SCREEN_H), Image.LANCZOS)
-        # 字节序必须和帧编码器（_to_rgb565）一致：**高字节在前**。
-        # 之前写成低字节在前，屏上颜色全乱（红蓝互换 + 麻点）。
-        return FrameEncoder._to_rgb565(img)
+        raw = FrameEncoder._to_rgb565(img)
+        return compress_asset_payload(raw)
 
     def _asset_idle(self, fn, pause=0.8):
         """先把帧流停一会儿、拿住串口锁，再发一条资产命令。
@@ -1260,51 +1328,17 @@ class Scheduler(threading.Thread):
 
     @staticmethod
     def _open_device(dev, timeout=2.0):
-        """调设备 open()，兼容不接受 handshake_timeout 的实现（测试替身）。"""
-        open_fn = getattr(dev, "open", None)
-        if not callable(open_fn):
-            return False
-        try:
-            return bool(open_fn(handshake_timeout=timeout))
-        except TypeError:
-            return bool(open_fn())
+        """兼容旧调用点：实际逻辑已抽到模块级 `_open_device()`。"""
+        return _open_device(dev, timeout=timeout)
 
     def _wait_device_back(self, dev, poll=None, timeout=None):
-        """固件写完后的有界轮询：每 200 ms 试一次，最多 15 s。
-
-        设备重启时串口会消失再出现，transport.flash_firmware 收到 [OK]
-        uploaded 后已经主动关掉了旧句柄，所以这里只 open() + query_version()，
-        绝不写像素帧。返回 (是否回来, "x.y.z", 失败说明)。
-        """
-        poll = REBOOT_POLL_SECS if poll is None else float(poll)
-        deadline = time.monotonic() + (REBOOT_TIMEOUT if timeout is None
-                                       else float(timeout))
-        attempts = 0
-        while time.monotonic() < deadline:
-            attempts += 1
-            try:
-                if self._open_device(dev, timeout=REBOOT_HANDSHAKE_TIMEOUT):
-                    tr = getattr(dev, "transport", None)
-                    ver = None
-                    if tr is not None:
-                        try:
-                            ver = tr.query_version(timeout=0.4)
-                        except Exception:
-                            ver = None
-                    if ver:
-                        self._reboot_attempts = attempts
-                        return True, format_fw_version(
-                            normalize_fw_version(ver) or ver), ""
-                try:
-                    if getattr(dev, "connected", False):
-                        dev.close()
-                except Exception:
-                    pass
-            except Exception as exc:
-                log.debug("等待设备回来（第 %d 次）：%s", attempts, exc)
-            time.sleep(poll)
+        """兼容旧调用点：实际逻辑已抽到模块级 `wait_device_back()`。"""
+        back, fw_text, why, attempts = wait_device_back(
+            dev,
+            poll=REBOOT_POLL_SECS if poll is None else poll,
+            timeout=REBOOT_TIMEOUT if timeout is None else timeout)
         self._reboot_attempts = attempts
-        return False, "", "设备没有回来，请拔插一次 USB 再重试"
+        return back, fw_text, why
 
     def flash_firmware_safe(self, path):
         """把固件写进设备 NOR 并等它重启回来，返回 WebUI 可直接下发的字典。
@@ -1411,14 +1445,33 @@ class Scheduler(threading.Thread):
                                                count, dwell, boot_hold))
 
     def upload_asset(self, kind, slot, path):
-        """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。"""
-        payload = self.encode_asset_image(path)
+        """把图片写进设备 NOR 的某个槽。写的时候暂停渲染，避免抢串口。
+
+        返回 `(ok, why, info)`。info 里带 `raw`（原始 25 600 B）、`sent`
+        （实际发出去的字节数）和 `fmt`（0/1），网页据此显示压缩比。
+
+        v1.0.4 之前固件只认 fmt=0：先按固件版本判断，版本未知或写失败
+        再退回裸 RGB565 重写一次（旧图/旧固件都能画出来）。
+        """
+        payload, fmt = self.encode_asset_image(path)
+        fw = normalize_fw_version(getattr(
+            getattr(self.device, "transport", None), "fw_version", None))
+        if fmt and fw is not None and fw < RLE_MIN_FW:
+            # 旧固件不认 fmt=1：解回裸数据，走原来的 fmt=0 路径
+            payload, fmt = rle_decode_rgb565(payload), 0
+        raw_len = ASSET_RAW_BYTES
+        sent_len = len(payload)
         self._devcfg_pause_until = time.monotonic() + 12.0
         lock = getattr(self.device.transport, "_lock", None)
         try:
             if lock is not None:
                 lock.acquire()
-            ok, why = self.device.asset_write(kind, slot, payload)
+            ok, why = self.device.asset_write(kind, slot, payload, fmt=fmt)
+            if not ok and fmt == 1:
+                # 可能是固件版本号没更新/不支持 fmt=1：直接用裸数据重试一次
+                raw = rle_decode_rgb565(payload)
+                ok, why = self.device.asset_write(kind, slot, raw)
+                payload, fmt = raw, 0
         finally:
             if lock is not None:
                 lock.release()
@@ -1430,7 +1483,52 @@ class Scheduler(threading.Thread):
                     self.device.asset_draw(kind, slot)
                 except Exception:
                     pass
-        return ok, why
+        info = {"raw": raw_len,
+                "sent": len(payload) if ok else sent_len,
+                "fmt": fmt}
+        return ok, why, info
+
+    def asset_slot_sizes(self, info=None):
+        """只回读 20 B 槽头，拿到每张图的格式和长度（不整图回读）。
+
+        返回 `{(kind, slot): {"fmt": 0|1, "len": N}}`；槽头 magic 不对或
+        读不到就不放进结果（网页按空槽显示）。老固件没有 `0A 0C` 时异常
+        返回空字典，网页退化成只显示 有图/空槽。
+        """
+        result = {}
+        if info is None:
+            try:
+                info = self.asset_query(tries=1)
+            except Exception:
+                info = None
+        if not info:
+            return result
+        targets = []
+        if info.get("boot_valid"):
+            targets.append((MiniProtocol.ASSET_BOOT, 0))
+        mask = int(info.get("standby_mask") or 0)
+        for i in range(16):
+            if mask & (1 << i):
+                targets.append((MiniProtocol.ASSET_STANDBY, i))
+        for kind, slot in targets:
+            addr = (ASSET_BOOT_ADDR if kind == MiniProtocol.ASSET_BOOT
+                    else ASSET_STANDBY_BASE + slot * ASSET_SLOT_SIZE)
+            try:
+                hdr = self._asset_idle(
+                    lambda a=addr: self.device.nor_read(a, ASSET_HDR_SIZE), 0.3)
+            except Exception:
+                hdr = None
+            if not hdr or len(hdr) < ASSET_HDR_SIZE:
+                continue
+            if bytes(hdr[0:4]) != b"MSA1":
+                continue
+            fmt = hdr[8]
+            if fmt > 1:
+                continue
+            leng = (hdr[10] | (hdr[11] << 8) | (hdr[12] << 16)
+                    | (hdr[13] << 24))
+            result[(kind, slot)] = {"fmt": fmt, "len": leng}
+        return result
 
     def stage_devcfg(self):
         import threading
@@ -4069,16 +4167,35 @@ async function assetPicked(kind, ev) {
   }
 }
 
+/* 槽头回读（只读 20 B/槽）：显示「原始 / RLE 压缩后」和节省比例。 */
+function slotInfoMap(d) {
+  const m = {};
+  if (d && d.slots) for (const s of d.slots) m[s.kind + ':' + s.slot] = s;
+  return m;
+}
+
+function slotSizeText(si, rawBytes) {
+  if (!si) return '';
+  const raw = rawBytes || 25600;
+  if (si.fmt === 1) {
+    const pct = Math.max(0, Math.round((1 - si.len / raw) * 100));
+    return 'RLE ' + formatBytes(si.len) + '（省 ' + pct + '%）';
+  }
+  return '原始 ' + formatBytes(si.len);
+}
+
 function renderSlotList(d, used) {
   const box = document.getElementById('asset-slot-list');
   if (!box) return;
+  const info = slotInfoMap(d);
   let html = '';
   for (let i = 0; i < 16; i++) {
     const has = !!(d && (d.standby_mask & (1 << i)));
+    const si = info['1:' + i];
     html += '<div style="margin-top:3px">' +
       '<span style="display:inline-block;width:3.2em;color:#666">槽 ' + (i + 1) + '</span>' +
-      '<span style="display:inline-block;width:4.2em;color:' + (has ? '#2d7' : '#999') + '">' +
-      (has ? '有图' : '空槽') + '</span>' +
+      '<span style="display:inline-block;width:11em;color:' + (has ? '#2d7' : '#999') + '">' +
+      (has ? (si ? slotSizeText(si) : '有图') : '空槽') + '</span>' +
       '<button onclick="uploadAsset(1, ' + i + ')" style="margin-right:4px">写入</button>' +
       (has ? '<button onclick="drawAsset(1, ' + i + ')" style="margin-right:4px">预览</button>' +
              '<button onclick="eraseAsset(1, ' + i + ')">擦除</button>' : '') +
@@ -4140,6 +4257,7 @@ async function refreshAsset() {
     document.getElementById('asset-dwell').value = String(j.dwell || 3);
   }
   const d = j.device;
+  if (d && j.slots) d.slots = j.slots;
   if (shouldSync('asset-boot-hold')) {
     const bhEl = document.getElementById('asset-boot-hold');
     if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
@@ -4148,9 +4266,10 @@ async function refreshAsset() {
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件 v1.0.0）'; return; }
   const slots = [];
   for (let i = 0; i < 16; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
+  const bootSlot = (d.slots || []).find(s => s.kind === 0 && s.slot === 0);
   document.getElementById('asset-state').textContent =
     '设备固件 v' + (d.fw || '?') +
-    '；开机图 ' + (d.boot_valid ? '有' : '无') +
+    '；开机图 ' + (d.boot_valid ? ('有 ' + slotSizeText(bootSlot)) : '无') +
     '；待机图 ' + (slots.length ? ('第 ' + slots.join('/') + ' 张') : '无') +
     '；当前 ' + (d.boot_mode ? '开机画图' : '无开机画面') + ' / ' + d.standby_mode;
   renderSlotList(d, slots);
@@ -4192,7 +4311,18 @@ async function uploadAsset(kind, slot) {
   if (!path) { setMsg(msg, '先填图片路径', true); return; }
   setMsg(msg, '正在写入设备…', false);
   const j = await postJSON('/api/asset/upload', { kind: kind, slot: slot, path: path });
-  setMsg(msg, j && j.ok ? '已写入' : ('失败：' + ((j && j.err) || '未知错误')), !(j && j.ok));
+  let text = '已写入';
+  if (j && j.ok) {
+    const inf = j.info;
+    if (inf && inf.fmt === 1) {
+      const pct = Math.round((1 - inf.sent / inf.raw) * 100);
+      text = '已写入：原始 ' + formatBytes(inf.raw) + ' → 压缩 ' +
+        formatBytes(inf.sent) + '（省 ' + pct + '%）';
+    } else if (inf) {
+      text = '已写入：原始 ' + formatBytes(inf.sent) + '（RLE 没更小，保持原样）';
+    }
+  }
+  setMsg(msg, j && j.ok ? text : ('失败：' + ((j && j.err) || '未知错误')), !(j && j.ok));
   if (j && j.ok) refreshAsset();
 }
 
@@ -5004,8 +5134,17 @@ class WebUI(threading.Thread):
                             info = sched.asset_query()
                         except Exception:
                             info = None
+                    slots = []
+                    if sched is not None and info:
+                        try:
+                            sizes = sched.asset_slot_sizes(info)
+                        except Exception:
+                            sizes = {}
+                        slots = [{"kind": k, "slot": s,
+                                  "fmt": v["fmt"], "len": v["len"]}
+                                 for (k, s), v in sorted(sizes.items())]
                     acfg = dcfg.get("asset") or {}
-                    self._json({"ok": True, "device": info,
+                    self._json({"ok": True, "device": info, "slots": slots,
                                 "boot_mode": int(acfg.get("boot_mode", 0)),
                                 "standby_mode": int(acfg.get("standby_mode", 1)),
                                 "count": int(acfg.get("count", 1)),
@@ -5108,8 +5247,8 @@ class WebUI(threading.Thread):
                         if not path:
                             self._json({"ok": False, "err": "图片路径是空的"})
                         else:
-                            ok, why = sched.upload_asset(kind, slot, path)
-                            self._json({"ok": ok,
+                            ok, why, info = sched.upload_asset(kind, slot, path)
+                            self._json({"ok": ok, "info": info,
                                         "err": "" if ok else "写入失败：%s" % why})
                     elif self.path == "/api/asset/settings":
                         body = self._read_json()
@@ -5672,14 +5811,17 @@ def cmd_flash(path, port=None):
             _console("  [FAIL] %s" % why)
             continue
         _console("  [OK] %s" % why)
-        time.sleep(1.5)
+        # 和网页版同一套逻辑：200 ms 轮询、最多等 15 s，别只睡 2 秒就下结论。
+        _console("  等待设备重启回来…")
         dev2 = MiniDevice(name)
-        if dev2.open():
-            fw2 = dev2.transport.fw_version
-            _console("  重启后固件 %s" % format_fw_version(fw2))
-            dev2.transport.close()
+        back, fw2, why2, attempts = wait_device_back(dev2)
+        if back:
+            _console("  升级完成：固件 %s" % fw2)
             return 0
-        _console("  重启后没有回应（可能还在重启，等两秒再跑 --selftest 看看）")
+        _console("  设备没有回来，请拔插一次 USB 再重试")
+        _console("  （已等 %.0f 秒、试了 %d 次%s）"
+                 % (REBOOT_TIMEOUT, attempts,
+                    "；%s" % why2 if why2 else ""))
         return 1
     return 1
 
@@ -5802,6 +5944,19 @@ def cmd_selftest(port=None):
                 _console("  NOR 抽查 %d 处：FF 占比 %d/%d %s"
                          % (len(spots), ff, total, "（已抹干净）" if ff == total else ""))
                 _console("    " + " ".join(detail))
+
+            # 4.5) OTA 通道自检：真的走一遍暂存区写入 + 回读校验，但**不发 0A 14**
+            # 所以没有 apply 标志，设备不重启、内部 flash 一个字节都不动。
+            ota_data = bytes(((i * 37) + 11) & 0xFF for i in range(1024))
+            try:
+                ota_ok, ota_why, ota_n = tr.ota_channel_probe(ota_data)
+            except Exception as exc:
+                ota_ok, ota_why, ota_n = False, "异常：%s" % exc, len(ota_data)
+            if ota_ok:
+                _console("  OTA 通道：写入/回读/校验通过（%d B）" % ota_n)
+            else:
+                _console("  [FAIL] OTA 通道：%s" % ota_why)
+                bad += 1
 
         # 5) 资产 CRC 回读（v53 起）：设备把槽里的图重读一遍算 CRC
         info2 = tr.asset_info()

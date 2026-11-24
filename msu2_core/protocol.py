@@ -52,6 +52,56 @@ def _rle_payload(chunk):
     return bytes(out)
 
 
+def rle_encode_rgb565(data):
+    """把 RGB565 字节流（高字节在前）压成资产 fmt=1 的 `[cnt, hi, lo]` 流。
+
+    语义与 `_rle_payload()` / 固件 `rle_feed()` 完全一致：`cnt` 是 1..255 的
+    重复像素数（0 表示这一包含 0 个像素，编码器不会产生），长行程按 255 拆包。
+    纯 Python 实现，不依赖 numpy（资产压缩在没装 numpy 的机器上也要能用）。
+    """
+    n = len(data) // 2
+    out = bytearray()
+    i = 0
+    while i < n:
+        hi = data[2 * i]
+        lo = data[2 * i + 1]
+        run = 1
+        while i + run < n and run < 255:
+            j = 2 * (i + run)
+            if data[j] != hi or data[j + 1] != lo:
+                break
+            run += 1
+        out += bytes((run, hi, lo))
+        i += run
+    return bytes(out)
+
+
+def rle_decode_rgb565(payload):
+    """`rle_encode_rgb565()` 的逆过程；测试往返、旧固件回退时用。"""
+    out = bytearray()
+    i = 0
+    while i + 3 <= len(payload):
+        cnt = payload[i]
+        hi = payload[i + 1]
+        lo = payload[i + 2]
+        i += 3
+        if cnt:
+            out += bytes((hi, lo)) * cnt
+    return bytes(out)
+
+
+def compress_asset_payload(raw):
+    """资产载荷选型：RLE 比原样小就用 fmt=1，否则原样 fmt=0。
+
+    返回 `(payload, fmt)`。纯色/渐变的压缩收益很大，照片类几乎压不动，
+    这时保持 fmt=0（设备端零解码开销，也没有“压缩反而更大”的风险）。
+    """
+    rle = rle_encode_rgb565(raw)
+    if rle and len(rle) < len(raw):
+        return rle, 1
+    return raw, 0
+
+
 def lcd_segment_payload(chunk):
     """选压缩或原样：压缩后更小就走 0x0D，否则按 0x0C 原样发。"""
     rle = _rle_payload(chunk)
@@ -93,7 +143,15 @@ class MiniProtocol:
         return MiniProtocol._frame(0x0A, 0x00, 0, 0, 0, 0)
 
     @staticmethod
-    def asset_begin(kind, slot, length):
+    def asset_begin(kind, slot, length, fmt=0):
+        """`0A 01`：开始写图。kind 最高位携带数据格式（固件 v1.0.4 起）。
+
+        fmt=0 是裸 RGB565（25 600 B，老固件/老图都走这条），fmt=1 是 RLE，
+        此时 length 是压缩后长度。低 7 位仍是 kind（0 开机 / 1 待机），
+        所以旧固件收到高位为 0 的 kind 时行为完全不变。
+        """
+        if fmt:
+            kind |= 0x80
         return MiniProtocol._frame(0x0A, 0x01, kind, slot,
                                    (length >> 8) & 0xFF, length & 0xFF)
 

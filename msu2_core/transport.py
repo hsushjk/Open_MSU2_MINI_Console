@@ -269,14 +269,17 @@ class SerialTransport:
         return None
 
     def asset_write(self, kind, slot, payload, chunk=1024, gap=0.008,
-                    timeout=8.0):
-        """把一张 160x80 RGB565 图写进指定槽。
+                    timeout=8.0, fmt=0):
+        """把一张 160x80 图写进指定槽。
 
+        fmt=0 时 payload 是 25 600 B 裸 RGB565（v1.0.3 及更早、或压缩不划算时）；
+        fmt=1 时 payload 是 RLE 压缩数据（`[cnt,hi,lo]` 流，长度更短）。
         分窗上传，一窗一确认；如果第一窗就被拒绝（比如设备刚被别的东西
         弄乱），整笔重试一次，不要一次失败就让用户手动再点。
         """
         for attempt in (0, 1):
-            ok, why = self._asset_write_once(kind, slot, payload, chunk, gap, timeout)
+            ok, why = self._asset_write_once(kind, slot, payload, chunk, gap,
+                                             timeout, fmt=fmt)
             if ok or attempt == 1:
                 return ok, why
             time.sleep(0.25)
@@ -284,7 +287,7 @@ class SerialTransport:
 
     @_serial_locked
     def _asset_write_once(self, kind, slot, payload, chunk=1024, gap=0.008,
-                          timeout=8.0):
+                          timeout=8.0, fmt=0):
         import zlib
 
         # 先打个招呼：设备要是已经卡死了，别再去按它的按钮，直接告诉用户拔插
@@ -292,14 +295,16 @@ class SerialTransport:
             return False, "设备没应答（请拔插一次 USB 再试）"
 
         payload = bytes(payload)
-        if len(payload) != 160 * 80 * 2:
-            raise ValueError("payload must be 160x80 RGB565")
-
+        if fmt == 0:
+            if len(payload) != 160 * 80 * 2:
+                raise ValueError("payload must be 160x80 RGB565")
+        elif not 0 < len(payload) <= 0x6800 - 20:
+            raise ValueError("RLE payload must fit in one asset slot")
 
         if self._ser is not None:
             self._ser.reset_input_buffer()
         t_begin = time.monotonic()
-        self.write(MiniProtocol.asset_begin(kind, slot, len(payload)))
+        self.write(MiniProtocol.asset_begin(kind, slot, len(payload), fmt))
         st = self._asset_reply(0x01, max(timeout, 20.0))
         if st != 0x06:
             used = time.monotonic() - t_begin
@@ -486,6 +491,77 @@ class SerialTransport:
             if i >= 0 and len(buf) >= i + 3 + buf[i + 2] + 1:
                 return buf[i + 3:i + 3 + buf[i + 2]]
         return None
+
+    def ota_channel_probe(self, payload, timeout=8.0):
+        """OTA 通道自检：真的走一遍暂存区写入 + 回读，但**不 apply**。
+
+        链路与真升级一致：`0A 12 01` 开始 → `0A 12 02` 分窗 → `0x13` 提交
+        （设备会重读整段算 CRC 再写镜像头），只是**不发** `0x14`，所以设备
+        不重启、内部 flash 一个字节都不动，当前固件照常运行。最后用
+        `0A 0C` 从 NOR 暂存区 `0x080000` 读回 16 B 头，核对 `'MSU2'` 魔数、
+        VALID 位、长度和 crc32。
+
+        返回 `(ok, why, n)`；失败原因直接写清楚是哪一步、回包是什么。
+        """
+        data = bytes(payload)
+        total = len(data)
+        if total <= 0:
+            return False, "测试数据为空", 0
+
+        # 和真升级一样，先把屏流收尾（设备现在可能还停在直写模式）
+        for frame in (MiniProtocol.lcd_set_xy(0, 0),
+                      MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H),
+                      MiniProtocol.lcd_enter_direct_mode()):
+            self.write(frame)
+        self.write(MiniProtocol.lcd_raw_end())
+        time.sleep(0.05)
+        if self._ser is not None:
+            self._ser.reset_input_buffer()
+
+        # 开始：真升级会重试 3 次，自检只重试 1 次，失败原因直接带回去
+        self.write(MiniProtocol.flash_begin(total))
+        st = self._reply_byte(0x0A, 0x12, 6.0)
+        if st != 0x06:
+            self._drain_upload_window()
+            time.sleep(0.2)
+            self.write(MiniProtocol.flash_begin(total))
+            st = self._reply_byte(0x0A, 0x12, 6.0)
+        if st != 0x06:
+            return False, ("暂存区不接受（0A 12 begin 回 %s）"
+                           % ("没回执" if st is None else "0x%02X" % st)), total
+
+        sent = 0
+        while sent < total:
+            part = data[sent:sent + 1024]
+            self.write(MiniProtocol.flash_window(len(part)))
+            self.write(part)
+            st = self._reply_byte(0x0A, 0x12, max(timeout, 3.0))
+            if st != 0x06:
+                return False, ("第 %d 字节处没确认（0A 12 回 %s）"
+                               % (sent, "没回执" if st is None else "0x%02X" % st)), total
+            sent += len(part)
+
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        self.write(MiniProtocol.flash_commit(crc))
+        st = self._reply_byte(0x13, 0x00, max(timeout, 3.0))
+        if st != 0x06:
+            return False, ("提交没过（0x13 回 %s）"
+                           % ("没回执" if st is None else "0x%02X" % st)), total
+
+        hdr = self.nor_read(0x080000, 16)
+        if not hdr or len(hdr) < 16:
+            return False, "暂存区头读不回来（0A 0C 没回应）", total
+        if hdr[0:4] != b"MSU2":
+            return False, "暂存区魔数不对（%s）" % hdr[0:4].hex(), total
+        hlen = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24)
+        hcrc = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24)
+        if not hdr[4] & 0x01:
+            return False, "镜像头没打 VALID 位（flags=0x%02X）" % hdr[4], total
+        if hlen != total:
+            return False, "镜像头长度不对（%d != %d）" % (hlen, total), total
+        if hcrc != crc:
+            return False, "镜像头 crc 不对（%08X != %08X）" % (hcrc, crc), total
+        return True, "ok", total
 
     def boot_trace(self, timeout=1.2, tries=3):
         """复位面包屑（固件 v53 起）：上次停在哪一步、累计复位次数。"""

@@ -454,8 +454,8 @@ class MiniDevice:
     def boot_report(self):
         return self.transport.boot_report()
 
-    def asset_write(self, kind, slot, payload):
-        return self.transport.asset_write(kind, slot, payload)
+    def asset_write(self, kind, slot, payload, fmt=0):
+        return self.transport.asset_write(kind, slot, payload, fmt=fmt)
 
     def asset_draw(self, kind, slot):
         return self.transport.asset_draw(kind, slot)
@@ -482,6 +482,9 @@ class MiniDevice:
 
     def nor_read(self, addr, n=16):
         return self.transport.nor_read(addr, n)
+
+    def ota_channel_probe(self, payload):
+        return self.transport.ota_channel_probe(payload)
 
     def asset_verify_check(self, kind, slot):
         return self.transport.asset_verify_check(kind, slot)

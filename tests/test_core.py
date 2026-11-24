@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zlib
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -644,6 +645,175 @@ class FirmwareFlashTests(unittest.TestCase):
         self.assertTrue(res["rebooted"], "已经上传成功，设备只是没回来")
         self.assertIn("拔插", res["err"])
         self.assertTrue(dev.suspended, "没回来时保持挂起，避免往复活中的串口写帧")
+
+
+class AssetRleTests(unittest.TestCase):
+    """任务 A：fmt=1 RLE 编解码、选型规则、老 fmt=0 路径兼容。"""
+
+    def test_round_trip_gradient(self):
+        data = bytes((i * 73 + (i >> 5) * 19) & 0xFF for i in range(25600))
+        packed = M.rle_encode_rgb565(data)
+        self.assertEqual(len(packed) % 3, 0, "必须是 3 字节一包")
+        self.assertEqual(M.rle_decode_rgb565(packed), data)
+
+    def test_long_run_split_at_255(self):
+        # 纯色整屏：一个像素重复 12 800 次，cnt 只能 1..255，必须拆包
+        data = b"\x12\x34" * 12800
+        packed = M.rle_encode_rgb565(data)
+        cnts = [packed[i] for i in range(0, len(packed), 3)]
+        self.assertTrue(all(1 <= c <= 255 for c in cnts))
+        self.assertGreater(len(cnts), 1, ">255 的行程要拆成多包")
+        self.assertEqual(M.rle_decode_rgb565(packed), data)
+        self.assertLess(len(packed), 400)
+
+    def test_compress_only_when_smaller(self):
+        flat, fmt = M.compress_asset_payload(b"\x00\x00" * 12800)
+        self.assertEqual(fmt, 1)
+        self.assertLess(len(flat), 25600)
+        # 逐像素变化的噪声 RLE 压不动（3 B/像素 > 2 B/像素）→ 保持 fmt=0
+        noise = bytes((i * 37 + 11) & 0xFF for i in range(25600))
+        raw, fmt2 = M.compress_asset_payload(noise)
+        self.assertEqual(fmt2, 0)
+        self.assertEqual(raw, noise)
+        self.assertEqual(len(raw), 25600)
+
+    def test_begin_command_legacy_kind_byte(self):
+        raw = M.MiniProtocol.asset_begin(1, 3, 25600)
+        self.assertEqual(raw[2], 1, "fmt=0 的 kind 字节必须还是 1（老固件认这个）")
+        rle = M.MiniProtocol.asset_begin(1, 3, 0x0200, fmt=1)
+        self.assertEqual(rle[2], 0x81, "fmt=1 用 kind 最高位标记")
+        self.assertEqual(rle[4:6], b"\x02\x00")
+
+
+class FakeAssetDevice:
+    """假设备：记录资产写入的格式和长度，用来测压缩/回退分支。"""
+
+    def __init__(self, fw=(1, 0, 4), fail_rle=False):
+        self.calls = []
+        self.fail_rle = fail_rle
+        tr = type("T", (), {})()
+        tr.fw_version = fw
+        tr._lock = None
+        self.transport = tr
+
+    def asset_write(self, kind, slot, payload, fmt=0):
+        if fmt == 1 and self.fail_rle:
+            return False, "设备拒绝接收（begin 回 0x15）"
+        self.calls.append((kind, slot, len(payload), fmt))
+        return True, "ok"
+
+    def asset_draw(self, kind, slot):
+        return True
+
+
+class AssetUploadTests(unittest.TestCase):
+    """上传链路：新固件走 RLE，老固件/失败要退回裸 RGB565。"""
+
+    def make(self, fw, fail_rle=False):
+        sched = M.Scheduler(M.OfflineDevice(), {"pages": []})
+        sched.device = FakeAssetDevice(fw, fail_rle=fail_rle)
+        return sched
+
+    def png(self, td):
+        src = os.path.join(td, "solid.png")
+        Image.new("RGB", (160, 80), (30, 120, 200)).save(src)
+        return src
+
+    def test_new_firmware_uses_rle(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self.png(td)
+            sched = self.make((1, 0, 4))
+            ok, why, info = sched.upload_asset(1, 0, src)
+        self.assertTrue(ok, why)
+        self.assertEqual(info["raw"], 25600)
+        self.assertEqual(info["fmt"], 1)
+        self.assertLess(info["sent"], 25600)
+        self.assertEqual(sched.device.calls[-1][3], 1)
+        self.assertEqual(sched.device.calls[-1][2], info["sent"])
+
+    def test_old_firmware_falls_back_to_raw(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self.png(td)
+            sched = self.make((1, 0, 3))
+            ok, why, info = sched.upload_asset(1, 0, src)
+        self.assertTrue(ok, why)
+        self.assertEqual(info["fmt"], 0, "v1.0.3 只认 fmt=0")
+        self.assertEqual(info["sent"], 25600)
+        self.assertEqual(sched.device.calls[-1][3], 0)
+
+    def test_write_failure_retries_with_raw(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self.png(td)
+            sched = self.make((1, 0, 4), fail_rle=True)
+            ok, why, info = sched.upload_asset(0, 0, src)
+        self.assertTrue(ok, why)
+        self.assertEqual(info["fmt"], 0, "RLE 被拒后必须用裸数据重写")
+        self.assertEqual(info["sent"], 25600)
+
+
+class OtaChannelTests(unittest.TestCase):
+    """任务 B：--selftest 的 OTA 通道项（写暂存区 + 回读头，绝不 apply）。"""
+
+    def make(self):
+        tr = M.SerialTransport("COM_fake")
+        ser = CapturingSerial()
+        tr._ser = ser
+        tr._connected = True
+        tr._handshaked = True
+        tr._reply_byte = lambda *a, **k: 0x06
+        return tr, ser
+
+    def test_staging_round_trip_validates_header(self):
+        tr, ser = self.make()
+        payload = bytes(range(256)) * 4
+        crc = zlib.crc32(payload) & 0xFFFFFFFF
+        hdr = (b"MSU2" + bytes([1, 0]) + len(payload).to_bytes(4, "little")
+               + crc.to_bytes(4, "little") + b"\xff\xff")
+        tr.nor_read = lambda addr, n=16: hdr
+        ok, why, n = tr.ota_channel_probe(payload)
+        self.assertTrue(ok, why)
+        self.assertEqual(n, len(payload))
+        self.assertIn(M.MiniProtocol.flash_begin(len(payload)), ser.writes)
+        self.assertEqual(ser.writes[-1], M.MiniProtocol.flash_commit(crc))
+        self.assertNotIn(M.MiniProtocol.flash_apply(), ser.writes,
+                         "自检绝不能发 0A 14（真升级）")
+
+    def test_rejected_begin_reports_reason(self):
+        tr, _ser = self.make()
+        tr._reply_byte = lambda *a, **k: 0x15
+        tr.nor_read = lambda addr, n=16: b"MSU2" + bytes(12)
+        ok, why, _n = tr.ota_channel_probe(bytes(1024))
+        self.assertFalse(ok)
+        self.assertIn("暂存区不接受", why)
+
+    def test_bad_magic_reports_reason(self):
+        tr, _ser = self.make()
+        tr.nor_read = lambda addr, n=16: b"XXXX" + bytes(12)
+        ok, why, _n = tr.ota_channel_probe(bytes(1024))
+        self.assertFalse(ok)
+        self.assertIn("魔数", why)
+
+    def test_selftest_has_ota_item(self):
+        src = open(os.path.join(ROOT, "msu2_mini.py"), encoding="utf-8").read()
+        self.assertIn("OTA 通道：写入/回读/校验通过", src)
+        self.assertIn("ota_channel_probe(ota_data)", src)
+
+
+class WaitDeviceBackModuleTests(unittest.TestCase):
+    """任务 C：cmd_flash 复用模块级 wait_device_back（200 ms 轮询、15 s 上限）。"""
+
+    def test_module_function_returns_fw_and_attempts(self):
+        dev = ScripedRebootDevice(reopen_calls=1)
+        back, fw, why, attempts = M.wait_device_back(dev, poll=0.01, timeout=2.0)
+        self.assertTrue(back, why)
+        self.assertEqual(fw, "1.0.4")
+        self.assertGreaterEqual(attempts, 2)
+        self.assertEqual(why, "")
+
+    def test_cmd_flash_uses_wait_device_back(self):
+        src = open(os.path.join(ROOT, "msu2_mini.py"), encoding="utf-8").read()
+        self.assertIn("back, fw2, why2, attempts = wait_device_back(dev2)", src)
+        self.assertIn("升级完成：固件", src)
 
 
 class SuspendedChannelTests(unittest.TestCase):

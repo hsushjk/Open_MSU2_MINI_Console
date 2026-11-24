@@ -108,7 +108,14 @@ class SerialTransport:
             time.sleep(0.15)
             if not self._handshaked and not self.handshake(
                     timeout=handshake_timeout):
-                self.close(); return False
+                # 上一次会话被强行结束时，设备可能正卡在“等像素”里：raw_left > 0，
+                # 之后所有字节（包括我们的命令）都被它当像素吃掉，于是既不发问候
+                # 也不回版本。灌两整帧数量的 0（必须是 6 的整数倍，才不会把 6 字节
+                # 定界推错位）把这个窟窿填平，然后再握一次手。
+                self._purge_stale_stream()
+                if not self.handshake(timeout=handshake_timeout):
+                    self.close(); return False
+                log.info("设备刚才卡在半截帧里，已灌字节冲掉，重新握手成功")
             log.info("串口已打开: %s @ %d", self.port, self.baud)
             ver = self.query_version()
             if not ver:
@@ -164,6 +171,31 @@ class SerialTransport:
         return self._connected and self._handshaked
 
     @_serial_locked
+    def _purge_stale_stream(self, total=32004):
+        # 灌一整帧还多一点的 0x00，把设备“等像素”的 raw_left 填平。
+        # 每次写出的字节数都必须是 6 的整数倍，否则 6 字节定界会被推错位。
+        if self._ser is None:
+            return
+        total -= total % 6
+        left = total
+        while left >= 6:
+            take = min(left, 3072)
+            take -= take % 6
+            for _attempt in range(3):
+                try:
+                    self._ser.write(bytes(take))
+                    break
+                except Exception:
+                    time.sleep(0.01)
+            else:
+                return
+            left -= take
+        try:
+            time.sleep(0.05)
+            self._ser.reset_input_buffer()
+        except Exception:
+            pass
+
     def write(self, data):
         with self._lock:
             if not self._connected or not self._ser:

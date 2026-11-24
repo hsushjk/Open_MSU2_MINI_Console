@@ -77,6 +77,25 @@ class SerialTransport:
 
     @_serial_locked
     def open(self, handshake_timeout=2.0):
+        for attempt in range(3):
+            if self._open_once(handshake_timeout):
+                return True
+            # 设备可能正卡在“接收环满 / 半截流”里：关掉端口重开等于给它
+            # 一次 USB 复位，绝大多数情况一下就活了，比让用户拔插强。
+            if attempt < 2:
+                log.info("串口没连上，重开一次（第 %d 次）", attempt + 1)
+                try:
+                    if self._ser is not None:
+                        self._ser.close()
+                except Exception:
+                    pass
+                self._ser = None
+                self._connected = False
+                self._handshaked = False
+                time.sleep(0.30)
+        return False
+
+    def _open_once(self, handshake_timeout=2.0):
         with self._lock:
             if self._connected and self._handshaked:
                 return True
@@ -104,7 +123,7 @@ class SerialTransport:
             # 就永久错位（设备还在打招呼，但所有命令都不回，只能拔插）。先写
             # 一整帧 0x00：class 0 未知 sub 固件直接忽略；完全空闲时连续 0 也会
             # 被当填充丢掉。写完等一会儿，让设备按“100 ms 无新字节”清残包。
-            self.write(b"\x00" * 6)
+            self.write(b"\x00" * 6, patience=0.4)
             time.sleep(0.15)
             if not self._handshaked and not self.handshake(
                     timeout=handshake_timeout):
@@ -164,7 +183,7 @@ class SerialTransport:
         return self._connected and self._handshaked
 
     @_serial_locked
-    def write(self, data):
+    def write(self, data, patience=3.0):
         with self._lock:
             if not self._connected or not self._ser:
                 return False
@@ -185,14 +204,14 @@ class SerialTransport:
                             stalled = True
                             log.info("设备接收环满了，写入等一会儿再续（已写 %d/%d 字节）",
                                      sent, total)
-                        if time.monotonic() - t0 > 3.0:
+                        if time.monotonic() - t0 > patience:
                             raise
                         time.sleep(0.005)
                         continue
                     if n <= 0:
                         # 短写：给驱动喘口气，别把半帧当成整帧发出去
-                        if time.monotonic() - t0 > 3.0:
-                            raise IOError("写入卡住（3 秒没有进展）")
+                        if time.monotonic() - t0 > patience:
+                            raise IOError("写入卡住（%.1f 秒没有进展）" % patience)
                         time.sleep(0.001)
                         continue
                     sent += n

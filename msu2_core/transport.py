@@ -104,8 +104,9 @@ class SerialTransport:
             # 就永久错位（设备还在打招呼，但所有命令都不回，只能拔插）。先写
             # 一整帧 0x00：class 0 未知 sub 固件直接忽略；完全空闲时连续 0 也会
             # 被当填充丢掉。写完等一会儿，让设备按“100 ms 无新字节”清残包。
-            self.write(b"\x00" * 6)
-            time.sleep(0.15)
+            # 打开端口后先什么都不写、只听设备问候（这是 1.0.5 之前的行为；
+            # 之前那笔“对齐垫”会在设备还没准备好的时候撞上 1 秒写超时）。
+            # 只有当问候迟迟不来时，才灌字节自救。
             if not self._handshaked and not self.handshake(
                     timeout=handshake_timeout):
                 # 上一次会话被强行结束时，设备可能正卡在“等像素”里：raw_left > 0，
@@ -113,6 +114,7 @@ class SerialTransport:
                 # 也不回版本。灌两整帧数量的 0（必须是 6 的整数倍，才不会把 6 字节
                 # 定界推错位）把这个窟窿填平，然后再握一次手。
                 self._purge_stale_stream()
+                time.sleep(0.05)
                 if not self.handshake(timeout=handshake_timeout):
                     self.close(); return False
                 log.info("设备刚才卡在半截帧里，已灌字节冲掉，重新握手成功")
@@ -176,6 +178,7 @@ class SerialTransport:
         # 每次写出的字节数都必须是 6 的整数倍，否则 6 字节定界会被推错位。
         if self._ser is None:
             return
+        self._connected = True          # 自救期间一律允许读写
         total -= total % 6
         left = total
         while left >= 6:
@@ -770,7 +773,9 @@ class SerialTransport:
     @_serial_locked
     def read_all(self):
         with self._lock:
-            if not self._connected or not self._ser:
+            # 只要求串口对象还在：写超时会把 _connected 置 False，但设备其实
+            # 还活着（只是暂时不收字节），这时候仍然必须能读到它的问候/回包。
+            if self._ser is None:
                 return b""
             try:
                 n = self._ser.in_waiting

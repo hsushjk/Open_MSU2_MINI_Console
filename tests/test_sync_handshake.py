@@ -93,10 +93,9 @@ class OpmsuHandshakeTests(unittest.TestCase):
         self.assertTrue(tr.open())
         self.assertEqual(tr.version, "")
         self.assertEqual(tr.fw_version, (1, 0, 5))
-        # 第一笔是对齐垫，第二笔是握手回复，第三笔才是版本查询
-        self.assertEqual(ser.writes[0], b"\x00" * 6)
-        self.assertEqual(ser.writes[1], b"\x00OKMSU")
-        self.assertEqual(ser.writes[2], bytes([0x00, 0x56, 0, 0, 0, 0]))
+        # 打开端口后先只听问候，第一笔写必须是握手回复，然后才是版本查询
+        self.assertEqual(ser.writes[0], b"\x00OKMSU")
+        self.assertEqual(ser.writes[1], bytes([0x00, 0x56, 0, 0, 0, 0]))
 
     def test_msn02_still_supported(self):
         tr, ser = make_transport(rx=b"\x00MSN02")
@@ -127,12 +126,13 @@ class OpmsuHandshakeTests(unittest.TestCase):
 class SyncPadTests(unittest.TestCase):
     """任务 2：打开端口/重同步前先垫 6 个 0x00，让定界重新对齐。"""
 
-    def test_open_pads_before_handshake(self):
+    def test_open_writes_nothing_before_the_greeting(self):
+        # 1.0.5 加过一笔“对齐垫”，会在设备还没准备好时撞上 1 秒写超时；
+        # 现在改成只听不说，问候来了才回 OKMSU。
         tr, ser = make_transport(rx=b"\x00OPMSU")
         self.assertTrue(tr.open())
-        self.assertGreaterEqual(len(ser.writes), 2)
-        self.assertEqual(ser.writes[0], b"\x00" * 6,
-                         "握手回复之前必须先写 6 个 0x00 对齐垫")
+        self.assertEqual(ser.writes[0], b"\x00OKMSU",
+                         "第一笔必须是握手回复，不能先灌对齐垫")
 
     def test_resync_pads_before_empty_frame(self):
         tr, ser = make_transport()

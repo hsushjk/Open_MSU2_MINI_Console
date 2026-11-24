@@ -4,6 +4,7 @@ import argparse
 import collections
 import datetime
 import faulthandler
+import hashlib
 import io
 import json
 import logging
@@ -50,7 +51,7 @@ except ImportError:
     _console("缺少 Pillow: pip install pillow"); sys.exit(1)
 
 try:
-    import psutil
+    import psutil  # noqa: F401  (只用来检查依赖装没装)
 except ImportError:
     _console("缺少 psutil: pip install psutil"); sys.exit(1)
 
@@ -60,8 +61,8 @@ except Exception:
     _np = None
 
 try:
-    from msu2_core import (
-        WIDGET_REGISTRY, RenderContext, Widget,
+    from msu2_core import (  # noqa: F401  (兼容旧代码：Widget 等名字继续从这里导出)
+        WIDGET_REGISTRY, RenderContext, Widget,  # noqa: F401
         LANDSCAPE, PORTRAIT, LANDSCAPE_SIZE, PORTRAIT_SIZE,
         probe_fonts, set_user_font, get_font,
         merge_config,
@@ -75,19 +76,19 @@ except ImportError as e:
 # --- 已拆到 msu2_core/ 的实现：这里重新绑定旧名字，保持 msu2_mini.X 兼容 ---
 from msu2_core.branding import (  # noqa: E402
     DEFAULT_GIF_DIR, SCREENSHOT_DIR,
-    _asset_dir, _data_dir, _icon_bytes,
+    _asset_dir, _data_dir, _icon_bytes,  # noqa: F401
 )
 from msu2_core.protocol import (  # noqa: E402
-    Cmd, END_FRAME, MiniProtocol, TILE_N,
-    _rle_payload, lcd_segment_payload,
+    Cmd, END_FRAME, MiniProtocol, TILE_N,  # noqa: F401
+    _rle_payload, lcd_segment_payload,  # noqa: F401
 )
 from msu2_core.transport import (  # noqa: E402
-    SCREEN_BAUD, SerialTransport, _normalize_port, _serial_locked,
+    SCREEN_BAUD, SerialTransport, _normalize_port, _serial_locked,  # noqa: F401
     format_fw_version, normalize_fw_version,
 )
 from msu2_core.device import (  # noqa: E402
-    FrameEncoder, MiniDevice, OfflineDevice, TOUCH_CH,
-    _full_frame, _tile_frame, _tile_signatures,
+    FrameEncoder, MiniDevice, OfflineDevice, TOUCH_CH,  # noqa: F401
+    _full_frame, _tile_frame, _tile_signatures,  # noqa: F401
 )
 from msu2_core.channel import DeviceChannel  # noqa: E402
 
@@ -128,6 +129,7 @@ class Background:
     MAX_FRAMES = 300
     MODES = ("fit", "fill", "stretch")
     PLAYLIST_SECS = 12.0
+    CROSSFADE_SECS = 0.45       # 背景图切换/首次出现时的交叉淡入淡出时长
 
     def __init__(self):
         self.path = ""
@@ -142,6 +144,10 @@ class Background:
         self.group_ts = None
         self.idx = 0
         self.t_last = None
+        self._fade_from = None
+        self._fade_start = None
+        self._fade_pending = False
+        self._last_frame = None
 
     def configure(self, dim=0, blur=0):
         self.dim = 0            # 暗化搬到全局显示设置，背景不再压暗
@@ -159,6 +165,41 @@ class Background:
             except Exception:
                 pass
         return out
+
+    def _begin_fade(self, from_img=None):
+        """下一帧从 from_img（默认全黑）交叉淡入到当前帧。"""
+        try:
+            self._fade_from = (from_img or Image.new(
+                "RGB", (SCREEN_W, SCREEN_H), "black")).convert("RGB")
+        except Exception:
+            self._fade_from = Image.new("RGB", (SCREEN_W, SCREEN_H), "black")
+        self._fade_start = None
+        self._fade_pending = True
+
+    def _reset_fade(self):
+        self._fade_from = None
+        self._fade_start = None
+        self._fade_pending = False
+
+    def _apply_fade(self, img, now):
+        """把某一帧和淡出起点混合；没有淡入任务时原样返回。"""
+        if self._fade_from is None:
+            return img
+        if self._fade_pending:
+            self._fade_pending = False
+            self._fade_start = now
+        span = max(0.01, float(self.CROSSFADE_SECS))
+        t = 0.0 if self._fade_start is None else (now - self._fade_start) / span
+        if t >= 1.0:
+            self._fade_from = None
+            self._fade_start = None
+            return img
+        t = max(0.0, min(1.0, t))
+        try:
+            return Image.blend(self._fade_from, img.convert("RGB"), t)
+        except Exception:
+            self._reset_fade()
+            return img
 
     def load_playlist(self, paths, mode=None, interval=None, shuffle=None):
         if mode is not None:
@@ -189,6 +230,10 @@ class Background:
             self.frames = [self._decorate(f) for f in self.raw]
         log.info("背景轮播已加载: %d 组 (%s, 模式 %s)", len(self.groups),
                  self.path, self.mode)
+        if self.frames:
+            self._begin_fade()
+        else:
+            self._reset_fade()
 
     def _read_path(self, p):
         if not p.exists():
@@ -237,10 +282,15 @@ class Background:
         self.t_last = None
         self.group_ts = None
         if not path:
+            self._reset_fade()
             return
         self._read_path(Path(path))
         self.frames = [self._decorate(f) for f in self.raw]
         log.info("背景图已加载: %s (%d 帧, 模式 %s)", path, len(self.frames), self.mode)
+        if self.frames:
+            self._begin_fade()
+        else:
+            self._reset_fade()
 
     def _frame(self, img):
         tw, th = SCREEN_W, SCREEN_H
@@ -282,17 +332,189 @@ class Background:
                 self.idx = 0
                 self.t_last = None
                 log.debug("背景切换到第 %d 组", self.group_idx + 1)
+                self._begin_fade(self._last_frame)
         if not self.frames:
             return None
         if len(self.frames) == 1:
-            return self.frames[0]
-        if self.t_last is None:
+            out = self.frames[0]
+        elif self.t_last is None:
             self.t_last = now
-            return self.frames[0]
-        if now - self.t_last >= self.durations[self.idx]:
-            self.idx = (self.idx + 1) % len(self.frames)
-            self.t_last = now
-        return self.frames[self.idx]
+            out = self.frames[0]
+        else:
+            if now - self.t_last >= self.durations[self.idx]:
+                self.idx = (self.idx + 1) % len(self.frames)
+                self.t_last = now
+            out = self.frames[self.idx]
+        self._last_frame = out
+        return self._apply_fade(out, now)
+
+def _background_dir():
+    """上位机数据目录下专门放规范化背景图的目录。"""
+    d = _data_dir() / "backgrounds"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log.warning("创建背景图目录失败: %s", exc)
+    return d
+
+
+def _cover_160x80(img):
+    """按背景 fill 语义把任意图片变成 160×80：保持宽高比、放大到铺满、居中裁剪。"""
+    tw, th = SCREEN_W, SCREEN_H
+    img = img.convert("RGB")
+    if img.size == (tw, th):
+        return img
+    try:
+        scale = max(tw / img.width, th / img.height)
+        nw = max(1, int(img.width * scale))
+        nh = max(1, int(img.height * scale))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        x = max(0, (nw - tw) // 2)
+        y = max(0, (nh - th) // 2)
+        return img.crop((x, y, x + tw, y + th))
+    except Exception as exc:
+        raise ValueError("缩放背景图失败：%s" % (exc,))
+
+
+_BG_NORM_CACHE = {}
+
+
+def _normalize_bg_image(path):
+    """把背景图统一成 160×80、存进数据目录 backgrounds/，返回规范化后的绝对路径。
+
+    - 静态图存 PNG，动图存 GIF（保留帧数和每帧时长）；
+    - 按内容哈希命名，同一张图只处理一次；
+    - 已经在 backgrounds/ 且尺寸正确的路径直接返回（幂等）。
+    """
+    try:
+        src = Path(path).expanduser()
+    except Exception as exc:
+        raise ValueError("背景图路径无效：%s" % (exc,))
+    if not src.is_file():
+        raise ValueError("背景图不存在：%s" % src)
+    if src.suffix.lower() not in IMAGE_EXTS:
+        raise ValueError("不支持的背景图格式：%s" % (src.suffix or "(无扩展名)"))
+    dst_dir = _background_dir()
+    try:
+        with Image.open(src) as probe:
+            already = (src.parent.resolve() == dst_dir.resolve()
+                       and probe.size == (SCREEN_W, SCREEN_H))
+    except Exception as exc:
+        raise ValueError("读不了背景图：%s" % (exc,))
+    if already:
+        return str(src.resolve())
+    try:
+        st = src.stat()
+        key = (str(src.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError as exc:
+        raise ValueError("读不了背景图：%s" % (exc,))
+    cached = _BG_NORM_CACHE.get(key)
+    if cached and Path(cached).exists():
+        return cached
+    try:
+        with Image.open(src) as im:
+            animated = bool(getattr(im, "is_animated", False)) and im.n_frames > 1
+            count = min(int(getattr(im, "n_frames", 1)), Background.MAX_FRAMES) if animated else 1
+            frames = []
+            durations = []
+            for i in range(count):
+                if animated:
+                    im.seek(i)
+                    durations.append(max(20, int(im.info.get("duration", 100) or 100)))
+                frames.append(_cover_160x80(im.copy()))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("处理背景图失败：%s" % (exc,))
+    if not frames:
+        raise ValueError("背景图里没有可用的画面：%s" % src)
+    digest = hashlib.sha1()
+    for frame in frames:
+        digest.update(frame.tobytes())
+    digest.update(repr(durations).encode("ascii"))
+    stem = re.sub(r"[^0-9A-Za-z_-]+", "_", src.stem).strip("_")[:40] or "bg"
+    ext = ".gif" if animated else ".png"
+    dst = dst_dir / ("%s_%s%s" % (stem, digest.hexdigest()[:12], ext))
+    if not dst.exists():
+        tmp = dst.with_name(dst.name + ".tmp")
+        try:
+            if animated:
+                frames[0].save(tmp, format="GIF", save_all=True,
+                               append_images=frames[1:], duration=durations,
+                               loop=0, disposal=2)
+            else:
+                frames[0].save(tmp, format="PNG", optimize=True)
+            os.replace(tmp, dst)
+        except Exception as exc:
+            raise ValueError("保存规范化背景图失败：%s" % (exc,))
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+    out = str(dst.resolve())
+    _BG_NORM_CACHE[key] = out
+    log.info("背景图已规范化: %s -> %s (%dx%d%s)", src.name, dst.name,
+             SCREEN_W, SCREEN_H,
+             (", 动图 %d 帧" % len(frames)) if animated else "")
+    return out
+
+
+def _migrate_bg_paths(paths):
+    """把旧配置里的背景图路径懒迁移成 160×80 规范图；返回 (新列表, 是否有变化)。"""
+    out = []
+    changed = False
+    for path in paths or []:
+        if not path:
+            continue
+        try:
+            new = _normalize_bg_image(path)
+        except Exception as exc:
+            log.warning("背景图迁移失败（保留原路径）%s: %s", path, exc)
+            new = path
+        if new != path:
+            changed = True
+        out.append(new)
+    return out, changed
+
+
+_BG_THUMB_CACHE = {}
+
+
+def _background_thumb(path, size=(96, 48)):
+    """WebUI 背景图列表的缩略图（PNG 字节）；只允许 backgrounds 目录里的文件。"""
+    try:
+        p = Path(path).resolve()
+        base = _background_dir().resolve()
+        if base != p.parent and base not in p.parents:
+            return None
+    except Exception:
+        return None
+    if not p.is_file():
+        return None
+    try:
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size, size)
+        cached = _BG_THUMB_CACHE.get(key)
+        if cached is not None:
+            return cached
+        with Image.open(p) as im:
+            im.seek(0)
+            thumb = im.convert("RGB")
+        thumb.thumbnail(size, Image.LANCZOS)
+        canvas = Image.new("RGB", size, "black")
+        canvas.paste(thumb, ((size[0] - thumb.width) // 2,
+                             (size[1] - thumb.height) // 2))
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG", optimize=True)
+        data = buf.getvalue()
+        _BG_THUMB_CACHE[key] = data
+        return data
+    except Exception as exc:
+        log.warning("生成背景图缩略图失败 %s: %s", path, exc)
+        return None
+
 
 def _act_screenshot():
     try:
@@ -565,6 +787,7 @@ class Scheduler(threading.Thread):
             self._bg_mode = "fit"
         self._bg_dim = 0          # 暗化已独立成全局设置，这里保留字段只为兼容旧配置
         self._bg_blur = _coerce_int(bg.get("blur"), 0, 0, 5)
+        self._normalize_background_config()   # 旧配置里的背景图懒迁移成 160×80
         self.background = Background()
         self.background.configure(self._bg_dim, self._bg_blur)
         if self._bg_enabled:
@@ -979,13 +1202,17 @@ class Scheduler(threading.Thread):
         try:
             data, note = _load_firmware_image(path)
         except Exception as exc:
+            log.error("固件升级失败：读不了固件 %s：%s", path, exc)
             return False, "读不了固件：%s" % (exc,)
         if len(data) > 48000:
+            log.error("固件升级失败：镜像太大（%d 字节，上限 48000）", len(data))
             return False, "固件太大（%d 字节，上限 48000）" % len(data)
         fw = getattr(self.device.transport, "fw_version", None) or getattr(
             self.device, "fw_version", None)
         fwv = normalize_fw_version(fw)
         if fwv is not None and fwv < (1, 0, 0):
+            log.error("固件升级失败：设备固件 %s 不支持自更新",
+                      format_fw_version(fwv))
             return False, ("设备固件 %s 不支持自更新，请先用 ISP 刷一次 v1.0.0"
                            % format_fw_version(fwv))
         log.info("固件升级：写入 %d 字节", len(data))
@@ -1189,7 +1416,33 @@ class Scheduler(threading.Thread):
         self._save_config(delay=0.8)     # 拖模糊/暗化时合并写盘
         return True
 
+    def _normalize_background_config(self):
+        """把背景图路径统一成 160×80 规范图（旧配置在这里懒迁移一次）。"""
+        old_path = self._bg_path
+        old_paths = list(self._bg_paths)
+        new_paths, changed = _migrate_bg_paths(old_paths)
+        new_path = old_path
+        if old_path:
+            try:
+                new_path = _normalize_bg_image(old_path)
+            except Exception as exc:
+                log.warning("背景图规范化失败（保留原路径）%s: %s", old_path, exc)
+        if new_path != old_path:
+            changed = True
+        self._bg_path = new_path
+        self._bg_paths = new_paths
+        if not changed:
+            return
+        bg = self.config.get("background")
+        if not isinstance(bg, dict):
+            bg = {}
+            self.config["background"] = bg
+        bg["path"] = new_path
+        bg["paths"] = list(new_paths)
+        self._save_config(delay=0.8)
+
     def _apply_background(self):
+        self._normalize_background_config()
         # 拖模糊/暗化时只有修饰变了，图不用重新解码：按关键字段判断
         key = (self._bg_enabled, self._bg_source, self._bg_path,
                tuple(self._bg_paths), self._bg_mode,
@@ -1776,6 +2029,7 @@ class Scheduler(threading.Thread):
             log.info("Scheduler 退出")
 
 def _default_config_path():
+    """选配置文件位置：程序目录（可写时）→ 家目录；都还没有文件时兼容旧版 ./config.json。"""
     local = _APP_DIR / "config.json"
     installed = "site-packages" in _APP_DIR.parts or "dist-packages" in _APP_DIR.parts
     if not installed:
@@ -1789,9 +2043,19 @@ def _default_config_path():
     try:
         home = Path.home() / ".msu2_mini"
         home.mkdir(parents=True, exist_ok=True)
-        return str(home / "config.json")
+        target = home / "config.json"
     except Exception:
         return str(local)
+    # 已经决定用家目录、但那儿还没有配置时，继续用旧版放在当前目录的配置
+    if not target.exists():
+        try:
+            legacy = Path("./config.json")
+            if legacy.exists() and legacy.resolve() != target.resolve():
+                log.info("使用当前目录的配置文件: %s", legacy)
+                return str(legacy)
+        except Exception:
+            pass
+    return str(target)
 
 DEFAULT_CONFIG_PATH = _default_config_path()
 
@@ -2014,19 +2278,6 @@ def _write_config_raw(cfg, path):
                 pass
             return False
 
-def _default_config_path():
-    p = Path(DEFAULT_CONFIG_PATH)
-    if p.exists():
-        return str(p)
-    legacy = Path("./config.json")
-    try:
-        if legacy.exists() and legacy.resolve() != p.resolve():
-            log.info("使用当前目录的配置文件: %s", legacy)
-            return str(legacy)
-    except Exception:
-        pass
-    return str(p)
-
 def ensure_config_file(path=None):
     p = Path(path or DEFAULT_CONFIG_PATH)
     meta = _widget_meta()
@@ -2142,6 +2393,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Open_MSU2_MINI_Console</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
 <style>
 body { font-family: Consolas, Menlo, monospace; max-width: 820px;
        margin: 2em auto; padding: 0 1em; color: #222; font-size: 14px;
@@ -2219,6 +2471,14 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 .touch-row select { width: 200px; }
 .touch-row input[type=text] { width: 100%; }
 .touch-row .lbl { font-size: 13px; color: #444; }
+.bg-thumb { width: 64px; height: 32px; object-fit: contain;
+            image-rendering: pixelated; background: #000;
+            border: 1px solid #ccc; border-radius: 2px; margin-right: 6px;
+            vertical-align: middle; }
+.bg-row { display: flex; align-items: center; gap: 4px; padding: 2px 0;
+          border-bottom: 1px solid #eee; }
+.bg-row .bg-name { flex: 1; font-size: 12px; color: #444; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
 .hint { font-size: 11px; color: #888; margin: 4px 0 8px; }
 </style>
 </head>
@@ -2357,11 +2617,14 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <input type="hidden" id="bg-path">
   </div>
   <div style="margin-top:4px" id="bg-multi-wrap">
-    <button onclick="document.getElementById('bg-files').click()">添加背景图…（可多选）</button>
+    <button onclick="document.getElementById('bg-files').click()">添加图片…（可多选）</button>
     <input type="file" id="bg-files" accept=".gif,.png,.jpg,.jpeg,.bmp,.webp" multiple
            style="display:none" onchange="bgPickedMulti(event)">
-    <textarea id="bg-paths" rows="3" style="width:100%"
-      placeholder="已选的背景图（一行一个，也可以手动粘贴路径）"></textarea>
+    <span class="tiny" id="bg-count" style="margin-left:8px">共 0 张</span>
+    <div class="tiny" style="color:#888;margin-top:2px">
+      顺序就是播放顺序：用 ↑ ↓ 调顺序，× 删除。上传的图会自动处理成 160×80。
+    </div>
+    <div id="bg-list" class="plist" style="margin-top:4px"></div>
   </div>
   <div style="margin-top:4px">
     <label style="font-size:12px;color:#666">显示方式
@@ -2379,6 +2642,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   </div>
   <div style="margin-top:4px">
     <button id="btn-bg" onclick="toggleBackground()">启用背景</button>
+    <button onclick="applyBgSettings()">应用背景设置</button>
     <span class="msg" id="msg-bg"></span>
   </div>
 </div>
@@ -2398,7 +2662,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <div style="margin-top:6px">
     <label style="font-size:12px;color:#666">开机画面
       <select id="asset-boot" onchange="syncAssetUi()">
-        <option value="0">不画</option>
+        <option value="0">关闭</option>
         <option value="1">显示 NOR 里的图片</option>
         <option value="2">跑自检并显示结果</option>
       </select>
@@ -2408,7 +2672,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     </label>
     <span class="tiny" id="asset-boot-hold-hint" style="margin-left:8px;color:#888"></span>
   </div>
-  <div style="margin-top:4px">
+  <div style="margin-top:4px" id="asset-boot-file-wrap">
     <button onclick="document.getElementById('asset-boot-file').click()">选择开机图…</button>
     <input type="file" id="asset-boot-file" accept=".png,.jpg,.jpeg,.bmp"
            style="display:none" onchange="assetPicked(0, event)">
@@ -2430,7 +2694,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       <input type="number" id="asset-dwell" min="1" max="60" value="3" style="width:3.5em"> 秒
     </label>
   </div>
-  <div style="margin-top:4px">
+  <div style="margin-top:4px" id="asset-standby-file-wrap">
     <button onclick="document.getElementById('asset-standby-file').click()">选择待机图…</button>
     <input type="file" id="asset-standby-file" accept=".png,.jpg,.jpeg,.bmp"
            style="display:none" onchange="assetPicked(1, event)">
@@ -2454,7 +2718,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
         <p class="hint">把新的 .hex 写进设备的板载 NOR，写完自动重启。
           <b>v1.0.0 及以上</b>支持；第一次升级需要先用 ISP 刷一次 v1.0.0。</p>
         <div class="row" style="align-items:center; gap:8px">
-          <button onclick="pickFirmware()">选择固件…</button>
+          <button id="fw-pick" onclick="pickFirmware()">选择固件…</button>
           <input id="fw-file" type="file" accept=".hex,.bin" style="display:none"
                  onchange="firmwarePicked(event)">
           <span id="fw-name" class="hint"></span>
@@ -2501,6 +2765,126 @@ let allBgEnabled = false;
 let configWidgetName = '';
 let currentWidgetName = '';
 
+/* ---- dirty tracking core（tests/test_webui.py 会抽取本段在 node 里跑，别改标记） ---- */
+const DIRTY = new Set();
+function markDirty(id) { DIRTY.add(id); }
+function clearDirty(ids) { (ids || []).forEach(id => DIRTY.delete(id)); }
+function isDirty(id) { return DIRTY.has(id); }
+function shouldSync(id) {
+  const el = document.getElementById(id);
+  if (el && document.activeElement === el) return false;
+  return !DIRTY.has(id);
+}
+/* ---- dirty tracking core end ---- */
+
+const TOUCH_IDS = ['tk-single', 'tk-double', 'tk-long',
+  'tk-macro-single', 'tk-macro-double', 'tk-macro-long',
+  'tk-program-single', 'tk-program-double', 'tk-program-long'];
+const BG_IDS = ['bg-source', 'bg-interval', 'bg-shuffle', 'bg-mode',
+  'bg-blur', 'bg-path', 'bg-list'];
+const ASSET_IDS = ['asset-boot', 'asset-standby', 'asset-dwell', 'asset-boot-hold'];
+
+function clearTouchDirty() { clearDirty(TOUCH_IDS); }
+function clearBgDirty() { clearDirty(BG_IDS); }
+function clearAssetDirty() { clearDirty(ASSET_IDS); }
+
+function formatBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+/* 背景图列表：顺序就是播放顺序 */
+let bgList = [];
+
+function bgDisplayName(path) {
+  let name = String(path || '').split(/[\\/]/).pop() || '';
+  return name.replace(/_[0-9a-f]{12}(\.[A-Za-z0-9]+)$/, '$1');
+}
+
+function renderBgList() {
+  const box = document.getElementById('bg-list');
+  const cnt = document.getElementById('bg-count');
+  if (cnt) cnt.textContent = '共 ' + bgList.length + ' 张';
+  if (!box) return;
+  box.innerHTML = '';
+  if (!bgList.length) {
+    const p = document.createElement('div');
+    p.className = 'tiny';
+    p.style.color = '#888';
+    p.textContent = '还没有背景图，点「添加图片…」选择（可多选，顺序就是播放顺序）。';
+    box.appendChild(p);
+    return;
+  }
+  bgList.forEach((path, i) => {
+    const row = document.createElement('div');
+    row.className = 'bg-row';
+    const img = document.createElement('img');
+    img.className = 'bg-thumb';
+    img.src = '/api/bgthumb?path=' + encodeURIComponent(path);
+    img.alt = '';
+    const name = document.createElement('span');
+    name.className = 'bg-name';
+    name.textContent = bgDisplayName(path);
+    name.title = path;
+    const up = document.createElement('button');
+    up.className = 'mini'; up.textContent = '↑'; up.title = '上移';
+    up.onclick = () => moveBg(i, -1);
+    const down = document.createElement('button');
+    down.className = 'mini'; down.textContent = '↓'; down.title = '下移';
+    down.onclick = () => moveBg(i, 1);
+    const del = document.createElement('button');
+    del.className = 'mini'; del.textContent = '×'; del.title = '删除';
+    del.onclick = () => removeBg(i);
+    row.appendChild(img); row.appendChild(name);
+    row.appendChild(up); row.appendChild(down); row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+
+function moveBg(i, delta) {
+  const j = i + delta;
+  if (j < 0 || j >= bgList.length) return;
+  const t = bgList[i];
+  bgList[i] = bgList[j];
+  bgList[j] = t;
+  markDirty('bg-list');
+  renderBgList();
+}
+
+function removeBg(i) {
+  if (i < 0 || i >= bgList.length) return;
+  bgList.splice(i, 1);
+  markDirty('bg-list');
+  renderBgList();
+}
+
+function setupDirtyListeners() {
+  TOUCH_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const fn = () => { markDirty(id); updateArgVisibility(); };
+    el.addEventListener('input', fn);
+    el.addEventListener('change', fn);
+  });
+  ['bg-interval', 'bg-shuffle'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', () => {
+      markDirty(id);
+      applyBgSettings();
+    });
+  });
+  ASSET_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const fn = () => markDirty(id);
+    el.addEventListener('input', fn);
+    el.addEventListener('change', fn);
+  });
+}
+
 const TOUCH_ACTIONS = [
   ["passthrough", "未定义（透传给插件）", "通用"],
   ["next_page", "下一页", "小屏"],
@@ -2537,7 +2921,7 @@ function syncTouchSelects(t) {
   ['single', 'double', 'long'].forEach(k => {
     const sel = document.getElementById('tk-' + k);
     if (!sel || !sel.options.length) return;
-    if (document.activeElement === sel) return;
+    if (!shouldSync('tk-' + k)) return;
     const v = t[k];
     if (v && sel.value !== v) sel.value = v;
   });
@@ -2599,7 +2983,21 @@ async function saveTouch() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({values})
     });
-    if (j.ok) setMsg('msg-touch', '已应用', false);
+    if (j.ok) {
+      clearTouchDirty();
+      const v = j.values || values;
+      document.getElementById('tk-single').value = v.single;
+      document.getElementById('tk-double').value = v.double;
+      document.getElementById('tk-long').value = v.long;
+      document.getElementById('tk-macro-single').value = v.macro_single || '';
+      document.getElementById('tk-macro-double').value = v.macro_double || '';
+      document.getElementById('tk-macro-long').value = v.macro_long || '';
+      document.getElementById('tk-program-single').value = v.program_single || '';
+      document.getElementById('tk-program-double').value = v.program_double || '';
+      document.getElementById('tk-program-long').value = v.program_long || '';
+      updateArgVisibility();
+      setMsg('msg-touch', '已应用', false);
+    }
     else setMsg('msg-touch', j.err || '保存失败', true);
   } catch(e) {
     setMsg('msg-touch', '失败: ' + e, true);
@@ -2611,7 +3009,7 @@ async function loadDim() {
   try {
     const j = await getJSON('/api/dim');
     const el = document.getElementById('disp-dim');
-    if (el && document.activeElement !== el) {
+    if (el && shouldSync('disp-dim')) {
       el.value = String(100 - (j.dim || 0));
     }
   } catch(e) {}
@@ -2657,8 +3055,14 @@ async function applyDim() {
   if (!el) return;
   const bright = parseInt(el.value, 10);
   const dim = isNaN(bright) ? 0 : Math.max(0, Math.min(90, 100 - bright));
+  markDirty('disp-dim');
   try {
     const j = await postJSON('/api/dim', { dim: dim });
+    if (j && j.ok === false) {
+      setMsg('msg-display', j.err || '设置失败', true);
+      return;
+    }
+    clearDirty(['disp-dim']);
     setMsg('msg-display', '亮度 ' + (100 - j.dim) + '%', false);
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
@@ -2669,7 +3073,7 @@ async function applyOrient() {
   try {
     const j = await postJSON('/api/orientation', {});
     setMsg('msg-display', (j && j.ok === false) ? '失败' : '方向已切换', false);
-    loadStatus();
+    refresh();
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
   }
@@ -2679,7 +3083,7 @@ async function applyReverse() {
   try {
     const j = await postJSON('/api/reverse', {});
     setMsg('msg-display', (j && j.ok === false) ? '失败' : '已翻转', false);
-    loadStatus();
+    refresh();
   } catch(e) {
     setMsg('msg-display', '失败: ' + e, true);
   }
@@ -2718,7 +3122,7 @@ async function loadDevices() {
       o.textContent = `${mark} ${d.id}  ${d.port || 'auto'}`;
       sel.appendChild(o);
     });
-    if (active) sel.value = active;
+    if (active && document.activeElement !== sel) sel.value = active;
   } catch(e) {}
 }
 
@@ -2766,17 +3170,73 @@ function setBgBlurLabel() {
     document.getElementById('bg-blur').value;
 }
 
-async function applyBgLook() {
-  const blur = parseInt(document.getElementById('bg-blur').value, 10);
-  const j = await postJSON('/api/background', {
-    enabled: allBgEnabled,
-    path: document.getElementById('bg-path').value.trim(),
-    paths: bgPaths(),
+function syncBgButton() {
+  const btn = document.getElementById('btn-bg');
+  if (!btn) return;
+  btn.textContent = allBgEnabled ? '关闭背景' : '启用背景';
+  btn.classList.toggle('active', !!allBgEnabled);
+}
+
+async function applyBgSettings(nextEnabled) {
+  const enabled = (nextEnabled === undefined) ? !!allBgEnabled : !!nextEnabled;
+  const source = bgSource();
+  const pathEl = document.getElementById('bg-path');
+  const path = source === 'single' && pathEl ? pathEl.value.trim() : '';
+  const body = {
+    enabled: enabled,
+    path: path,
+    paths: bgList.slice(),
     mode: document.getElementById('bg-mode').value,
-    blur,
-  });
-  document.getElementById('msg-bg').textContent =
-    j.ok ? `模糊 ${j.blur}` : (j.err || '失败');
+    blur: parseInt(document.getElementById('bg-blur').value, 10) || 0,
+    source: source,
+    interval: bgInterval(),
+    shuffle: bgShuffle(),
+  };
+  if (enabled && source === 'single' && !body.path) {
+    setMsg('msg-bg', '先选一张背景图', true);
+    return false;
+  }
+  if (enabled && source === 'playlist' && !body.paths.length) {
+    setMsg('msg-bg', '先添加背景图（可多选）', true);
+    return false;
+  }
+  setMsg('msg-bg', '应用中…', false);
+  try {
+    const j = await postJSON('/api/background', body);
+    if (!j || j.ok === false) {
+      setMsg('msg-bg', (j && j.err) || '保存失败', true);
+      return false;
+    }
+    clearBgDirty();
+    allBgEnabled = !!j.enabled;
+    bgList = (j.paths || []).slice();
+    if (pathEl) pathEl.value = j.path || '';
+    const nameEl = document.getElementById('bg-name');
+    if (nameEl) nameEl.textContent = j.path ? bgDisplayName(j.path) : '（未选择）';
+    renderBgList();
+    syncBgButton();
+    setBgBlurLabel();
+    setMsg('msg-bg', enabled ? '已启用背景（顺序/秒数已保存）'
+                             : '已关闭背景（设置已保存）', false);
+    return true;
+  } catch(e) {
+    setMsg('msg-bg', '保存失败: ' + e, true);
+    return false;
+  }
+}
+
+async function toggleBackground() {
+  await applyBgSettings(!allBgEnabled);
+}
+
+async function setBackgroundMode() {
+  markDirty('bg-mode');
+  await applyBgSettings();
+}
+
+async function applyBgLook() {
+  markDirty('bg-blur');
+  await applyBgSettings();
 }
 
 function bgSource() {
@@ -2784,7 +3244,7 @@ function bgSource() {
   return el ? el.value : 'single';
 }
 
-function setBgSource() {
+function applyBgVisibility() {
   const pl = bgSource() === 'playlist';
   const pw = document.getElementById('bg-iv-wrap');
   const sw = document.getElementById('bg-sh-wrap');
@@ -2794,6 +3254,11 @@ function setBgSource() {
   if (sw) sw.style.display = pl ? '' : 'none';
   if (single) single.style.display = pl ? 'none' : '';
   if (multi) multi.style.display = pl ? '' : 'none';
+}
+
+function setBgSource() {
+  markDirty('bg-source');
+  applyBgVisibility();
 }
 
 function bgInterval() {
@@ -2806,11 +3271,6 @@ function bgShuffle() {
   return !!(el && el.checked);
 }
 
-function bgPaths() {
-  return document.getElementById('bg-paths').value
-    .split('\n').map(s => s.trim()).filter(s => s.length > 0);
-}
-
 async function refresh() {
   try {
     const j = await getJSON('/api/status');
@@ -2820,30 +3280,38 @@ async function refresh() {
       j.orientation === 'portrait' ? '切换到横屏' : '切换到竖屏';
     document.getElementById('btn-rev').textContent =
       j.reverse ? '取消翻转' : '上下翻转';
-    if (document.activeElement !== document.getElementById('bg-path')) {
-      document.getElementById('bg-path').value = j.background_path || '';
+    if (shouldSync('bg-path')) {
+      const curPath = j.background_path || '';
+      const pEl = document.getElementById('bg-path');
+      if (pEl && pEl.value !== curPath) {
+        pEl.value = curPath;
+        const nameEl = document.getElementById('bg-name');
+        if (nameEl) nameEl.textContent =
+          curPath ? bgDisplayName(curPath) : '（未选择）';
+      }
     }
-    const bgBtn = document.getElementById('btn-bg');
-    bgBtn.textContent = j.background_enabled ? '关闭背景' : '启用背景';
-    bgBtn.classList.toggle('active', !!j.background_enabled);
-    allBgEnabled = !!j.background_enabled;
-    const bgModeEl = document.getElementById('bg-mode');
-    if (bgModeEl && document.activeElement !== bgModeEl) {
-      bgModeEl.value = j.background_mode || 'fit';
+    if (!BG_IDS.some(isDirty)) {
+      allBgEnabled = !!j.background_enabled;
+      syncBgButton();
     }
-    const dimEl = document.getElementById('disp-dim');
-    if (dimEl && document.activeElement !== dimEl) {
-      dimEl.value = String(100 - (j.dim || 0));
+    if (shouldSync('bg-mode')) {
+      const bgModeEl = document.getElementById('bg-mode');
+      if (bgModeEl) bgModeEl.value = j.background_mode || 'fit';
     }
-    const blurEl = document.getElementById('bg-blur');
-    if (blurEl && document.activeElement !== blurEl) {
-      blurEl.value = j.background_blur || 0;
-      setBgBlurLabel();
+    if (shouldSync('disp-dim')) {
+      const dimEl = document.getElementById('disp-dim');
+      if (dimEl) dimEl.value = String(100 - (j.dim || 0));
     }
-    const pathsEl = document.getElementById('bg-paths');
-    if (pathsEl && document.activeElement !== pathsEl) {
-      const cur = (j.background_paths || []).join('\n');
-      if (pathsEl.value.trim() !== cur.trim()) pathsEl.value = cur;
+    if (shouldSync('bg-blur')) {
+      const blurEl = document.getElementById('bg-blur');
+      if (blurEl) { blurEl.value = j.background_blur || 0; setBgBlurLabel(); }
+    }
+    if (shouldSync('bg-list')) {
+      const curPaths = (j.background_paths || []).slice();
+      if (curPaths.join('\n') !== bgList.join('\n')) {
+        bgList = curPaths;
+        renderBgList();
+      }
     }
     const sel = document.getElementById('dev-select');
     if (sel && j.active && document.activeElement !== sel) {
@@ -2877,21 +3345,17 @@ async function refresh() {
       if (pv.dataset.want !== want) { pv.dataset.want = want; pv.src = want; }
     }
     const srcEl = document.getElementById('bg-source');
-    if (srcEl && document.activeElement !== srcEl) {
+    if (srcEl && shouldSync('bg-source')) {
       srcEl.value = j.background_source || 'single';
-      setBgSource();
+      applyBgVisibility();
     }
-    const pthEl = document.getElementById('bg-paths');
-    if (pthEl && document.activeElement !== pthEl) {
-      pthEl.value = (j.background_paths || []).join('\n');
+    if (shouldSync('bg-interval')) {
+      const ivEl = document.getElementById('bg-interval');
+      if (ivEl) ivEl.value = j.background_interval || 12;
     }
-    const ivEl = document.getElementById('bg-interval');
-    if (ivEl && document.activeElement !== ivEl) {
-      ivEl.value = j.background_interval || 12;
-    }
-    const shEl = document.getElementById('bg-shuffle');
-    if (shEl && document.activeElement !== shEl) {
-      shEl.checked = !!j.background_shuffle;
+    if (shouldSync('bg-shuffle')) {
+      const shEl = document.getElementById('bg-shuffle');
+      if (shEl) shEl.checked = !!j.background_shuffle;
     }
 
     currentWidgetName = j.current_widget || '';
@@ -3121,25 +3585,6 @@ async function switchTo(name) {
   }
   setTimeout(refresh, 200);
 }
-async function setBackgroundMode() {
-  const modeEl = document.getElementById('bg-mode');
-  const mode = modeEl ? modeEl.value : 'fit';
-  const path = (document.getElementById('bg-path') || {}).value || '';
-  const enabled = !!allBgEnabled;
-  try {
-    const j = await getJSON('/api/background', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: enabled, path: path.trim(), mode: mode})
-    });
-    if (j.ok) setMsg('msg-bg', '显示方式已更新', false);
-    else setMsg('msg-bg', j.err || '被拒绝', true);
-  } catch(e) {
-    setMsg('msg-bg', '失败: ' + e, true);
-  }
-  setTimeout(refresh, 200);
-}
-
 async function doAction(name, action) {
   setMsg('msg-pages', '执行中...', false);
   try {
@@ -3294,61 +3739,114 @@ async function post(path) {
   setTimeout(refresh, 250);
 }
 
-async function uploadFileToServer(file) {
-  try {
-    const r = await fetch('/api/upload', {
-      method: 'POST',
-      headers: {'X-Filename': encodeURIComponent(file.name)},
-      body: file,
-    });
-    const j = await r.json();
-    return (j && j.ok) ? j.path : '';
-  } catch (e) {
-    return '';
-  }
+function uploadFileToServer(file, purpose, onProgress) {
+  return new Promise(resolve => {
+    let xhr;
+    try {
+      xhr = new XMLHttpRequest();
+    } catch (e) {
+      resolve({ ok: false, err: '浏览器不支持上传' });
+      return;
+    }
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    if (purpose) xhr.setRequestHeader('X-Purpose', purpose);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = ev => {
+        if (!ev.lengthComputable) return;
+        try { onProgress(ev.loaded, ev.total); } catch (e) {}
+      };
+    }
+    xhr.onload = () => {
+      let j = null;
+      try { j = JSON.parse(xhr.responseText); } catch (e) {}
+      if (!j || typeof j !== 'object') {
+        resolve({ ok: false,
+                  err: '服务器返回无法解析（HTTP ' + xhr.status + '）' });
+        return;
+      }
+      resolve(j);
+    };
+    xhr.onerror = () => resolve({ ok: false, err: '网络错误，文件没传上去' });
+    xhr.onabort = () => resolve({ ok: false, err: '上传已取消' });
+    xhr.send(file);
+  });
 }
 
 async function bgPicked(ev) {
   const f = ev.target.files && ev.target.files[0];
   if (!f) return;
-  setMsg('msg-bg', '正在读取图片…', false);
-  const p = await uploadFileToServer(f);
-  if (!p) { setMsg('msg-bg', '上传失败', true); return; }
-  document.getElementById('bg-path').value = p;
-  document.getElementById('bg-name').textContent = f.name;
-  setMsg('msg-bg', '', false);
-  const btn = document.getElementById('btn-bg');
-  if (btn && !btn.classList.contains('active')) toggleBackground();
-  else applyBgLook();
+  setMsg('msg-bg', '正在上传 ' + f.name + '（' + formatBytes(f.size) + '）…', false);
+  const up = await uploadFileToServer(f, 'background', (loaded, total) => {
+    setMsg('msg-bg', '上传中 ' + f.name + ' ' +
+           Math.round(loaded * 100 / Math.max(1, total)) + '%', false);
+  });
+  if (!up || !up.ok) {
+    setMsg('msg-bg', '上传失败：' + ((up && up.err) || '未知原因'), true);
+    return;
+  }
+  document.getElementById('bg-path').value = up.path || '';
+  document.getElementById('bg-name').textContent = bgDisplayName(up.path || '');
+  markDirty('bg-path');
+  const srcEl = document.getElementById('bg-source');
+  if (srcEl && srcEl.value !== 'single') {
+    srcEl.value = 'single';
+    applyBgVisibility();
+  }
+  await applyBgSettings(true);
 }
 
 async function bgPickedMulti(ev) {
-  const files = ev.target.files;
-  if (!files || !files.length) return;
-  setMsg('msg-bg', '正在读取 ' + files.length + ' 张图片…', false);
+  const files = Array.from(ev.target.files || []);
+  if (!files.length) return;
   const got = [];
-  for (const f of files) {
-    const p = await uploadFileToServer(f);
-    if (p) got.push(p);
+  const failed = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    setMsg('msg-bg', '第 ' + (i + 1) + '/' + files.length + ' 张：' + f.name +
+           '（' + formatBytes(f.size) + '）', false);
+    const up = await uploadFileToServer(f, 'background', (loaded, total) => {
+      setMsg('msg-bg', '第 ' + (i + 1) + '/' + files.length + ' 张 ' +
+             Math.round(loaded * 100 / Math.max(1, total)) + '%', false);
+    });
+    if (up && up.ok && up.path) got.push(up.path);
+    else failed.push(f.name + '：' + ((up && up.err) || '未知原因'));
   }
-  if (!got.length) { setMsg('msg-bg', '上传失败', true); return; }
-  const ta = document.getElementById('bg-paths');
-  const cur = (ta.value || '').trim();
-  ta.value = (cur ? cur + '\n' : '') + got.join('\n');
-  setMsg('msg-bg', '已添加 ' + got.length + ' 张', false);
-  const btn = document.getElementById('btn-bg');
-  if (btn && !btn.classList.contains('active')) toggleBackground();
-  else applyBgLook();
+  if (!got.length) {
+    setMsg('msg-bg', '上传失败：' + failed.join('；'), true);
+    return;
+  }
+  bgList = bgList.concat(got);
+  markDirty('bg-list');
+  renderBgList();
+  const srcEl = document.getElementById('bg-source');
+  if (srcEl && srcEl.value !== 'playlist') {
+    srcEl.value = 'playlist';
+    applyBgVisibility();
+  }
+  await applyBgSettings(true);
+  if (failed.length) {
+    setMsg('msg-bg', '已添加 ' + got.length + ' 张，失败 ' + failed.length +
+           ' 张：' + failed.join('；'), true);
+  } else {
+    setMsg('msg-bg', '已添加 ' + got.length + ' 张（顺序就是播放顺序）', false);
+  }
 }
 
 async function assetPicked(kind, ev) {
   const f = ev.target.files && ev.target.files[0];
   if (!f) return;
   const msg = kind ? 'msg-asset-standby' : 'msg-asset-boot';
-  setMsg(msg, '正在读取图片…', false);
-  const p = await uploadFileToServer(f);
-  if (!p) { setMsg(msg, '上传失败', true); return; }
-  document.getElementById(kind ? 'asset-standby-path' : 'asset-boot-path').value = p;
+  setMsg(msg, '正在上传 ' + f.name + '（' + formatBytes(f.size) + '）…', false);
+  const up = await uploadFileToServer(f, 'asset', (loaded, total) => {
+    setMsg(msg, '上传中 ' +
+           Math.round(loaded * 100 / Math.max(1, total)) + '%', false);
+  });
+  if (!up || !up.ok) {
+    setMsg(msg, '上传失败：' + ((up && up.err) || '未知原因'), true);
+    return;
+  }
+  document.getElementById(kind ? 'asset-standby-path' : 'asset-boot-path').value = up.path;
   document.getElementById(kind ? 'asset-standby-name' : 'asset-boot-name').textContent = f.name;
   if (kind === 0) {
     await uploadAsset(0, 0);          /* 开机图选完直接写进设备并预览 */
@@ -3356,43 +3854,6 @@ async function assetPicked(kind, ev) {
   } else {
     setMsg('msg-asset-standby', '已选好，点上面某个槽位的「写入」', false);
   }
-}
-
-async function toggleBackground() {
-  const btn = document.getElementById('btn-bg');
-  const currentlyOn = btn.classList.contains('active');
-  const next = !currentlyOn;
-  const path = document.getElementById('bg-path').value.trim();
-  const modeEl = document.getElementById('bg-mode');
-  const mode = modeEl ? modeEl.value : 'fit';
-  const paths = bgPaths();
-  const blur = parseInt(document.getElementById('bg-blur').value, 10);
-  const source = bgSource();
-  const interval = bgInterval();
-  const shuffle = bgShuffle();
-
-  if (next && source === 'single' && !path) {
-    setMsg('msg-bg', '请先填写图片路径', true);
-    return;
-  }
-  if (next && source === 'playlist' && paths.length === 0) {
-    setMsg('msg-bg', '请先填写图片路径', true);
-    return;
-  }
-  setMsg('msg-bg', '应用中...', false);
-  try {
-    const j = await getJSON('/api/background', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: next, path, paths, mode, blur,
-                           source, interval, shuffle})
-    });
-    if (j.ok) setMsg('msg-bg', next ? '已启用' : '已关闭', false);
-    else setMsg('msg-bg', j.err || '被拒绝', true);
-  } catch(e) {
-    setMsg('msg-bg', '失败: ' + e, true);
-  }
-  setTimeout(refresh, 250);
 }
 
 function renderSlotList(d, used) {
@@ -3413,27 +3874,64 @@ function renderSlotList(d, used) {
   box.innerHTML = html;
 }
 
-function syncAssetUi() {
-  const sel = document.getElementById('asset-standby');
-  const wrap = document.getElementById('asset-dwell-wrap');
-  if (!sel || !wrap) return;
-  wrap.style.display = (parseInt(sel.value, 10) === 2) ? '' : 'none';
-  const bm = parseInt((document.getElementById('asset-boot') || {}).value || '0', 10);
-  const bw = document.getElementById('asset-boot-hold-wrap');
+/* ---- assetUiState 规则（tests/test_webui.py 会抽取本段在 node 里跑，别改标记） ---- */
+function assetUiState(boot, standby) {
+  boot = parseInt(boot, 10) || 0;
+  standby = parseInt(standby, 10) || 0;
+  return {
+    bootFile: boot === 1,
+    bootHold: boot === 1,
+    bootHoldHint: boot === 2,
+    dwell: standby === 2,
+    slots: standby === 2,
+    standbyFile: standby === 2,
+  };
+}
+/* ---- assetUiState 规则结束 ---- */
+
+function setShown(id, shown) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = shown ? '' : 'none';
+}
+
+function applyAssetVisibility() {
+  const bootEl = document.getElementById('asset-boot');
+  const standbyEl = document.getElementById('asset-standby');
+  const st = assetUiState(bootEl ? bootEl.value : 0,
+                          standbyEl ? standbyEl.value : 0);
+  setShown('asset-boot-file-wrap', st.bootFile);
+  setShown('asset-boot-hold-wrap', st.bootHold);
+  setShown('asset-dwell-wrap', st.dwell);
+  setShown('asset-slot-list', st.slots);
+  setShown('asset-standby-file-wrap', st.standbyFile);
   const bh = document.getElementById('asset-boot-hold-hint');
-  if (bw) bw.style.display = (bm === 1) ? '' : 'none';
-  if (bh) bh.textContent = (bm === 2) ? '（自检画面固定停留 1.5 秒）' : '';
+  if (bh) bh.textContent = st.bootHoldHint ? '（自检画面固定停留 1.5 秒）' : '';
+}
+
+function syncAssetUi() {
+  markDirty('asset-boot');
+  markDirty('asset-standby');
+  applyAssetVisibility();
 }
 
 async function refreshAsset() {
   const j = await getJSON('/api/asset');
   if (!j || !j.ok) { setMsg('msg-asset', '读取失败', true); return; }
-  document.getElementById('asset-boot').value = String(j.boot_mode || 0);
-  document.getElementById('asset-standby').value = String(j.standby_mode);
-  document.getElementById('asset-dwell').value = String(j.dwell || 3);
+  if (shouldSync('asset-boot')) {
+    document.getElementById('asset-boot').value = String(j.boot_mode || 0);
+  }
+  if (shouldSync('asset-standby')) {
+    document.getElementById('asset-standby').value = String(j.standby_mode);
+  }
+  if (shouldSync('asset-dwell')) {
+    document.getElementById('asset-dwell').value = String(j.dwell || 3);
+  }
   const d = j.device;
-  const bhEl = document.getElementById('asset-boot-hold');
-  if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
+  if (shouldSync('asset-boot-hold')) {
+    const bhEl = document.getElementById('asset-boot-hold');
+    if (bhEl) bhEl.value = String((d && d.boot_hold) || j.boot_hold || 3);
+  }
+  applyAssetVisibility();
   if (!d) { document.getElementById('asset-state').textContent = '设备没有回应资产查询（固件 v1.0.0）'; return; }
   const slots = [];
   for (let i = 0; i < 16; i++) if (d.standby_mask & (1 << i)) slots.push(i + 1);
@@ -3469,6 +3967,7 @@ async function saveAssetSettings() {
   };
   setMsg('msg-asset', '保存中…（正在写设备）', false);
   const j = await postJSON('/api/asset/settings', body);
+  if (j && j.ok) clearAssetDirty();
   setMsg('msg-asset', j && j.ok ? '已保存到设备' : ('失败：' + ((j && j.err) || '设备没有确认')), !(j && j.ok));
   if (j && j.ok) refreshAsset();
 }
@@ -3507,20 +4006,40 @@ async function firmwarePicked(ev) {
   const files = ev.target.files || [];
   const f = files[0];
   if (!f) return;
-  setMsg('msg-flash', '正在把文件传到本机…', false);
-  const up = await uploadFileToServer(f);
+  document.getElementById('fw-name').textContent =
+    f.name + ' · ' + formatBytes(f.size);
+  setMsg('msg-flash', '正在把 ' + f.name + '（' + formatBytes(f.size) +
+         '）传到本机…', false);
+  const up = await uploadFileToServer(f, 'firmware', (loaded, total) => {
+    setMsg('msg-flash', '上传中 ' +
+           Math.round(loaded * 100 / Math.max(1, total)) + '%（' +
+           formatBytes(loaded) + ' / ' + formatBytes(total) + '）', false);
+  });
   if (!up || !up.ok) {
     setMsg('msg-flash', '上传失败：' + ((up && up.err) || '未知原因'), true);
     return;
   }
-  document.getElementById('fw-name').textContent = f.name;
+  setMsg('msg-flash', '已传到本机（' + formatBytes(up.size || f.size) +
+         '），准备写入设备…', false);
   if (!confirm('确定把 ' + f.name + ' 写进设备并重启吗？\n\n' +
                '写入大约 10–40 秒，期间不要关窗口、不要拔线。')) {
-    setMsg('msg-flash', '已取消', false);
+    setMsg('msg-flash', '已取消（文件只传到本机，没有写进设备）', false);
     return;
   }
-  setMsg('msg-flash', '正在写入设备…（别关窗口）', false);
-  const j = await postJSON('/api/flash', { path: up.path });
+  const pickBtn = document.getElementById('fw-pick');
+  if (pickBtn) pickBtn.disabled = true;
+  const started = Date.now();
+  const timer = setInterval(() => {
+    setMsg('msg-flash', '正在写入设备…（已 ' +
+           Math.round((Date.now() - started) / 1000) + ' 秒，别关窗口）', false);
+  }, 500);
+  let j = null;
+  try {
+    j = await postJSON('/api/flash', { path: up.path });
+  } finally {
+    clearInterval(timer);
+    if (pickBtn) pickBtn.disabled = false;
+  }
   if (j && j.ok) {
     setMsg('msg-flash', '已写入：' + (j.msg || '设备正在重启'), false);
   } else {
@@ -3599,11 +4118,16 @@ async function shutdownApp() {
   }
 }
 
+setupDirtyListeners();
 loadTouch();
 loadWeb();
-loadDim(); refreshAsset();
+loadDim();
 loadDevices();
-setBgSource();
+applyBgVisibility();
+renderBgList();
+syncBgButton();
+applyAssetVisibility();
+refreshAsset();
 loadPages();
 refresh();
 setInterval(refresh, 1000);
@@ -3612,6 +4136,23 @@ setInterval(loadDevices, 5000);
 </body>
 </html>
 """
+
+def asset_ui_state(boot_mode, standby_mode):
+    """开机/待机卡片的控件显隐规则。
+
+    WebUI 里的 assetUiState() 必须和这里一致（tests/test_webui.py 会用 node
+    把两边对齐），改规则时两个地方一起改。
+    """
+    boot = int(boot_mode)
+    standby = int(standby_mode)
+    return {
+        "bootFile": boot == 1,      # 选择开机图/预览：只有“显示 NOR 里的图片”才需要
+        "bootHold": boot == 1,      # 开机图停留秒数
+        "bootHoldHint": boot == 2,  # 自检固定停留时间的提示
+        "dwell": standby == 2,      # 每张图片秒数
+        "slots": standby == 2,      # NOR 槽位列表
+        "standbyFile": standby == 2,  # 选择待机图
+    }
 
 def _check_path(path, exts, max_bytes):
     try:
@@ -4119,6 +4660,14 @@ class WebUI(threading.Thread):
                         self.send_error(404); return
                     self._send(data, "image/png"); return
 
+                if path == "/api/bgthumb":
+                    q = parse_qs(parsed.query)
+                    bg_path = (q.get("path") or [""])[0]
+                    data = _background_thumb(bg_path)
+                    if data is None:
+                        self.send_error(404); return
+                    self._send(data, "image/png"); return
+
                 if path == "/api/widgets":
                     self._json({
                         "ok": True,
@@ -4324,18 +4873,46 @@ class WebUI(threading.Thread):
                             self._json({"ok": False, "err": "文件为空或超过 32 MB"})
                         else:
                             data = self.rfile.read(n)
+                            purpose = (self.headers.get("X-Purpose") or "").strip().lower()
                             updir = _data_dir() / "uploads"
                             updir.mkdir(parents=True, exist_ok=True)
                             base = os.path.basename(str(raw_name)) or "upload.bin"
                             safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_"
                                            for ch in base)[-60:] or "upload.bin"
-                            dst = updir / ("%s_%s" % (time.strftime("%H%M%S"), safe))
-                            try:
-                                dst.write_bytes(data)
-                                self._json({"ok": True, "path": str(dst),
-                                            "size": len(data)})
-                            except Exception as exc:
-                                self._json({"ok": False, "err": "保存失败：%s" % (exc,)})
+                            ext = os.path.splitext(safe)[1].lower()
+                            if purpose == "background" and ext in IMAGE_EXTS:
+                                # 背景图：收到就统一成 160×80、存进数据目录 backgrounds/
+                                tmp = updir / ("%s_bg_%s"
+                                               % (time.strftime("%H%M%S"), safe))
+                                try:
+                                    tmp.write_bytes(data)
+                                    fixed = _normalize_bg_image(tmp)
+                                    with Image.open(fixed) as im:
+                                        w, h = im.size
+                                    self._json({"ok": True, "path": fixed,
+                                                "size": os.path.getsize(fixed),
+                                                "width": w, "height": h,
+                                                "normalized": True})
+                                except Exception as exc:
+                                    log.error("背景图上传处理失败 %s：%s", safe, exc)
+                                    self._json({"ok": False,
+                                                "err": "背景图处理失败：%s" % (exc,)})
+                                finally:
+                                    try:
+                                        if tmp.exists():
+                                            tmp.unlink()
+                                    except Exception:
+                                        pass
+                            else:
+                                dst = updir / ("%s_%s"
+                                               % (time.strftime("%H%M%S"), safe))
+                                try:
+                                    dst.write_bytes(data)
+                                    self._json({"ok": True, "path": str(dst),
+                                                "size": len(data)})
+                                except Exception as exc:
+                                    self._json({"ok": False,
+                                                "err": "保存失败：%s" % (exc,)})
                     elif self.path == "/api/flash":
                         body = self._read_json()
                         path = str(body.get("path", "") or "")
@@ -4343,6 +4920,8 @@ class WebUI(threading.Thread):
                             self._json({"ok": False, "err": "没有选择固件文件"})
                         else:
                             ok, why = sched.flash_firmware_safe(path)
+                            if not ok:
+                                log.error("Web 固件升级失败（%s）：%s", path, why)
                             self._json({"ok": ok, "msg": "" if not ok else why,
                                         "err": "" if ok else why})
                     elif self.path == "/api/asset/wipe":
@@ -4365,6 +4944,17 @@ class WebUI(threading.Thread):
                             paths = None
                         if paths is not None:
                             paths = [str(p) for p in paths if isinstance(p, str)]
+                        if path or paths:
+                            # 启用的背景图统一成 160×80 规范图（旧图懒迁移）
+                            try:
+                                if path:
+                                    path = _normalize_bg_image(path)
+                                if paths:
+                                    paths = [_normalize_bg_image(p) for p in paths]
+                            except ValueError as exc:
+                                self._json({"ok": False,
+                                            "err": "背景图处理失败：%s" % (exc,)})
+                                return
                         dim = body.get("dim")
                         blur = body.get("blur")
                         source = body.get("source")
@@ -4947,7 +5537,7 @@ def cmd_selftest(port=None):
 
         # 6) 待机动画逐帧（v53 起）：让设备自己跑 10 次心跳
         if fwmaj >= 1:
-            st = tr.asset_settings(0, 3, 8, 3, boot_hold=3)
+            tr.asset_settings(0, 3, 8, 3, boot_hold=3)
             dur = tr.anim_probe(10)
             if dur is None:
                 _console("  [WARN] 动画探针没有回应")

@@ -83,6 +83,11 @@ from msu2_core.protocol import (  # noqa: E402
     _rle_payload, lcd_segment_payload,  # noqa: F401
     compress_asset_payload, rle_decode_rgb565, rle_encode_rgb565,  # noqa: F401
 )
+from msu2_core.plugin_store import (
+    load_all as load_plugin_configs,
+    migrate_legacy as migrate_plugin_configs,
+    save_all as save_plugin_configs,
+)
 from msu2_core.transport import (  # noqa: E402
     SCREEN_BAUD, SerialTransport, _normalize_port, _serial_locked,  # noqa: F401
     format_fw_version, normalize_fw_version,
@@ -2505,11 +2510,21 @@ def _sanitize_config(cfg):
     gif_dir = cfg.get("gif_dir")
     cfg["gif_dir"] = gif_dir if isinstance(gif_dir, str) and gif_dir else str(DEFAULT_GIF_DIR)
     _sanitize_devices(cfg)
+    # 插件私有配置不在主文件里：先把老字段搬进 widget_config/ 下的独立文件，
+    # 再从文件读回内存（插件侧仍然读写 cfg["widget_config"]，代码不用改）。
     wc = cfg.get("widget_config")
-    if not isinstance(wc, dict):
-        wc = {}
-    cfg["widget_config"] = {k: dict(v) for k, v in wc.items()
-                            if k in WIDGET_REGISTRY and isinstance(v, dict)}
+    legacy = {k: dict(v) for k, v in wc.items()
+              if k in WIDGET_REGISTRY and isinstance(v, dict)} if isinstance(wc, dict) else {}
+    try:
+        moved = migrate_plugin_configs(legacy)
+        if moved:
+            log.info("已把 %d 个插件的配置迁移到 widget_config/ 目录", moved)
+        cfg["widget_config"] = load_plugin_configs(list(WIDGET_REGISTRY.keys()))
+        for name, data in legacy.items():
+            cfg["widget_config"].setdefault(name, data)
+    except Exception as e:
+        log.warning("读取插件配置失败: %s", e)
+        cfg["widget_config"] = legacy
     font = cfg.get("font")
     cfg["font"] = font if isinstance(font, str) else ""
     web = cfg.get("web")
@@ -2528,8 +2543,14 @@ def _write_config_raw(cfg, path):
     tmp = p.with_name(p.name + ".tmp")
     # `_help` / `_available_widgets` 这类下划线开头的是运行时元数据（每次启动
     # 重新生成），别写进用户配置文件里，否则 config.json 又长又难读。
-    clean = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+    # `widget_config` 也剔掉：插件私有配置各自写到 widget_config/<插件名>.json。
+    clean = {k: v for k, v in cfg.items()
+             if not str(k).startswith("_") and k != "widget_config"}
     data = json.dumps(clean, indent=2, ensure_ascii=False)
+    try:
+        save_plugin_configs(cfg.get("widget_config") or {})
+    except Exception as e:
+        log.warning("写入插件配置失败: %s", e)
     with _CONFIG_LOCK:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -2561,7 +2582,7 @@ def ensure_config_file(path=None):
             "background": {"enabled": "背景图开关",
                            "path": "背景图路径（图片、GIF 或图片序列目录）",
                            "mode": "显示方式：fit=适应 / fill=填充 / stretch=拉伸"},
-            "widget_config": "每个插件自己的配置（Web 页面该行的 ⋯ 菜单里点「设置」修改）",
+            "widget_config": "（已拆分）插件配置现在各自存在 widget_config/<插件名>.json",
             "font": "自定义字体路径",
             "web": {"host": "WebUI 监听地址", "port": "WebUI 端口"},
             "log_level": "DEBUG / INFO / WARNING / ERROR",
@@ -5436,6 +5457,9 @@ class WebUI(threading.Thread):
                                 result = {"ok": True}
                             if result.get("ok"):
                                 sched._switch.set()
+                                # 插件可能改了自己的配置（待办条目、纪念日…），
+                                # 这里补一次保存，插件的 json 才会跟着更新。
+                                save_config(outer.cfg, cfg_path)
                             self._json(result)
                         except Exception as e:
                             log.exception("插件 %s on_action 异常", name)

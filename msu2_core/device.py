@@ -264,24 +264,43 @@ class MiniDevice:
                 _lock.release()
 
     def _write_paced(self, payload):
-        """把整帧按 2 KB 分块、带间隔写进串口（限速可自适应）。
+        """把整帧按 2 KB 分块写进串口，每块之后等驱动把在途字节送完再送下一块。
 
-        间隔不是可省的“等待”，而是数据完整性的前提：设备端 USB 环只有 8 KB，
-        主机灌得比它消化得快时尾部像素会被丢掉。实测（Windows，fw 1.0.9）：
-        2 KB/块、间隔 10 ms 连续 40 帧全对；8 ms 空转同样能过，但接上 WebUI
-        与渲染的真实负载会出现尾部 30/50 块丢失；4 KB/块即便等到 15 ms，连续
-        发送 40 帧仍有 17 帧丢尾部。10 ms 是经得起这些场景的安全值（线上速率
-        约 140 KB/s），不要为了几十毫秒再往下压。
+        设备的 USB 接收环只有 8 KB，主机一口气排进四块就顶满；顶满之后写入会
+        撞超时，Windows 上还可能把串口卡到只能拔插。等 ``out_waiting`` 归零再
+        发下一块，就把在途字节压到一块以内，接收环永远不会溢出。
+
+        块与块之间再留 4 ms：纯属给设备主循环一点喘息的余量。实测（Windows，
+        fw 1.0.9，连续 200 帧整屏噪声）：4 ms 与 6 ms 都是 200/200 全对、
+        平均 188/196 ms 一帧；2 ms 开始出现丢尾块。更早版本里“8 ms 不安全”
+        是另外两个缺陷（NAK 标志卡死、帧尾裁决顶掉签名回包）造成的误判。
         """
         seg_write = 2048
         rate = max(120000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
-        gap = min(0.010, seg_write / rate)
+        gap = min(0.004, seg_write / rate)
+        ser = getattr(self.transport, "_ser", None)
         for i in range(0, len(payload), seg_write):
             if not self.transport.write(payload[i:i + seg_write]):
                 return False
             if i + seg_write < len(payload):
+                # 等驱动把这一块真正送出去，再送下一块。
+                self._wait_tx_drain(ser, 0.3)
                 time.sleep(gap)
         return True
+
+    @staticmethod
+    def _wait_tx_drain(ser, timeout):
+        """等驱动把在途字节发完（最多等 timeout 秒，超时也继续）。"""
+        if ser is None:
+            return
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            try:
+                if ser.out_waiting <= 0:
+                    return
+            except Exception:
+                return
+            time.sleep(0.001)
 
     def _show_image_once_locked(self, img):
         t0 = time.perf_counter()
@@ -315,10 +334,12 @@ class MiniDevice:
         # 而重连发生在设备正停在半帧里的时刻，于是后续命令全被当成像素吃掉 ——
         # 那才是真正把设备搞哑的链路。宁可不确认，也绝不打断它。
         self.self_paced = False
+        # 先把帧尾裁决收掉，再进入分块自检：否则签名的应答会被这笔待取的
+        # 裁决顶掉，主机要白等一整轮超时（实测每隔十几帧卡一秒）。
         try:
-            self.transport.read_all()
+            self.last_verdict = self.transport.read_frame_verdict(0.2)
         except Exception:
-            pass
+            self.last_verdict = None
         self._quiet_frames = 0
         self._ack_fails = 0
         self.tx_ms = (time.perf_counter() - t0) * 1000.0 - self.enc_ms

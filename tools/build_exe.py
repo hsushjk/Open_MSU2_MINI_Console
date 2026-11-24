@@ -23,7 +23,9 @@ HIDDEN = (
     "pywintypes",
     "pythoncom",
 )
-COLLECT = ("msu2_core", "widgets", "PIL")
+# mss：外部投屏插件（widgets/screen_cast4.py 等）的抓屏后端。仓库内置
+# 插件不依赖它，但打包时带上，用户放外部插件就不用再自己装。
+COLLECT = ("msu2_core", "widgets", "PIL", "mss")
 
 
 def main(argv=None):

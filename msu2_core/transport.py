@@ -272,21 +272,17 @@ class SerialTransport:
                 total = len(view)
                 sent = 0
                 t0 = time.monotonic()
-                stuck = 0
                 while sent < total:
                     try:
                         n = self._write_raw(view[sent:]) or 0
                     except serial.SerialTimeoutException:
-                        # 设备接收环满了（NAK）：这不是链路坏了，等一会儿再续。
-                        # 只要 3 秒内还有进展就不算失败，日志降成 DEBUG 免得刷屏。
-                        if time.monotonic() - t0 > 3.0:
-                            raise
-                        stuck += 1
-                        if stuck % 50 == 1:
-                            log.debug("设备接收环满，等待续写（已写 %d/%d 字节）",
-                                      sent, total)
-                        time.sleep(0.02)
-                        continue
+                        # 写超时时 Windows 已经把“发出去多少字节”搞不清了：
+                        # 再续写同样的内容会在设备端变成重复字节，整帧从那
+                        # 里开始错位。宁可作废这一帧（上层重发整帧），也不
+                        # 续写。 
+                        log.debug("设备接收环满或链路卡住，放弃这一帧（已写 %d/%d 字节）",
+                                  sent, total)
+                        raise
                     if n <= 0:
                         # 短写：给驱动喘口气，别把半帧当成整帧发出去
                         if time.monotonic() - t0 > 3.0:
@@ -711,6 +707,29 @@ class SerialTransport:
             if i >= 0 and len(buf) >= i + 6:
                 return {"stage": buf[i + 2],
                         "boots": buf[i + 3] | (buf[i + 4] << 8)}
+        return None
+
+    @_serial_locked
+    def read_frame_verdict(self, timeout=0.2):
+        """读帧尾裁决字节：0x06 表示整帧完整，0x15 表示设备作废了那一帧。
+
+        顺带跳过心跳（``\\0OPMSU``）和其他回包的首字节。设备回复是单字节，
+        必须先收掉它再发下一条命令 —— EP3 只有一笔在途缓冲，裁决还没被取走时
+        分块签名的应答会被整包丢掉，主机只能白等一轮超时。
+        """
+        if self._ser is None:
+            return None
+        end = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < end:
+            buf += self._ser.read(self._ser.in_waiting or 1)
+            while len(buf) >= 6 and buf[0] == 0x00 and buf[1] == 0x4F:
+                buf = buf[6:]
+            if not buf:
+                continue
+            if buf[0] in (0x06, 0x15):
+                return buf[0]
+            buf = buf[1:]
         return None
 
     @_serial_locked

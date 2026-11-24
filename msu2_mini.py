@@ -5843,7 +5843,9 @@ def cmd_selftest(port=None):
             continue
         tr = dev.transport
         fw = tr.fw_version
-        _console("  握手 %s，raw_mode=%s" % (tr.version or "?", tr.raw_mode))
+        _console("  握手 %s，raw_mode=%s"
+                     % (tr.version or ("OPMSU" if tr.raw_mode else "?"),
+                        tr.raw_mode))
         if fw:
             _console("  固件 %s" % format_fw_version(fw))
         else:
@@ -5982,6 +5984,15 @@ def cmd_selftest(port=None):
 
         # 6) 待机动画逐帧（v53 起）：让设备自己跑 10 次心跳
         if fwmaj >= 1:
+            saved = None
+            try:
+                _cur = tr.asset_info()
+                if _cur:
+                    saved = (_cur.get("boot_mode", 0), _cur.get("standby_mode", 1),
+                             _cur.get("count", 8), _cur.get("dwell", 3),
+                             _cur.get("boot_hold", 3))
+            except Exception:
+                saved = None
             tr.asset_settings(0, 3, 8, 3, boot_hold=3)
             dur = tr.anim_probe(10)
             if dur is None:
@@ -5989,7 +6000,11 @@ def cmd_selftest(port=None):
             else:
                 _console("  待机动画 10 步：%.0f ms（每步约 %.1f ms）"
                          % (dur * 1000.0, dur * 100.0))
-            tr.asset_settings(0, 1, 8, 3, boot_hold=3)
+            # 测完把用户原来的待机画面设置恢复回去
+            if saved:
+                tr.asset_settings(*saved)
+            else:
+                tr.asset_settings(0, 1, 8, 3, boot_hold=3)
 
         if ok == 4 and ok_full == 3:
             _console("  [PASS] 链路与回执正常")

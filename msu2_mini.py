@@ -13,6 +13,7 @@ import random
 import shutil
 import signal
 import subprocess
+import functools
 import sys
 import tempfile
 import threading
@@ -362,6 +363,19 @@ QUERY_IDLE = bytes((0x00, 0x57, 0x00, 0x00, 0x00, 0x00))
 IDLE_REPLY = b"\x57IDLE\xaa"
 
 
+def _serial_locked(fn):
+    """串口是独占的原生资源：任何一次 read/write/close 都必须互斥，
+    否则 pyserial 的 OVERLAPPED 缓冲可能被并发释放（表现为 0xc0000374 堆损坏）。"""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return fn(self, *args, **kwargs)
+        with lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class SerialTransport:
     def __init__(self, port, baud=SCREEN_BAUD, timeout=0.05):
         self.port = port; self.baud = baud; self.timeout = timeout
@@ -376,6 +390,7 @@ class SerialTransport:
         self.raw_mode = False
         self.last_status = None      # 调试模式下最近一帧的 11 字节详情（px/win/ms）
 
+    @_serial_locked
     def open(self):
         with self._lock:
             if self._connected and self._handshaked:
@@ -435,6 +450,7 @@ class SerialTransport:
                 log.warning("固件没有回应版本查询（可能是 v8 或更早的固件）")
             return True
 
+    @_serial_locked
     def close(self):
         with self._lock:
             if self._ser:
@@ -447,6 +463,7 @@ class SerialTransport:
     def connected(self):
         return self._connected and self._handshaked
 
+    @_serial_locked
     def write(self, data):
         with self._lock:
             if not self._connected or not self._ser:
@@ -472,6 +489,7 @@ class SerialTransport:
                 self._connected = False; self._handshaked = False
                 return False
 
+    @_serial_locked
     def resync(self, timeout=0.5):
         """把设备从“等像素”拉回“等命令”。
 
@@ -511,6 +529,7 @@ class SerialTransport:
                 self._connected = False; self._handshaked = False
                 return False
 
+    @_serial_locked
     def asset_info(self, timeout=1.5):
         """查设备上的资产：开机图是否有效、待机图哪几槽有效、当前设置。"""
         if self._ser is not None:
@@ -542,6 +561,7 @@ class SerialTransport:
                 time.sleep(0.01)
         return None
 
+    @_serial_locked
     def boot_report(self, timeout=1.0):
         """读开机自检结果位图（v47 起）：bit0 FLASH / bit1 TOUCH / bit2 LCD / bit3 USB / bit4 CFG"""
         if self._ser is None:
@@ -575,6 +595,7 @@ class SerialTransport:
             time.sleep(0.25)
         return False, "unknown"
 
+    @_serial_locked
     def _asset_write_once(self, kind, slot, payload, chunk=1024, gap=0.008,
                           timeout=8.0):
         import zlib
@@ -628,6 +649,7 @@ class SerialTransport:
             return False, "数据发完了，但设备没有回执（可能掉线）"
         return False, "设备校验没过（0x%02X），图没写进去" % st
 
+    @_serial_locked
     def _asset_reply(self, sub, timeout=3.0):
         """读资产命令的回执。
 
@@ -654,6 +676,7 @@ class SerialTransport:
                 time.sleep(0.005)
         return None
 
+    @_serial_locked
     def _wait_byte(self, timeout=2.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -665,6 +688,7 @@ class SerialTransport:
             time.sleep(0.005)
         return None
 
+    @_serial_locked
     def _reply_byte(self, cls_byte, sub, timeout=3.0):
         """Scan for a short reply frame ``cls sub status``; returns status or None."""
         end = time.monotonic() + timeout
@@ -682,6 +706,7 @@ class SerialTransport:
                 time.sleep(0.005)
         return None
 
+    @_serial_locked
     def _drain_upload_window(self):
         """Feed zeros so a half-open upload window on the device closes."""
         if self._ser is None:
@@ -693,6 +718,7 @@ class SerialTransport:
         except Exception:
             pass
 
+    @_serial_locked
     def flash_firmware(self, data, progress=None, chunk=1024):
         # 固件侧按 256 字节一页搬运，镜像长度必须是 256 的整数倍
         if len(data) % 256:
@@ -752,6 +778,7 @@ class SerialTransport:
         time.sleep(0.2)
         return True, "uploaded %d bytes, device is rebooting" % total
 
+    @_serial_locked
     def nor_read(self, addr, n=16, timeout=1.2):
         """读板载 NOR 原始字节（固件 v52 起，命令 0A 0C），用于自检抽查。"""
         n = max(1, min(int(n), 48))
@@ -778,6 +805,7 @@ class SerialTransport:
             time.sleep(0.08)
         return None
 
+    @_serial_locked
     def _boot_trace_once(self, timeout=1.2):
         self._ser.reset_input_buffer()
         self._ser.write(MiniProtocol.boot_trace())
@@ -791,6 +819,7 @@ class SerialTransport:
                         "boots": buf[i + 3] | (buf[i + 4] << 8)}
         return None
 
+    @_serial_locked
     def tile_check(self, sigs, timeout=2.5):
         """分块签名核对（固件 v58）：命令与 100 字节签名一次写完，设备回 10 字节掩码。
 
@@ -826,6 +855,7 @@ class SerialTransport:
             pass
         return None
 
+    @_serial_locked
     def asset_verify_check(self, kind, slot, timeout=8.0):
         """让设备把槽里的图回读一遍算 CRC（固件 v53 起），返回 (ok, crc16)。"""
         self._ser.reset_input_buffer()
@@ -839,6 +869,7 @@ class SerialTransport:
                 return (buf[i + 2] == 0x06, buf[i + 3] | (buf[i + 4] << 8))
         return (False, 0)
 
+    @_serial_locked
     def anim_probe(self, n=10, timeout=20.0):
         """让设备自己跑 n 次待机心跳（固件 v53 起），用来验证动画不会卡死。"""
         self._ser.reset_input_buffer()
@@ -853,6 +884,7 @@ class SerialTransport:
                 return time.monotonic() - t0
         return None
 
+    @_serial_locked
     def asset_draw(self, kind, slot, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
@@ -864,6 +896,7 @@ class SerialTransport:
             return False, "设备没有回执"
         return False, "设备上那个槽还没有图（先写入再预览）"
 
+    @_serial_locked
     def asset_erase(self, kind, slot, timeout=4.0):
         if self._ser is not None:
             self._ser.reset_input_buffer()
@@ -871,6 +904,7 @@ class SerialTransport:
         st = self._asset_reply(0x05, timeout)
         return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认擦除（%r）" % (st,))
 
+    @_serial_locked
     def asset_wipe(self, timeout=25.0):
         """抹掉板载 NOR 里的全部图片与设置（逐槽擦 4K，约 0.3 秒）。"""
         if self._ser is not None:
@@ -879,6 +913,7 @@ class SerialTransport:
         st = self._asset_reply(0x0A, timeout)
         return (st == 0x06), ("ok" if st == 0x06 else "设备没有确认抹除（%r）" % (st,))
 
+    @_serial_locked
     def asset_settings(self, boot_mode, standby_mode, count, dwell,
                        boot_hold=4, timeout=4.0):
         if self._ser is not None:
@@ -895,6 +930,7 @@ class SerialTransport:
             return True, "画面设置已保存；开机停留秒数需要固件 v37 及以上"
         return True, "ok"
 
+    @_serial_locked
     def wait_idle(self, timeout=0.8):
         """等到设备把上一帧吃完（v16 的 0x57 空闲探询）。
 
@@ -924,6 +960,7 @@ class SerialTransport:
                     time.sleep(0.002)
             return False
 
+    @_serial_locked
     def read_verdicts(self, count, timeout=0.4):
         """收 count 个裁决字节（0x06 好 / 0x15 坏），跳过握手噪声。
 
@@ -974,6 +1011,7 @@ class SerialTransport:
                     time.sleep(0.003)
             return (got >= count and not bad), got
 
+    @_serial_locked
     def read_all(self):
         with self._lock:
             if not self._connected or not self._ser:
@@ -985,6 +1023,7 @@ class SerialTransport:
                 self._connected = False; self._handshaked = False
                 return b""
 
+    @_serial_locked
     def query_version(self, timeout=0.4):
         """问固件版本；返回 (major, minor, touch) 或 None。
 
@@ -1015,6 +1054,7 @@ class SerialTransport:
                 log.debug("查询固件版本失败: %s", e)
             return None
 
+    @_serial_locked
     def devcfg_info(self, timeout=0.5):
         """读设备端存档（板载 NOR）。
 
@@ -1052,6 +1092,7 @@ class SerialTransport:
                 log.debug("读设备存档失败: %s", e)
             return None
 
+    @_serial_locked
     def devcfg_write(self, dim, orient, reverse, flags=0, timeout=3.0):
         """把配置写进设备 NOR；成功返回 True。擦除+编程约 20 ms，别和发帧抢串口。"""
         with self._lock:
@@ -1076,6 +1117,7 @@ class SerialTransport:
                 log.warning("写设备存档失败: %s", e)
             return False
 
+    @_serial_locked
     def set_debug(self, on):
         """开/关屏上调试标记；设备会自己写进 NOR，掉电也记得。"""
         with self._lock:
@@ -1095,6 +1137,7 @@ class SerialTransport:
                 log.warning("设置调试模式失败: %s", e)
                 return False
 
+    @_serial_locked
     def read_status(self, timeout=0.12):
         """收流后设备回的 16 字节状态帧（0x55 ... 0xAA）。
 
@@ -1138,6 +1181,7 @@ class SerialTransport:
                 time.sleep(0.004)
             return None
 
+    @_serial_locked
     def read_adc(self, ch, timeout=0.05):
         with self._lock:
             if not self._connected or not self._ser:
@@ -6005,8 +6049,8 @@ def cmd_selftest(port=None):
 
 
 def _data_dir():
-    """放日志与崩溃记录的地方；装到只读目录时退回用户目录。"""
-    bases = []
+    """日志、崩溃记录、上传文件都放在程序同目录；目录不可写才退回用户目录。"""
+    bases = [_APP_DIR]
     if os.name == "nt":
         la = os.environ.get("LOCALAPPDATA")
         if la:

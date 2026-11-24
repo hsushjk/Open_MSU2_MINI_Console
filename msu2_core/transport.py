@@ -76,7 +76,7 @@ class SerialTransport:
         self.last_status = None      # 调试模式下最近一帧的 11 字节详情（px/win/ms）
 
     @_serial_locked
-    def open(self, handshake_timeout=2.0):
+    def open(self, handshake_timeout=2.0, purge_retry=True):
         with self._lock:
             if self._connected and self._handshaked:
                 return True
@@ -113,6 +113,10 @@ class SerialTransport:
                 # 之后所有字节（包括我们的命令）都被它当像素吃掉，于是既不发问候
                 # 也不回版本。灌两整帧数量的 0（必须是 6 的整数倍，才不会把 6 字节
                 # 定界推错位）把这个窟窿填平，然后再握一次手。
+                if not purge_retry:
+                    # 探测别人的串口（蓝牙等）时不要灌 32 KB：那些口根本
+                    # 不认这套协议，灌进去只会白等好几秒。
+                    self.close(); return False
                 self._purge_stale_stream()
                 time.sleep(0.05)
                 if not self.handshake(timeout=handshake_timeout):

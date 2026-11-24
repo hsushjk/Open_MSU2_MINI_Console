@@ -4522,16 +4522,23 @@ def _pick_free_port(used):
     否则探测时打一遍“串口已打开 / 固件版本”，真正要用的实例还得再开一次。
     """
     try:
-        ports = [p.device for p in serial.tools.list_ports.comports()]
+        comports = list(serial.tools.list_ports.comports())
     except Exception:
         return ""
+    # 优先只看 USB CDC 口：蓝牙/虚拟串口打开一次要好几秒，而且永远握不上手。
+    usb = [c.device for c in comports
+           if "1A86" in (c.hwid or "").upper()
+           or "USB" in (c.hwid or "").upper()]
+    ports = usb if usb else [c.device for c in comports]
     for name in ports:
         if name in used:
             continue
         probe = MiniDevice(name)
         ok = False
         try:
-            ok = probe.open()
+            # 探测模式：只给 0.35 秒看有没有问候，失败就走人；
+            # 绝不往别人的串口灌 32 KB（蓝牙口会白等好几秒）。
+            ok = probe.open(handshake_timeout=0.35, purge_retry=False)
         except Exception:
             ok = False
         if ok:

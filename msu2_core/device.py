@@ -249,8 +249,9 @@ class MiniDevice:
         # 否则 Windows 会抛 WriteFile failed (PermissionError(13, ...))。
         self._suspended = False
 
-    def open(self, handshake_timeout=2.0):
-        ok = self.transport.open(handshake_timeout=handshake_timeout)
+    def open(self, handshake_timeout=2.0, purge_retry=True):
+        ok = self.transport.open(handshake_timeout=handshake_timeout,
+                                 purge_retry=purge_retry)
         if ok:
             self.encoder.reset()
             self._ack_fails = 0

@@ -145,6 +145,9 @@ def lcd_segment_payload(chunk):
 
 HEARTBEAT_INTERVAL = 2.0
 
+# 插件热加载：主循环每隔这么久查一次插件文件指纹（mtime+size）。
+RELOAD_POLL = 2.0
+
 TOUCH_CH = 9
 TOUCH_SAMPLE_INTERVAL = 0.03
 TOUCH_LONG_PRESS = 0.8
@@ -1875,6 +1878,7 @@ def _coerce_int(value, default, lo=None, hi=None):
     return v
 
 def _widget_watch_dirs():
+    """热加载要监视的插件目录：包内 widgets 目录 + 所有外挂插件候选目录。"""
     dirs = []
     try:
         base = getattr(_widgets_pkg, "_pkg_path", None)
@@ -1882,9 +1886,27 @@ def _widget_watch_dirs():
             dirs.append(Path(base))
         for item in list(getattr(_widgets_pkg, "_ext_dirs", []) or []):
             dirs.append(Path(item))
+        # 外挂目录可能还没建，_ext_dirs 里没有；_candidate_dirs 每次现算。
+        for item in _widgets_pkg._candidate_dirs():
+            dirs.append(Path(item))
     except Exception:
         pass
-    return dirs
+    out, seen = [], set()
+    for d in dirs:
+        try:
+            key = str(d.resolve())
+        except Exception:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if not d.is_dir():
+                continue
+        except OSError:
+            continue
+        out.append(d)
+    return out
 
 def _build_overlay(text, orientation):
     w, h = (PORTRAIT_SIZE if orientation == PORTRAIT else LANDSCAPE_SIZE)
@@ -1972,8 +1994,12 @@ class Scheduler(threading.Thread):
         self._frames_window = collections.deque()
         self.metrics = {"frames": 0, "bytes": 0, "reconnects": 0,
                         "render_ms": {}, "touch": 0}
-        self._watch_mtime = 0.0
-        self._watch_ts = 0.0
+        # 插件热加载：指纹 {文件路径: (mtime_ns, size)}；_reload_pending 防止
+        # 一次重载还没落地又排队下一次。
+        self._plugin_scan_lock = threading.Lock()
+        self._plugin_fp = None
+        self._plugin_scan_ts = 0.0
+        self._reload_pending = False
 
         self._touch_baseline = None
         self._touch_last_sample_ts = 0.0
@@ -2116,6 +2142,9 @@ class Scheduler(threading.Thread):
                     self._apply_background()
             except Exception as e:
                 log.warning("后台任务 %s 失败: %s", op, e)
+            finally:
+                if op == "reload":
+                    self._reload_pending = False
 
     def _teardown_all(self):
         for w in list(self._widgets):
@@ -2523,38 +2552,66 @@ class Scheduler(threading.Thread):
         self.metrics["_bytes_last"] = total
         self.metrics["bytes"] = int(self.metrics.get("bytes", 0)) + delta
         self._frames_window.append((mono, delta))
-    def _watch_widgets(self, mono):
-        if mono - self._watch_ts < 1.5:
-            return
-        self._watch_ts = mono
-        stamp = 0.0
-        for d in _widget_watch_dirs():
+    @staticmethod
+    def _plugin_fingerprint(dirs):
+        """采集插件文件指纹：顶层 *.py 与 */__init__.py，取 (mtime_ns, size)。"""
+        fp = {}
+        for d in dirs:
             try:
                 entries = list(d.iterdir())
-            except Exception:
+            except Exception as e:
+                log.warning("插件目录扫描失败: %s (%s)", d, e)
                 continue
             for f in entries:
                 try:
                     if f.is_dir():
                         target = f / "__init__.py"
-                        if not target.exists():
+                        if not target.is_file():
                             continue
-                    elif f.suffix == ".py":
+                    elif f.suffix == ".py" and f.is_file():
                         target = f
                     else:
                         continue
-                    m = target.stat().st_mtime
-                except Exception:
+                    st = target.stat()
+                except OSError:
                     continue
-                if m > stamp:
-                    stamp = m
-        if self._watch_mtime == 0.0:
-            self._watch_mtime = stamp
+                fp[str(target)] = (st.st_mtime_ns, st.st_size)
+        return fp
+
+    def _check_plugin_changes(self, mono):
+        """低频检查插件文件变化，有变化就自动重载。设备离线时也照常检查。"""
+        if self._plugin_fp is not None and mono - self._plugin_scan_ts < RELOAD_POLL:
             return
-        if stamp > self._watch_mtime:
-            self._watch_mtime = stamp
-            log.info("检测到插件文件变化，正在重新加载")
-            self.post_op("reload")
+        if self._reload_pending:
+            return
+        with self._plugin_scan_lock:
+            self._plugin_scan_ts = mono
+            try:
+                new_fp = self._plugin_fingerprint(_widget_watch_dirs())
+            except Exception as e:
+                log.warning("插件热加载扫描失败: %s", e)
+                return
+            old_fp = self._plugin_fp
+            self._plugin_fp = new_fp
+        if old_fp is None:
+            return                      # 第一次只建立基线
+        changed = 0
+        for path, sig in new_fp.items():
+            if old_fp.get(path) != sig:
+                changed += 1
+        for path in old_fp:
+            if path not in new_fp:
+                changed += 1
+        if changed <= 0:
+            return
+        self._reload_pending = True
+        try:
+            self.reload()
+        except Exception as e:
+            self._reload_pending = False
+            log.warning("插件热加载失败: %s", e)
+            return
+        log.info("检测到插件变化，已自动重载（%d 个文件变化）", changed)
 
     def metrics_snapshot(self):
         now = time.monotonic()
@@ -2571,6 +2628,7 @@ class Scheduler(threading.Thread):
             "fps": round(fps, 2),
             "bytes_per_sec": int(bps),
             "frames": int(self.metrics.get("frames", 0)),
+            "composites": int(self.metrics.get("composites", 0)),
             "bytes": int(self.metrics.get("bytes", 0)),
             "reconnects": int(self.metrics.get("reconnects", 0)),
             "touch": int(self.metrics.get("touch", 0)),
@@ -2734,6 +2792,12 @@ class Scheduler(threading.Thread):
         return img
 
     def _composite_impl(self, widget_img, mono):
+        """把背景与插件图层合成为一帧。
+
+        每次调用都重新做 alpha 合成，不缓存成品帧；只有背景图的解码/缩放
+        可以继续用 Background.tick 里的缓存。顺序固定不变：
+        合成 -> 伪亮度 LUT（_dim）-> 上下翻转（reverse），然后才发给设备。
+        """
         bg = self.background.tick(mono)
         if bg is None:
             canvas = Image.new("RGBA", (SCREEN_W, SCREEN_H), "black")
@@ -2757,6 +2821,16 @@ class Scheduler(threading.Thread):
         if self.reverse:
             out = out.rotate(180)
         return out
+
+    def _send_frame(self, widget_img, mono):
+        """合成一帧并发给设备。
+
+        所有发帧路径都走这里：只要这一帧要发，就重新走一遍 Pillow 合成
+        （背景 + 插件图层），不允许复用上一次的合成结果。成功返回 True。
+        """
+        frame = self._composite(widget_img, mono)
+        self.metrics["composites"] = int(self.metrics.get("composites", 0)) + 1
+        return self.device.show_image(frame)
 
     def _handle_switch(self):
         widgets = self._widgets
@@ -2803,6 +2877,11 @@ class Scheduler(threading.Thread):
         try:
             while not self._stop.is_set():
                 try:
+                    # 插件热加载：先查插件文件，再排空后台操作（reload 也走队列）。
+                    # 放在设备连接检查之前，设备离线时改插件也能自动重载。
+                    self._check_plugin_changes(time.monotonic())
+                    self._drain_ops()
+
                     if not self.device.connected:
                         if not self.device.open():
                             self._rediscover()
@@ -2812,9 +2891,6 @@ class Scheduler(threading.Thread):
                         last_mono = 0.0
                         last_bg_ts = 0.0
                         self._devcfg_boot_sync()
-
-                    self._drain_ops()
-                    self._watch_widgets(time.monotonic())
 
                     if self._devcfg_dirty:
                         self._flush_devcfg()
@@ -2875,12 +2951,12 @@ class Scheduler(threading.Thread):
                         key = id(overlay)
                         if key != self._overlay_seen or self._force_send:
                             self._overlay_seen = key
-                            if self.device.show_image(self._composite(overlay, mono)):
+                            if self._send_frame(overlay, mono):
                                 self._last_send_mono = mono
                                 self._count_frame(mono)
                                 self._force_send = False
                             else:
-                                self._force_send = True      # ???????????
+                                self._force_send = True      # 发送失败，下一轮强制重发
                     elif need_render:
                         last_mono = mono
                         t0 = time.perf_counter()
@@ -2901,7 +2977,7 @@ class Scheduler(threading.Thread):
                         if img is not None or need_bg or self._force_send:
                             frame = img if img is not None else self._last_imgs.get(w.name)
                             if frame is not None or need_bg:
-                                if self.device.show_image(self._composite(frame, mono)):
+                                if self._send_frame(frame, mono):
                                     self._last_send_mono = mono
                                     self._count_frame(mono)
                                     self._force_send = False
@@ -2911,8 +2987,7 @@ class Scheduler(threading.Thread):
                                   w.name, cost, (time.perf_counter() - t0) * 1000.0)
                     elif need_bg:
                         last_bg_ts = mono
-                        if self.device.show_image(
-                                self._composite(self._last_imgs.get(w.name), mono)):
+                        if self._send_frame(self._last_imgs.get(w.name), mono):
                             self._last_send_mono = mono
                             self._count_frame(mono)
                         else:

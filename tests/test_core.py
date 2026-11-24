@@ -4,7 +4,9 @@
 """
 import io
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -225,6 +227,100 @@ class RepairTests(unittest.TestCase):
         self.assertTrue(dev.transport.writes)
         enc_reset = dev.encoder._last_raw is None
         self.assertTrue(enc_reset)
+
+
+class HotReloadTests(unittest.TestCase):
+    """插件热加载：指纹变化才重载，且一次变化只排一次 reload。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="msu2_hot_")
+        self.plugin = os.path.join(self.tmp, "hot_plugin.py")
+        with io.open(self.plugin, "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        self._old_env = os.environ.get(M._widgets_pkg._EXT_DIR_ENV)
+        os.environ[M._widgets_pkg._EXT_DIR_ENV] = self.tmp
+        self.sched = M.Scheduler(M.OfflineDevice(), {"pages": []})
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop(M._widgets_pkg._EXT_DIR_ENV, None)
+        else:
+            os.environ[M._widgets_pkg._EXT_DIR_ENV] = self._old_env
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _bump(self, text="y = 2\n"):
+        with io.open(self.plugin, "a", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_change_posts_exactly_one_reload(self):
+        sched = self.sched
+        sched._check_plugin_changes(0.0)      # 建立基线
+        self.assertEqual(len(sched._ops), 0)
+        sched._check_plugin_changes(1.0)      # 不到 RELOAD_POLL：跳过
+        self.assertEqual(len(sched._ops), 0)
+        sched._check_plugin_changes(3.0)      # 到点但没变化：不重载
+        self.assertEqual(len(sched._ops), 0)
+        self._bump()
+        with self.assertLogs("msu2", level="INFO") as cm:
+            sched._check_plugin_changes(6.0)
+        self.assertEqual(len(sched._ops), 1)
+        self.assertEqual(sched._ops[0][0], "reload")
+        self.assertTrue(any("检测到插件变化，已自动重载（1 个文件变化）" in line
+                            for line in cm.output), cm.output)
+        self.assertTrue(sched._reload_pending)
+        sched._check_plugin_changes(9.0)      # 上次重载还没落地：不重复排队
+        self.assertEqual(len(sched._ops), 1)
+        sched._drain_ops()                    # 主循环里真正执行 reload
+        self.assertFalse(sched._reload_pending)
+        sched._check_plugin_changes(12.0)     # 已处理完、文件没再变：不重载
+        self.assertEqual(len(sched._ops), 0)
+
+    def test_failure_is_caught_and_does_not_block_later_scans(self):
+        sched = self.sched
+        sched._check_plugin_changes(0.0)
+        self._bump()
+        sched.reload = lambda: (_ for _ in ()).throw(RuntimeError("reload boom"))
+        with self.assertLogs("msu2", level="WARNING") as cm:
+            sched._check_plugin_changes(3.0)
+        self.assertTrue(any("插件热加载失败" in line for line in cm.output), cm.output)
+        self.assertFalse(sched._reload_pending)   # 失败后允许下一次检测
+        self.assertEqual(len(sched._ops), 0)
+
+    def test_watch_dirs_cover_package_and_external_dirs(self):
+        dirs = [os.path.normcase(str(d)) for d in M._widget_watch_dirs()]
+        self.assertIn(os.path.normcase(self.tmp), dirs)
+        self.assertIn(os.path.normcase(str(M._widgets_pkg._pkg_path)), dirs)
+
+
+class CompositeTests(unittest.TestCase):
+    """每帧都必须重新合成：背景变化后发出去的帧必须跟着变。"""
+
+    def make(self, **cfg):
+        cfg.setdefault("pages", [])
+        return M.Scheduler(M.OfflineDevice(), cfg)
+
+    def test_each_send_recomposes_with_current_background(self):
+        sched = self.make()
+        sched.background.frames = [Image.new("RGB", (160, 80), (255, 0, 0))]
+        self.assertTrue(sched._send_frame(None, 0.0))
+        self.assertEqual(sched.device.last.getpixel((0, 0)), (255, 0, 0))
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 0, 255))]
+        self.assertTrue(sched._send_frame(None, 0.0))
+        self.assertEqual(sched.device.last.getpixel((0, 0)), (0, 0, 255))
+        self.assertEqual(sched.metrics["composites"], 2)
+        self.assertLess(sched.metrics["comp_ms"], 15.0)
+
+    def test_dim_and_reverse_apply_after_composite(self):
+        sched = self.make(display={"dim": 50}, reverse=True)
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 0, 200))]
+        layer = Image.new("RGBA", (160, 80), (0, 0, 0, 0))
+        layer.paste((255, 0, 0, 255), (0, 0, 80, 80))   # 左半屏不透明红
+        sched._send_frame(layer, 0.0)
+        out = sched.device.last
+        self.assertEqual(out.size, (160, 80))
+        # 先合成（左红右蓝）-> 压暗 50% -> 180° 翻转：左右互换
+        self.assertEqual(out.getpixel((0, 0)), (0, 0, 100))
+        self.assertEqual(out.getpixel((159, 0)), (127, 0, 0))
 
 
 if __name__ == "__main__":

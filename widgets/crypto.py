@@ -331,10 +331,7 @@ class CryptoWidget(Widget):
         return img
 
     def _pages(self, ctx, ids):
-        try:
-            W, H = ctx.size
-        except Exception:
-            W, H = 160, 80
+        H = ctx.size[1]
         cols = 2 if ctx.orientation == LANDSCAPE else 1
         rows = max(1, H // 44)
         per = max(1, cols * rows)

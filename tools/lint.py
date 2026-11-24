@@ -1,8 +1,10 @@
-"""未定义名门禁：防止拆包/移动代码时漏 import（F821）、重复定义（F811）。
+"""静态检查门禁：未定义名（F821）、重复定义（F811）、没用的 import（F401）、
+没用的变量（F841）。这几个都是“改代码时真的会咬人”的问题，但不会因为风格
+偏好（行宽、引号、空行）把人卡住。
 
-优先用 ruff（`python -m ruff check --select F821,F811`），没装 ruff 就退回
-pyflakes。两者都没装时只打印提示并以 0 退出 —— 门禁尽量严格，但绝不因为
-开发机没装 linter 就把构建/测试硬卡死。
+优先用 ruff（`python -m ruff check --select F821,F811,F401,F841`），没装 ruff
+就退回 pyflakes。两者都没装时只打印提示并以 0 退出 —— 门禁尽量严格，但绝不
+因为开发机没装 linter 就把构建/测试硬卡死。
 
 用法（仓库根目录，提交前跑）：
 
@@ -18,7 +20,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = ("msu2_mini.py", "msu2_core", "widgets", "tests", "tools")
-SELECT = "F821,F811"          # F821 未定义名；F811 重复定义（会盖掉 import）
+# F821 未定义名；F811 重复定义；F401 没用的 import；F841 没用的局部变量
+SELECT = "F401,F811,F821,F841"
 
 
 def source_files(extra_paths=None):
@@ -78,8 +81,23 @@ def _pyflakes_problems(paths):
     from pyflakes import api
     from pyflakes import messages as msgmod
 
-    wanted = (msgmod.UndefinedName, msgmod.RedefinedWhileUnused)
+    wanted = (msgmod.UndefinedName, msgmod.RedefinedWhileUnused,
+              msgmod.UnusedImport, msgmod.UnusedVariable)
     problems = []
+    line_cache = {}
+
+    def _has_noqa(filename, lineno):
+        """pyflakes 不认识 # noqa，这里自己按源码行过滤（和 ruff 行为对齐）。"""
+        if filename not in line_cache:
+            try:
+                with open(filename, encoding="utf-8", errors="replace") as fh:
+                    line_cache[filename] = fh.readlines()
+            except OSError:
+                line_cache[filename] = []
+        lines = line_cache[filename]
+        if 1 <= lineno <= len(lines):
+            return "noqa" in lines[lineno - 1]
+        return False
 
     class _Reporter:
         def unexpectedError(self, filename, msg):
@@ -89,8 +107,11 @@ def _pyflakes_problems(paths):
             problems.append("%s:%s: %s" % (filename, lineno, msg))
 
         def flake(self, message):
-            if isinstance(message, wanted):
-                problems.append(str(message))
+            if not isinstance(message, wanted):
+                return
+            if _has_noqa(message.filename, message.lineno):
+                return
+            problems.append(str(message))
 
     reporter = _Reporter()
     for path in paths:
@@ -121,8 +142,8 @@ def main(argv=None):
     if not files:
         print("没有找到可扫描的 .py 文件")
         return 0
-    print("[%s] 扫描 %d 个文件（F821 未定义名 / F811 重复定义）…"
-          % (backend, len(files)))
+    print("[%s] 扫描 %d 个文件（F821 未定义名 / F811 重复定义 / "
+          "F401 没用的 import / F841 没用的变量）…" % (backend, len(files)))
     try:
         problems = collect(backend, argv)
     except Exception as exc:
@@ -133,7 +154,7 @@ def main(argv=None):
         for line in problems:
             print("  " + line)
         return 1
-    print("OK：未发现未定义名或重复定义")
+    print("OK：未发现未定义名、重复定义、没用的 import 或没用的变量")
     return 0
 
 

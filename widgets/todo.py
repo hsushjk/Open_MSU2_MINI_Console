@@ -410,7 +410,6 @@ class TodoWidget(Widget):
         box = line_h - 4
         if box < 6:
             box = 6
-        text_x = 4 + box + 5
         max_text_w = W - 8 - box - 5
         if max_text_w < 1:
             max_text_w = 1

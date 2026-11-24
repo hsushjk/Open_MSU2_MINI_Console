@@ -315,7 +315,7 @@ def _pick_source():
         return _NullSource()
     if sys.platform.startswith("linux"):
         try:
-            import dbus
+            import dbus  # noqa: F401  (只用来检查依赖装没装)
             log.info("音乐插件: D-Bus MPRIS")
             return _LinuxMPRIS()
         except ImportError:

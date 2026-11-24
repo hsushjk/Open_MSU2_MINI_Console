@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import select
 import sys
 import threading
 import time
@@ -59,6 +61,10 @@ def _serial_locked(fn):
         with lock:
             return fn(self, *args, **kwargs)
     return wrapper
+
+
+_POSIX_NB = (os.name == "posix")
+_NB_PIECE = 2048        # 实测最优分片：26 KB 整帧 50 ms（≈500 KB/s）
 
 
 class SerialTransport:
@@ -184,6 +190,49 @@ class SerialTransport:
     def connected(self):
         return self._connected and self._handshaked
 
+    def _write_raw(self, data):
+        """把整段字节写进串口：POSIX 用非阻塞 os.write + select。
+
+        usbmon 实测：Linux 的 cdc_acm 写路径在缓冲满时会丢掉 wakeup，主机
+        519 ms 内一笔 OUT URB 都没提交（设备侧既没有 NAK，DMA 也没有超时），
+        pyserial 的阻塞写因此每帧随机卡 1~2 次、26 KB 要 700~1600 ms。
+        换成 O_NONBLOCK + select（2048 B 一片）后同样的载荷 50 ms 写完，
+        约 500 KB/s，且不再出现卡顿。
+        """
+        if self._ser is None:
+            return 0
+        view = memoryview(bytes(data))
+        total = len(view)
+        if total <= 0:
+            return 0
+        if not _POSIX_NB:
+            return self._ser.write(view) or 0
+        fd = self._ser.fileno()
+        try:
+            os.set_blocking(fd, False)
+        except (AttributeError, OSError):
+            pass
+        sent = 0
+        t0 = time.monotonic()
+        while sent < total:
+            if time.monotonic() - t0 > 3.0:
+                raise IOError("写入卡住（3 秒没有进展）")
+            take = min(total - sent, _NB_PIECE)
+            piece = view[sent:sent + take]
+            off = 0
+            while off < take:
+                try:
+                    n = os.write(fd, piece[off:])
+                except BlockingIOError:
+                    select.select([], [fd], [], 0.2)
+                    continue
+                if n <= 0:
+                    select.select([], [fd], [], 0.2)
+                    continue
+                off += n
+            sent += take
+        return sent
+
     @_serial_locked
     def _purge_stale_stream(self, total=32004):
         # 灌一整帧还多一点的 0x00，把设备“等像素”的 raw_left 填平。
@@ -198,7 +247,7 @@ class SerialTransport:
             take -= take % 6
             for _attempt in range(3):
                 try:
-                    self._ser.write(bytes(take))
+                    self._write_raw(bytes(take))
                     break
                 except Exception:
                     time.sleep(0.01)
@@ -215,6 +264,16 @@ class SerialTransport:
         with self._lock:
             if not self._connected or not self._ser:
                 return False
+            if _POSIX_NB:
+                # Linux: pyserial 的阻塞写在 cdc_acm 上会随机卡 500 ms（见 _write_raw）
+                try:
+                    self._write_raw(data)
+                    self.bytes_written += len(data)
+                    return True
+                except Exception as e:
+                    log.warning("写入失败: %s", e)
+                    self._connected = False; self._handshaked = False
+                    return False
             try:
                 view = memoryview(bytes(data))
                 total = len(view)
@@ -223,7 +282,7 @@ class SerialTransport:
                 stuck = 0
                 while sent < total:
                     try:
-                        n = self._ser.write(view[sent:]) or 0
+                        n = self._write_raw(view[sent:]) or 0
                     except serial.SerialTimeoutException:
                         # 设备接收环满了（NAK）：这不是链路坏了，等一会儿再续。
                         # 只要 3 秒内还有进展就不算失败，日志降成 DEBUG 免得刷屏。
@@ -272,10 +331,10 @@ class SerialTransport:
                 self._ser.reset_input_buffer()
                 # 对齐垫（与 open() 同一套）：先补一整帧 0x00，再等设备自己把
                 # 半帧残包按“空闲 100 ms”丢掉，然后才清接收缓冲、发空帧。
-                self._ser.write(b"\x00" * 6)
+                self._write_raw(b"\x00" * 6)
                 time.sleep(0.25)
                 self._ser.reset_input_buffer()
-                self._ser.write(END_FRAME)        # 0 像素的收流：flush + 归零 + 裁决
+                self._write_raw(END_FRAME)        # 0 像素的收流：flush + 归零 + 裁决
                 time.sleep(0.05)
                 deadline = time.monotonic() + timeout
                 got = b""
@@ -482,7 +541,7 @@ class SerialTransport:
         if self._ser is None:
             return
         try:
-            self._ser.write(b"\x00" * 4096)
+            self._write_raw(b"\x00" * 4096)
             time.sleep(0.15)
             self._ser.reset_input_buffer()
         except Exception:
@@ -501,15 +560,15 @@ class SerialTransport:
         self._ser.reset_input_buffer()
         # Close any half-open frame and reset the device's per-session byte budget
         # (firmware >= v59 drops everything once 40 KB has gone through without a reset).
-        self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
-        self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
-        self._ser.write(MiniProtocol.lcd_enter_direct_mode())
-        self._ser.write(MiniProtocol.lcd_raw_end())
+        self._write_raw(MiniProtocol.lcd_set_xy(0, 0))
+        self._write_raw(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
+        self._write_raw(MiniProtocol.lcd_enter_direct_mode())
+        self._write_raw(MiniProtocol.lcd_raw_end())
         time.sleep(0.05)
         self._ser.reset_input_buffer()
         r = None
         for attempt in range(3):
-            self._ser.write(MiniProtocol.flash_begin(total))
+            self._write_raw(MiniProtocol.flash_begin(total))
             r = self._reply_byte(0x0A, 0x12, 6.0)
             if r == 0x06:
                 break
@@ -517,10 +576,10 @@ class SerialTransport:
             log.warning("上传握手没有回应（第 %d 次，0x%02X），收尾后重试", attempt + 1,
                         r if r is not None else 0)
             self._drain_upload_window()
-            self._ser.write(MiniProtocol.lcd_set_xy(0, 0))
-            self._ser.write(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
-            self._ser.write(MiniProtocol.lcd_enter_direct_mode())
-            self._ser.write(MiniProtocol.lcd_raw_end())
+            self._write_raw(MiniProtocol.lcd_set_xy(0, 0))
+            self._write_raw(MiniProtocol.lcd_set_size(SCREEN_W, SCREEN_H))
+            self._write_raw(MiniProtocol.lcd_enter_direct_mode())
+            self._write_raw(MiniProtocol.lcd_raw_end())
             time.sleep(0.4)
             self._ser.reset_input_buffer()
         if r != 0x06:
@@ -529,8 +588,8 @@ class SerialTransport:
         pos = 0
         while pos < total:
             part = data[pos:pos + chunk]
-            self._ser.write(MiniProtocol.flash_window(len(part)))
-            self._ser.write(part)
+            self._write_raw(MiniProtocol.flash_window(len(part)))
+            self._write_raw(part)
             r = self._reply_byte(0x0A, 0x12, 6.0)
             if r != 0x06:
                 self._drain_upload_window()
@@ -539,12 +598,12 @@ class SerialTransport:
             if progress:
                 progress(pos, total)
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        self._ser.write(MiniProtocol.flash_commit(crc))
+        self._write_raw(MiniProtocol.flash_commit(crc))
         r = self._reply_byte(0x13, 0x00, 8.0)
         if r != 0x06:
             self._drain_upload_window()
             return False, "CRC check failed on the device (0x%02X)" % (r if r is not None else 0)
-        self._ser.write(MiniProtocol.flash_apply())
+        self._write_raw(MiniProtocol.flash_apply())
         # 收到 [OK] uploaded 后设备立刻重启：马上关串口，从这里起一个字节都不写。
         # 旧代码 sleep(0.2) 的“礼貌等待”正好让调度器往正在重启的句柄里塞像素帧，
         # Windows 上就是 WriteFile failed (PermissionError(13, ...)) 刷屏。
@@ -557,7 +616,7 @@ class SerialTransport:
         """读板载 NOR 原始字节（固件 v52 起，命令 0A 0C），用于自检抽查。"""
         n = max(1, min(int(n), 48))
         self._ser.reset_input_buffer()
-        self._ser.write(MiniProtocol._frame(0x0A, 0x0C,
+        self._write_raw(MiniProtocol._frame(0x0A, 0x0C,
                                             (addr >> 16) & 0xFF,
                                             (addr >> 8) & 0xFF,
                                             addr & 0xFF, n))
@@ -653,7 +712,7 @@ class SerialTransport:
     @_serial_locked
     def _boot_trace_once(self, timeout=1.2):
         self._ser.reset_input_buffer()
-        self._ser.write(MiniProtocol.boot_trace())
+        self._write_raw(MiniProtocol.boot_trace())
         end = time.monotonic() + timeout
         buf = b""
         while time.monotonic() < end:
@@ -681,7 +740,7 @@ class SerialTransport:
         # （设备每次都按序收下 100 字节，不会残留状态）。
         for _attempt in range(3):
             self._ser.reset_input_buffer()
-            self._ser.write(payload)
+            self._write_raw(payload)
             end = time.monotonic() + timeout / 3.0
             buf = b""
             while time.monotonic() < end:
@@ -695,7 +754,7 @@ class SerialTransport:
             time.sleep(0.02)
         # 没等到回包：把 100 字节补齐，别让设备停在“等签名”的状态里
         try:
-            self._ser.write(bytes(TILE_N * 2))
+            self._write_raw(bytes(TILE_N * 2))
         except Exception:
             pass
         return None
@@ -704,7 +763,7 @@ class SerialTransport:
     def asset_verify_check(self, kind, slot, timeout=8.0):
         """让设备把槽里的图回读一遍算 CRC（固件 v53 起），返回 (ok, crc16)。"""
         self._ser.reset_input_buffer()
-        self._ser.write(MiniProtocol.asset_verify(kind, slot))
+        self._write_raw(MiniProtocol.asset_verify(kind, slot))
         end = time.monotonic() + timeout
         buf = b""
         while time.monotonic() < end:
@@ -719,7 +778,7 @@ class SerialTransport:
         """让设备自己跑 n 次待机心跳（固件 v53 起），用来验证动画不会卡死。"""
         self._ser.reset_input_buffer()
         t0 = time.monotonic()
-        self._ser.write(MiniProtocol.anim_probe(n))
+        self._write_raw(MiniProtocol.anim_probe(n))
         end = time.monotonic() + timeout
         buf = b""
         while time.monotonic() < end:
@@ -823,7 +882,7 @@ class SerialTransport:
                 return None
             try:
                 self._ser.reset_input_buffer()
-                self._ser.write(bytes([0x00, 0x56, 0, 0, 0, 0]))
+                self._write_raw(bytes([0x00, 0x56, 0, 0, 0, 0]))
                 t0 = time.monotonic()
                 buf = bytearray()
                 waited = False
@@ -873,7 +932,7 @@ class SerialTransport:
                 return None
             try:
                 self._ser.reset_input_buffer()
-                self._ser.write(MiniProtocol.devcfg_info())
+                self._write_raw(MiniProtocol.devcfg_info())
                 t0 = time.monotonic()
                 buf = bytearray()
                 while time.monotonic() - t0 < timeout:
@@ -907,7 +966,7 @@ class SerialTransport:
                 return False
             try:
                 self._ser.reset_input_buffer()
-                self._ser.write(MiniProtocol.devcfg_write(dim, orient,
+                self._write_raw(MiniProtocol.devcfg_write(dim, orient,
                                                           reverse, flags))
                 t0 = time.monotonic()
                 buf = bytearray()

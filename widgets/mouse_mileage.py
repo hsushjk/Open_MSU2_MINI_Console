@@ -31,7 +31,7 @@ def _data_dir():
 
 
 def _migrate_legacy(path):
-    """把旧版放在 %LOCALAPPDATA%\MSU2_MINI 里的数据搬过来。"""
+    r"""把旧版放在 %LOCALAPPDATA%\MSU2_MINI 里的数据搬过来。"""
     try:
         import shutil
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")

@@ -310,8 +310,8 @@ class MiniDevice:
     def _write_paced(self, payload):
         """把整帧按 2 KB 分块、带间隔写进串口（限速可自适应）。"""
         seg_write = 2048
-        rate = max(40000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
-        gap = seg_write / rate
+        rate = max(120000.0, min(240000.0, getattr(self, "_pace_bps", 140000.0)))
+        gap = min(0.010, seg_write / rate)   # 空洞绝不超过 10 ms
         for i in range(0, len(payload), seg_write):
             if not self.transport.write(payload[i:i + seg_write]):
                 return False

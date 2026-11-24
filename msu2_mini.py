@@ -29,7 +29,7 @@ else:
 _HERE = str(_APP_DIR)
 
 
-__version__ = "1.0.9"
+__version__ = "1.0.13"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
@@ -4532,6 +4532,19 @@ def _check_widget_values(schema, values):
 _PROBED = {}
 
 
+
+def _usb_ports():
+    """串口候选：优先 hwid 含 1A86/USB 的 USB CDC 口，没有再退回全量。
+
+    Linux 上还有 /dev/ttyS0..3 这类主板串口，打开它们会报 I/O error 且白等几秒；
+    蓝牙虚拟串口同理。探测/自检都应该避开。
+    """
+    comports = list(serial.tools.list_ports.comports())
+    usb = [c.device for c in comports
+           if "1A86" in (c.hwid or "").upper() or "USB" in (c.hwid or "").upper()]
+    return usb or [c.device for c in comports]
+
+
 def _pick_free_port(used):
     """自动挑一个能握手的串口。
 
@@ -5768,7 +5781,7 @@ def cmd_flash(path, port=None):
         _console("读不了固件: %s" % e)
         return 2
     _console("固件 %s: %d 字节（%s）" % (os.path.basename(path), len(data), note))
-    names = [port] if port else [p.device for p in serial.tools.list_ports.comports()]
+    names = [port] if port else _usb_ports()   # 只挑 USB CDC，别去开 /dev/ttyS*
     if not names:
         _console("没有找到串口设备")
         return 2
@@ -5817,7 +5830,7 @@ def cmd_flash(path, port=None):
 
 def cmd_selftest(port=None):
     """--selftest：不开界面，直接体检设备（握手 / 版本 / 触摸 / 整帧链路 / 逐帧回执）。"""
-    names = [port] if port else [p.device for p in serial.tools.list_ports.comports()]
+    names = [port] if port else _usb_ports()   # 只挑 USB CDC，别去开 /dev/ttyS*
     if not names:
         _console("没有找到串口设备")
         return 2

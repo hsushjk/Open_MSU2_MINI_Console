@@ -167,16 +167,18 @@ python msu2_mini.py --port /dev/serial/by-id/usb-MSU2_MSU2_MINI_*
 ## 打包
 
 ```powershell
-python -m PyInstaller --noconfirm --clean MSU2_Console_Open.spec
+python tools/build_exe.py --mode console --name MSU2_Console_Open
 ```
 
-也可使用 `python tools/build_exe.py` 生成不同入口与架构的程序。需要随包携带的资源如下（spec 中已固定）：
+`--mode` 可选 `console` 或 `noconsole`；`--name` 决定产物名；`--no-numpy` 在不需要加速的平台上剔除 numpy。脚本固定以下选项：
 
-- `--onefile --console`，图标为 `icon.ico`；
-- `--add-data "icon.ico;."`、`--add-data "msu2_core;msu2_core"`、`--add-data "widgets;widgets"`，插件在运行时按目录发现，二者必须一起打包；
-- `--collect-submodules` 覆盖 `msu2_core`、`widgets`、`PIL`；
-- `--optimize 1`；
-- 打包后从元数据中剔除 `PIL\_avif.pyd`，该扩展仅用于 AVIF 图片，界面与插件均不使用。
+- `--onefile`、`--optimize 1`、`--noconfirm --clean`；
+- 图标同时作为运行时资源与可执行文件图标（`--add-data "icon.ico;."`、`--icon icon.ico`）；
+- `--add-data` 携带 `msu2_core` 与 `widgets`，插件在运行时按目录发现，两者必须一起打包；
+- 对 `msu2_core`、`widgets`、`PIL` 做 `--collect-submodules`；
+- 主机上未安装的可选依赖（pynput、numpy、pywin32 等）自动排除。
+
+产物在 `dist\`。
 
 ## 测试
 

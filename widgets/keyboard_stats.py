@@ -1,4 +1,5 @@
 import logging
+import atexit
 import os
 import threading
 import time
@@ -41,6 +42,26 @@ def _load_saved():
         return day, n
     except Exception:
         return None
+
+
+_LIVE = {"st": None}
+
+
+def _flush_on_exit():
+    """进程退出时补一次落盘：render 里 30 秒才存一次，直接关窗口会丢掉最后一小段。"""
+    st = _LIVE.get("st")
+    if not isinstance(st, dict):
+        return
+    try:
+        today = int(st.get("today") or 0)
+        if today != int(st.get("_saved_count") or 0):
+            _save_saved(_today_key(), today)
+            st["_saved_count"] = today
+    except Exception:
+        pass
+
+
+atexit.register(_flush_on_exit)
 
 
 def _save_saved(day, count):
@@ -109,6 +130,7 @@ class KeyboardStatsWidget(Widget):
         except Exception:
             st["_saved_count"] = 0
         st["_save_ts"] = 0.0
+        _LIVE["st"] = st
         self._stop_watch(st)
         self._stop_listener(st)
         try:

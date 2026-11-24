@@ -1,4 +1,5 @@
 import logging
+import time
 import shutil
 import subprocess
 import sys
@@ -41,13 +42,27 @@ def _get_windows():
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
         user32.GetClipboardData.argtypes = [wintypes.UINT]
         user32.GetClipboardData.restype = wintypes.HANDLE
         kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalLock.restype = ctypes.c_void_p
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
 
-        if not user32.OpenClipboard(None):
+        # 剪贴板常被别的程序短暂占用（OpenClipboard 失败很正常），
+        # 重试几次比直接放弃准得多；失败也不是错误。
+        opened = False
+        for _ in range(3):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.01)
+        if not opened:
             return None
         try:
             if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):

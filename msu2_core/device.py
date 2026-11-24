@@ -10,7 +10,9 @@ import time
 from .protocol import (
     MiniProtocol, SCREEN_H, SCREEN_W, TILE_N, lcd_segment_payload,
 )
-from .transport import SerialTransport, _normalize_port
+from .transport import (
+    SerialTransport, _normalize_port, format_fw_version, normalize_fw_version,
+)
 
 try:
     import numpy as _np
@@ -250,11 +252,13 @@ class MiniDevice:
             self.encoder.reset()
             self._ack_fails = 0
             self._zero_acks = 0
-            fwv = getattr(self.transport, "fw_version", None)
+            fwv = normalize_fw_version(
+                getattr(self.transport, "fw_version", None))
             if fwv is None:
                 log.info("固件没有回版本号（proto25 或更早），按老固件处理")
-            elif fwv < (1, 0):
-                log.warning("固件版本 %d.%d 过旧，请升级到 v1.0.0", fwv[0], fwv[1])
+            elif fwv < (1, 0, 0):
+                log.warning("固件版本 %s 过旧，请升级到 v1.0.0",
+                            format_fw_version(fwv))
         return ok
 
     def close(self):  self.transport.close()
@@ -350,8 +354,9 @@ class MiniDevice:
         """
         if not self._tiles_ok:
             return True
-        fw = getattr(self.transport, "fw_version", None)
-        if not fw or fw < (1, 0):
+        fw = normalize_fw_version(
+            getattr(self.transport, "fw_version", None))
+        if not fw or fw < (1, 0, 0):
             return True
         if getattr(self.encoder, "last_raw", None) is None:
             return True

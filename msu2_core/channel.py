@@ -373,16 +373,6 @@ class DeviceChannel:
                 self._q.clear()
             log.debug("设备 %s 发送线程退出", self.id)
 
-    def wait_idle(self, timeout=2.0):
-        """等队列发空（测试/退出前用）。"""
-        end = time.monotonic() + max(0.0, float(timeout))
-        while time.monotonic() < end:
-            with self._cond:
-                if not self._q:
-                    return True
-            time.sleep(0.02)
-        return False
-
     # ---- 对外快照 -----------------------------------------------------
     def snapshot(self):
         """给 WebUI / --devices 用的一台设备状态。"""

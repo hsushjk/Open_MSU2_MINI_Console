@@ -185,7 +185,7 @@ class RepairTests(unittest.TestCase):
         def __init__(self, masks):
             self.masks = list(masks)
             self.writes = []
-            self.fw_version = (1, 0)
+            self.fw_version = (1, 0, 0)
 
         def write(self, data):
             self.writes.append(bytes(data))

@@ -23,6 +23,27 @@ log = logging.getLogger("msu2")
 SCREEN_BAUD = 19200
 
 
+def normalize_fw_version(fw):
+    """把两段/三段版本统一成三段元组；空值返回 None。
+
+    v1.0.2 起版本帧带 patch；更老的 6 字节帧只有 major/minor，patch 补 0。
+    版本门限比较统一走这个函数，避免 (1, 0) 与 (1, 0, 0) 直接比较时
+    因元组长度不同而被误判成“更旧”。
+    """
+    if not fw:
+        return None
+    parts = [int(x) for x in list(fw)[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def format_fw_version(fw):
+    """把固件版本排成三段式字符串（如 "1.0.2"），空值返回"未知"。"""
+    ver = normalize_fw_version(fw)
+    return "%d.%d.%d" % ver if ver else "未知"
+
+
 # v16 起：空闲探询。设备只有在“上一帧的字节全吃完、没有半开的段”时才能
 # 解析到这条命令并回包，所以收到回包 = 设备确实空下来了。
 
@@ -96,15 +117,16 @@ class SerialTransport:
                         log.info("设备恢复应答: %s", self.port)
                         break
             if ver:
-                major, minor, touch = ver
-                self.fw_version = (major, minor)
-                log.info("固件版本 %d.%d，触摸读数 %d", major, minor, touch)
+                major, minor, patch, touch = ver
+                self.fw_version = (major, minor, patch)
+                log.info("固件版本 %s，触摸读数 %d",
+                         format_fw_version(self.fw_version), touch)
                 if touch == 0:
                     for _ in range(6):
                         time.sleep(0.08)
                         again = self.query_version(timeout=0.25)
-                        if again and again[2] > 0:
-                            touch = again[2]
+                        if again and again[3] > 0:
+                            touch = again[3]
                             log.info("触摸读数 %d（第一拍稍晚才有）", touch)
                             break
                     if touch == 0:
@@ -610,10 +632,12 @@ class SerialTransport:
 
     @_serial_locked
     def query_version(self, timeout=0.4):
-        """问固件版本；返回 (major, minor, touch) 或 None。
+        """问固件版本；返回 (major, minor, patch, touch) 或 None。
 
-        新固件（v9 起）会在同一个回包里带上当前触摸读数，所以这一条日志
-        就能同时回答“烧的是哪一版”和“ADC 有没有在产出”。
+        v1.0.2 起固件回 7 字节：56 MA MI PA TH TL AA；
+        更老的固件回 6 字节：56 MA MI TH TL AA，patch 补 0。
+        新固件在同一个回包里带上当前触摸读数，所以这一条日志就能同时回答
+        “烧的是哪一版”和“ADC 有没有在产出”。
         """
         with self._lock:
             if not self._connected or not self._ser:
@@ -623,17 +647,36 @@ class SerialTransport:
                 self._ser.write(bytes([0x00, 0x56, 0, 0, 0, 0]))
                 t0 = time.monotonic()
                 buf = bytearray()
+                waited = False
                 while time.monotonic() - t0 < timeout:
                     n = self._ser.in_waiting
                     if n:
                         buf.extend(self._ser.read(n))
                     while len(buf) >= 6:
-                        if buf[0] == 0x56 and buf[5] == 0xAA:
-                            major, minor = buf[1], buf[2]
-                            touch = (buf[3] << 8) | buf[4]
-                            del buf[:6]
-                            return major, minor, touch
+                        if buf[0] == 0x56:
+                            # 新固件 7 字节：末字节 0xAA 且 patch 在 buf[3]
+                            if len(buf) >= 7 and buf[6] == 0xAA:
+                                major, minor, patch = buf[1], buf[2], buf[3]
+                                touch = (buf[4] << 8) | buf[5]
+                                del buf[:7]
+                                return major, minor, patch, touch
+                            # 旧固件 6 字节末字节也是 0xAA：稍等一下，看第 7
+                            # 字节是不是还在路上。只等一次，避免旧固件慢半拍
+                            # 时把每条查询都拖到超时。
+                            if buf[5] == 0xAA:
+                                if not waited:
+                                    waited = True
+                                    time.sleep(0.03)
+                                    n = self._ser.in_waiting
+                                    if n:
+                                        buf.extend(self._ser.read(n))
+                                    continue
+                                major, minor = buf[1], buf[2]
+                                touch = (buf[3] << 8) | buf[4]
+                                del buf[:6]
+                                return major, minor, 0, touch
                         del buf[0]
+                        waited = False
                     time.sleep(0.005)
             except Exception as e:
                 log.debug("查询固件版本失败: %s", e)

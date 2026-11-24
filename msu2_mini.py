@@ -28,7 +28,7 @@ else:
 _HERE = str(_APP_DIR)
 
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
@@ -83,6 +83,7 @@ from msu2_core.protocol import (  # noqa: E402
 )
 from msu2_core.transport import (  # noqa: E402
     SCREEN_BAUD, SerialTransport, _normalize_port, _serial_locked,
+    format_fw_version, normalize_fw_version,
 )
 from msu2_core.device import (  # noqa: E402
     FrameEncoder, MiniDevice, OfflineDevice, TOUCH_CH,
@@ -983,8 +984,10 @@ class Scheduler(threading.Thread):
             return False, "固件太大（%d 字节，上限 48000）" % len(data)
         fw = getattr(self.device.transport, "fw_version", None) or getattr(
             self.device, "fw_version", None)
-        if fw is not None and fw < (1, 0):
-            return False, "设备固件 %d.%d 不支持自更新，请先用 ISP 刷一次 v1.0.0" % fw
+        fwv = normalize_fw_version(fw)
+        if fwv is not None and fwv < (1, 0, 0):
+            return False, ("设备固件 %s 不支持自更新，请先用 ISP 刷一次 v1.0.0"
+                           % format_fw_version(fwv))
         log.info("固件升级：写入 %d 字节", len(data))
 
         def _run():
@@ -4769,10 +4772,10 @@ def cmd_flash(path, port=None):
         tr = dev.transport
         fw = tr.fw_version
         _console("  已连接 %s，当前固件 %s"
-                 % (name, ("%d.%d" % fw) if fw else "未知"))
-        if not fw or fw < (1, 0):
+                 % (name, format_fw_version(fw)))
+        if not fw or fw < (1, 0, 0):
             _console("  [FAIL] 设备固件 %s 过旧，请先用 ISP 刷一次 v1.0.0"
-                     % (("%d.%d" % fw) if fw else "未知"))
+                     % format_fw_version(fw))
             tr.close()
             continue
 
@@ -4793,7 +4796,7 @@ def cmd_flash(path, port=None):
         dev2 = MiniDevice(name)
         if dev2.open():
             fw2 = dev2.transport.fw_version
-            _console("  重启后固件 %s" % (("%d.%d" % fw2) if fw2 else "未知"))
+            _console("  重启后固件 %s" % format_fw_version(fw2))
             dev2.transport.close()
             return 0
         _console("  重启后没有回应（可能还在重启，等两秒再跑 --selftest 看看）")
@@ -4820,7 +4823,7 @@ def cmd_selftest(port=None):
         fw = tr.fw_version
         _console("  握手 %s，raw_mode=%s" % (tr.version or "?", tr.raw_mode))
         if fw:
-            _console("  固件 %d.%d" % fw)
+            _console("  固件 %s" % format_fw_version(fw))
         else:
             _console("  固件版本未知（v8 及更早没有版本帧）")
 
@@ -5015,7 +5018,7 @@ def cmd_devices(cfg, cfg_path=None):
             fw = getattr(getattr(dev_obj, "transport", None), "fw_version", None)
             _console("  [%d] %-10s %-8s 在线  固件 %s  朝向 %s  亮度 %d%%  "
                      "翻转 %s  页 %s"
-                     % (i + 1, did, target, ("%d.%d" % fw) if fw else "旧版",
+                     % (i + 1, did, target, format_fw_version(fw) if fw else "旧版",
                         ori, 100 - dim, rev, cur))
         else:
             offline += 1

@@ -133,6 +133,7 @@ class MiniProtocol:
     def boot_report():
         return MiniProtocol._frame(0x0A, 0x0B, 0, 0, 0, 0)
 
+    @staticmethod
     def asset_wipe():
         """抹掉全部资产与设置：`0A 0A`"""
         return MiniProtocol._frame(0x0A, 0x0A, 0, 0, 0, 0)

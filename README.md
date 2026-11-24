@@ -1,6 +1,6 @@
 # Open_MSU2_MINI_Console
 
-MSU2_MINI 小屏的 Windows 上位机 **v1.0.0**：一个本地 WebUI（默认 `http://0.0.0.0:8765`）把插件页、截屏、背景图、开机/待机画面、OTA 升级和全局触控手势全放在一个页面里，另带 `--selftest` / `--flash` / `--simulate` 等命令行入口。
+MSU2_MINI 小屏的 Windows 上位机 **v1.0.2**：一个本地 WebUI（默认 `http://0.0.0.0:8765`）把插件页、截屏、背景图、开机/待机画面、OTA 升级和全局触控手势全放在一个页面里，另带 `--selftest` / `--flash` / `--simulate` 等命令行入口。
 
 ## 关键特性
 
@@ -121,7 +121,7 @@ python msu2_mini.py --headless                  # 只跑服务，不开浏览器
 | `--log` | 同时把日志打到控制台（默认也写文件） |
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `--log-file PATH` | 日志文件路径，传 `none` 关闭文件日志（默认 `%LOCALAPPDATA%\MSU2_MINI\console.log`） |
-| `--version` | 打印版本（`1.0.0`） |
+| `--version` | 打印版本（`1.0.2`） |
 
 `--selftest` 的报告结构：握手与 `raw_mode` → 固件版本 → 触摸 10 次采样 → 局部变化帧 / 整屏噪点帧的成功数与耗时 → 50 块分块签名核对（没对上会自动补画）→ 复位面包屑（上次阶段 + 复位次数）→ NOR 抽查 7 处（看是否已抹干净）。
 
@@ -188,11 +188,17 @@ spec 里已经固定了这些设置，手工改命令时别漏：
 ## 测试
 
 `powershell
-python -m unittest discover -s tests -v   # 22 个用例，不接设备
+python -m unittest discover -s tests -v   # 50 个用例，不接设备
 `
 
 覆盖编码器（整帧 / 差分 / RLE / 分块签名）、触控状态机、协议帧字段、配置夹取、
 --flash 的 Intel HEX 解析、以及「坏块补画 / 整帧重发 / 仍不同步则整屏重画」的分支。
+
+提交前再跑一遍未定义名门禁（优先 ruff，没装就退回 pyflakes，两者都没有则跳过）：
+
+`powershell
+python -X utf8 tools\lint.py
+`
 
 真机自检（接上设备）：
 
@@ -218,7 +224,7 @@ python msu2_mini.py --selftest
 
 **卡在旧固件**
 
-- 旧版本（v8 及更早）没有版本帧，界面会显示“固件版本未知”；v1.0.0 起统一版本号，正常应显示 `1.0.0`。
+- 旧版本（v8 及更早）没有版本帧，界面会显示“固件版本未知”；v1.0.0 起统一版本号，v1.0.2 起固件版本按三段式显示（正常应显示 `1.0.2`）。更老的 6 字节版本帧仍被兼容：只有 major/minor 时 patch 补 0（例如旧 v1.0.1 固件显示 `1.1.0`）。
 - 用 WCHISPTool 走一次 ISP 烧 `build/msu2_proto_fw.hex`，之后就能用页面上的 OTA 免拆升级。
 
 **OTA 失败**

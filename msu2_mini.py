@@ -29,7 +29,7 @@ else:
 _HERE = str(_APP_DIR)
 
 
-__version__ = "1.0.2"
+__version__ = "1.0.4"
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 

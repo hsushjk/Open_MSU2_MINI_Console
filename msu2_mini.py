@@ -88,6 +88,7 @@ from msu2_core.device import (  # noqa: E402
     FrameEncoder, MiniDevice, OfflineDevice, TOUCH_CH,
     _full_frame, _tile_frame, _tile_signatures,
 )
+from msu2_core.channel import DeviceChannel  # noqa: E402
 
 SCREEN_W, SCREEN_H = LANDSCAPE_SIZE
 MANUAL_COOLDOWN = 0.8
@@ -513,11 +514,28 @@ def _build_overlay(text, orientation):
     return img
 
 class Scheduler(threading.Thread):
+    """一个渲染循环 + N 个输出通道。
+
+    渲染/合成只做一次，然后把同一张图扇出给每台设备（每台一个 DeviceChannel）。
+    只有一台设备时通道是同步的，submit() 当场发完，行为和拆分前完全一致；
+    多台时每台一个发送线程 + 各自队列，慢/掉线的设备不会拖住渲染循环和其它设备。
+    """
+
     def __init__(self, device, config, on_config_changed=None, on_shutdown=None,
-                 shared=None):
+                 shared=None, channels=None):
         super().__init__(daemon=True, name="Scheduler")
-        self.device = device
-        self.config = config
+        # 通道列表由 DeviceManager 建好传进来；老的调用方式（测试/单设备）
+        # 就用传进来的 device 现造一个同步通道 —— 发帧在主循环里当场完成，
+        # 逐帧分块核对、回执、device.last 的时序都和拆分前一样。
+        if channels:
+            self.channels = list(channels)
+        else:
+            self.channels = [DeviceChannel(
+                str(config.get("id") or "dev1"), config, device, sync=True,
+                discover=_discover_device)]
+        self._active_index = 0
+        self._channels_lock = threading.RLock()
+        self.config = self.channels[0].config
         self.shared = shared if isinstance(shared, dict) else {}
         self._on_config_changed = on_config_changed
         self._on_shutdown = on_shutdown
@@ -528,13 +546,8 @@ class Scheduler(threading.Thread):
         self._devcfg_ack_ok = False       # 最近一次写设备是否成功
         self._devcfg_pause_until = 0.0    # 这段时间内不发帧，好让设备安心写 NOR
 
-        self.orientation = config.get("orientation", LANDSCAPE)
-        self.reverse = bool(config.get("reverse", False))
-        self.portrait_rotate = _coerce_int(config.get("portrait_rotate", -90), -90)
-        disp = config.get("display")
-        if not isinstance(disp, dict):
-            disp = {}
-        self._dim = _coerce_int(disp.get("dim"), 0, 0, 90)
+        # 当前选中设备的显示设置（每台的完整设置在各自的通道里）
+        self._sync_active_display()
         self._debug = False   # 调试模式已废弃（会跟看门狗打架），永远关闭
 
         bg = config.get("background")
@@ -588,7 +601,7 @@ class Scheduler(threading.Thread):
         self._load_touch_cfg(config)
 
         self.ctx = RenderContext(
-            device=device, now=time.time(),
+            device=self.device, now=time.time(),
             orientation=self.orientation, config=self._cfg_view(),
         )
         self._ctxs = {}
@@ -607,6 +620,114 @@ class Scheduler(threading.Thread):
         self._last_send_mono = 0.0
 
         self._reload_widgets()
+
+    # ---- 多设备通道 ---------------------------------------------------
+    @property
+    def active_channel(self):
+        with self._channels_lock:
+            if not self.channels:
+                return None
+            return self.channels[min(self._active_index, len(self.channels) - 1)]
+
+    @property
+    def device(self):
+        """当前选中设备的 MiniDevice/OfflineDevice。
+
+        资产/固件/触摸/NOR 这些设备级操作都落到选中的那台；发帧走所有通道。
+        """
+        ch = self.active_channel
+        return ch.device if ch is not None else None
+
+    @device.setter
+    def device(self, dev):
+        ch = self.active_channel
+        if ch is not None:
+            ch.device = dev
+
+    def _sync_active_display(self):
+        """把选中设备的显示设置同步成“当前设置”（渲染朝向跟随当前设备）。"""
+        ch = self.active_channel
+        if ch is None:
+            return
+        self._dim = int(ch.dim)
+        self.reverse = bool(ch.reverse)
+        self.orientation = ch.orientation
+        self.portrait_rotate = int(ch.portrait_rotate)
+
+    def channel(self, dev_id):
+        with self._channels_lock:
+            for ch in self.channels:
+                if ch.id == dev_id:
+                    return ch
+        return None
+
+    def set_active(self, dev_id):
+        """切换“当前设备”：它的配置成为编辑对象，它的朝向成为渲染朝向。"""
+        with self._channels_lock:
+            idx = -1
+            for i, ch in enumerate(self.channels):
+                if ch.id == dev_id:
+                    idx = i
+                    break
+            if idx < 0:
+                return False
+            self._active_index = idx
+            self.config = self.channels[idx].config
+        self._sync_active_display()
+        try:
+            self.ctx.device = self.device
+            self.ctx.orientation = self.orientation
+            self.ctx.config = self._cfg_view()
+            for c in list(self._ctxs.values()):
+                c.device = self.device
+                c.config = self._cfg_view()
+        except Exception as e:
+            log.debug("切换设备时刷新上下文失败: %s", e)
+        self._force_send = True
+        log.info("当前设备 -> %s", dev_id)
+        return True
+
+    def set_channel_display(self, dev_id, dim=None, reverse=None):
+        """改某一台设备的显示设置（WebUI 里按设备单独调亮度/翻转用）。"""
+        ch = self.channel(dev_id)
+        if ch is None:
+            return False
+        if dim is not None:
+            ch.set_dim(dim)
+        if reverse is not None:
+            ch.set_reverse(reverse)
+        if ch is self.active_channel:
+            self._sync_active_display()
+            try:
+                self.ctx.orientation = self.orientation
+            except Exception:
+                pass
+        self._force_send = True
+        return True
+
+    def _any_connected(self):
+        """还有没有一台设备在线（一台都连不上时才让主循环歇一下）。"""
+        return any(ch.connected for ch in list(self.channels))
+
+    def _warn_orientation_mix(self):
+        """多台设备的朝向设置不一致时提醒一次：同一份内容没法同时横竖屏。"""
+        chans = [ch for ch in list(self.channels) if not ch.offline]
+        orients = {ch.orientation for ch in chans}
+        if len(orients) <= 1:
+            return
+        names = ", ".join("%s=%s" % (ch.id, ch.orientation) for ch in chans)
+        log.warning("各设备朝向不一致（%s）：同一份内容只能按当前设备 %s 的朝向渲染，"
+                    "其它设备的朝向设置暂时不生效", names, self.active_channel.id)
+
+    def start(self):
+        """启动发送线程，再启动渲染循环。"""
+        for ch in list(self.channels):
+            try:
+                ch.start()
+            except Exception as e:
+                log.warning("设备 %s 发送线程启动失败: %s", ch.id, e)
+        self._warn_orientation_mix()
+        super().start()
 
     def _load_touch_cfg(self, config):
         tk = config.get("touch")
@@ -978,21 +1099,29 @@ class Scheduler(threading.Thread):
 
     def toggle_reverse(self, from_touch=False):
         if not self._allow("toggle_reverse", from_touch): return False
-        self.reverse = not self.reverse
-        self.device.set_reverse(self.reverse)
+        # 翻转是每台设备自己的显示设置：只改当前设备的那一条通道
+        self.active_channel.set_reverse(not self.reverse)
+        self._sync_active_display()
         self.config["reverse"] = self.reverse
         self._save_config()
         self._devcfg_dirty = True
         self._switch.set()
-        log.info("翻转 -> %s", self.reverse)
+        log.info("翻转 -> %s（设备 %s）", self.reverse, self.active_channel.id)
         return True
 
     def toggle_orientation(self, from_touch=False):
         if not self._allow("toggle_orientation", from_touch): return False
+        # 朝向是内容级设置：同一份内容没法同时横竖屏，所以跟着当前设备走
         self.orientation = (PORTRAIT if self.orientation == LANDSCAPE
                             else LANDSCAPE)
         self.ctx.orientation = self.orientation
         self.config["orientation"] = self.orientation
+        ch = self.active_channel
+        if ch is not None:
+            ch.orientation = self.orientation
+            disp = self.config.get("display")
+            if isinstance(disp, dict):
+                disp["orientation"] = self.orientation
         self._save_config()
         self._ensure_supported()
         self._switch.set()
@@ -1001,16 +1130,17 @@ class Scheduler(threading.Thread):
         return True
 
     def set_dim(self, value):
-        """伪亮度：内部存的是压暗量 0-90，作用在最终合成帧上；100% = 不压暗。"""
+        """伪亮度：内部存的是压暗量 0-90，作用在该设备自己的输出上；100% = 不压暗。"""
         v = _coerce_int(value, self._dim, 0, 90)
         if v == self._dim:
             return True
+        self.active_channel.set_dim(v)
         self._dim = v
         self.config.setdefault("display", {})["dim"] = v
         self._save_config(delay=0.8)     # 拖动时每格都来一次，合并写盘
         self._devcfg_dirty = True        # 亮度也记到设备里
         self._force_send = True
-        log.info("亮度 -> %d%%", 100 - v)
+        log.info("亮度 -> %d%%（设备 %s）", 100 - v, self.active_channel.id)
         return True
 
 
@@ -1097,27 +1227,37 @@ class Scheduler(threading.Thread):
 
     def _count_frame(self, mono):
         self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
-        # 链路预算：按上一帧的实际传输时间给下一帧留出间隔。高清整帧有 25 KB，
-        # 每秒能发的帧数是有上限的；连续排帧会把数据压在设备侧，帧中间断流
-        # 就表现为花屏、错位（尤其是动画背景图这种每帧全屏都变的场景）。
-        # v16 起 show_image 自己会等设备回空闲，链路已经不会堆积，再加间隔
-        # 只会白白拖低帧率。
-        if getattr(self.device, "self_paced", False):
-            self._send_gap = 0.0
-            self._last_frame_mono = mono
-        else:
+        # 链路预算：按各台在线设备上一帧的实际传输时间给下一帧留出间隔。高清整帧
+        # 有 25 KB，每秒能发的帧数是有上限的；连续排帧会把数据压在设备侧，帧中间
+        # 断流就表现为花屏、错位（尤其是动画背景图这种每帧全屏都变的场景）。
+        # 多设备时取 tx_ms 的最小值：最慢的那台不会把整条流水线拖慢，它的通道队列
+        # 自己丢旧帧；单设备时与拆分前完全一致。
+        paced = False
+        txs = []
+        for ch in list(self.channels):
+            if not ch.connected:
+                continue
+            dev = ch.device
+            if getattr(dev, "self_paced", False):
+                continue
+            paced = True
             try:
-                tx = float(getattr(self.device, "tx_ms", 0.0) or 0.0)
+                txs.append(float(getattr(dev, "tx_ms", 0.0) or 0.0))
             except Exception:
-                tx = 0.0
+                txs.append(0.0)
+        if paced:
+            tx = min(txs) if txs else 0.0
             if tx > 0.0:
                 self._send_gap = min(0.6, tx / 1000.0 * 1.15)
-            self._last_frame_mono = mono
+        else:
+            self._send_gap = 0.0
+        self._last_frame_mono = mono
         total = 0
-        try:
-            total = int(getattr(self.device.transport, "bytes_written", 0))
-        except Exception:
-            total = 0
+        for ch in list(self.channels):
+            try:
+                total += int(getattr(ch.device.transport, "bytes_written", 0))
+            except Exception:
+                pass
         last = int(self.metrics.get("_bytes_last", 0))
         delta = total - last if total >= last else 0
         self.metrics["_bytes_last"] = total
@@ -1211,6 +1351,11 @@ class Scheduler(threading.Thread):
             "background": {"enabled": self._bg_enabled, "mode": self._bg_mode,
                            "dim": self._bg_dim, "blur": self._bg_blur,
                            "frames": len(self.background.frames)},
+            # 每台设备各自的连接/版本/帧率（单设备时就是一个元素的数组，
+            # 旧字段全部保留，前端不改也不会坏）
+            "devices": [ch.snapshot() for ch in list(self.channels)],
+            "device_count": len(self.channels),
+            "active_device": (self.active_channel.id if self.active_channel else None),
         }
 
     def switch_to(self, name):
@@ -1249,12 +1394,31 @@ class Scheduler(threading.Thread):
         self._stop.set()
         self._save_flush()      # 退出前把还没落盘的改动补上
 
+    def stop_channels(self):
+        """停掉每台设备的发送线程（可重复调用，run() 退出和外面收尾都会调）。"""
+        for ch in list(self.channels):
+            try:
+                ch.stop()
+            except Exception as e:
+                log.debug("停止设备 %s 的发送线程失败: %s", ch.id, e)
+
     def _poll_touch(self, now):
         # 往设备 NOR 里写图/写设置时，设备正在把收到的每个字节当图像数据处理；
         # 这时再插一条触摸查询（6 字节命令）会被当成像素吃掉，图就花了。
         if now < getattr(self, "_devcfg_pause_until", 0.0):
             return
-        v = self.device.read_touch()
+        # 触摸只在“当前设备”上读。多设备时另一台可能正在发帧（整帧独占串口锁），
+        # 拿不到锁就跳过这一拍：绝不能让一台慢设备把渲染循环堵在触摸采样上。
+        lock = getattr(getattr(self.device, "transport", None), "_lock", None)
+        if lock is not None:
+            if not lock.acquire(blocking=False):
+                return
+            try:
+                v = self.device.read_touch()
+            finally:
+                lock.release()
+        else:
+            v = self.device.read_touch()
         if v is None:
             self._touch_zero_streak = 0
             return
@@ -1363,11 +1527,12 @@ class Scheduler(threading.Thread):
         return img
 
     def _composite_impl(self, widget_img, mono):
-        """把背景与插件图层合成为一帧。
+        """把背景与插件图层合成为一帧“基础内容”。
 
-        每次调用都重新做 alpha 合成，不缓存成品帧；只有背景图的解码/缩放
-        可以继续用 Background.tick 里的缓存。顺序固定不变：
-        合成 -> 伪亮度 LUT（_dim）-> 上下翻转（reverse），然后才发给设备。
+        只做所有设备共用的那部分：背景 + 插件图层 + 朝向旋转 -> 160x80 RGB。
+        伪亮度（dim）和 180° 翻转（reverse）是每台设备自己的显示设置，放在
+        DeviceChannel 里做 —— 这样同一份内容可以在亮度/翻转不同的屏上显示，
+        而合成只做一次。
         """
         bg = self.background.tick(mono)
         if bg is None:
@@ -1384,24 +1549,27 @@ class Scheduler(threading.Thread):
             if widget_img.mode != "RGBA":
                 widget_img = widget_img.convert("RGBA")
             out = Image.alpha_composite(canvas, widget_img).convert("RGB")
-        if self._dim > 0:
-            # 伪亮度：整屏按比例压暗，对所有插件和背景一起生效。
-            k = 100 - self._dim
-            lut = [(i * k) // 100 for i in range(256)] * 3
-            out = out.point(lut)
-        if self.reverse:
-            out = out.rotate(180)
         return out
 
     def _send_frame(self, widget_img, mono):
-        """合成一帧并发给设备。
+        """合成一帧，然后扇出给每台设备的通道。
 
         所有发帧路径都走这里：只要这一帧要发，就重新走一遍 Pillow 合成
-        （背景 + 插件图层），不允许复用上一次的合成结果。成功返回 True。
+        （背景 + 插件图层），不允许复用上一次的合成结果。每台设备各自
+        后处理（亮度/翻转）+ 各自的 FrameEncoder 差分缓存 + 各自队列。
+        至少一路收下就返回 True（一台离线不影响其它设备继续推流）。
         """
         frame = self._composite(widget_img, mono)
         self.metrics["composites"] = int(self.metrics.get("composites", 0)) + 1
-        return self.device.show_image(frame)
+        ok = False
+        for ch in list(self.channels):
+            try:
+                if ch.submit(frame):
+                    ok = True
+            except Exception as e:
+                # 单台的发送异常（串口刚拔掉等）绝不能打断渲染循环
+                log.warning("设备 %s 提交帧失败: %s", ch.id, e)
+        return ok
 
     def _handle_switch(self):
         widgets = self._widgets
@@ -1422,27 +1590,21 @@ class Scheduler(threading.Thread):
         self._force_send = True
 
     def _rediscover(self):
-        """连不上时每 3 秒重新扫一次串口：拔插后 COM 号变了也能自己找回。"""
-        now = time.monotonic()
-        if now - getattr(self, "_last_scan", 0.0) < 3.0:
-            return
-        self._last_scan = now
-        if str(getattr(self.device, "port", "auto")).lower() not in ("auto", "", "offline"):
-            return
-        found = _pick_free_port(set())
-        if not found:
-            return
-        log.info("重新发现设备: %s", found)
-        try:
-            self.device.close()
-        except Exception:
-            pass
-        self.device = MiniDevice(found)
-        self._force_send = True
+        """连不上时让各台 auto 端口的设备自己重扫串口：拔插后 COM 号变了也能找回。"""
+        found = False
+        for ch in list(self.channels):
+            try:
+                if ch.try_rediscover():
+                    found = True
+            except Exception as e:
+                log.debug("设备 %s 重新发现失败: %s", ch.id, e)
+        if found:
+            self._force_send = True
 
     def run(self):
-        log.info("Scheduler 启动, %d 页, 朝向 %s, 翻转 %s",
-                 len(self._widgets), self.orientation, self.reverse)
+        log.info("Scheduler 启动, %d 页, %d 台设备, 朝向 %s, 翻转 %s",
+                 len(self._widgets), len(self.channels), self.orientation,
+                 self.reverse)
         last_mono = 0.0
         last_bg_ts = 0.0
         try:
@@ -1453,15 +1615,21 @@ class Scheduler(threading.Thread):
                     self._check_plugin_changes(time.monotonic())
                     self._drain_ops()
 
-                    if not self.device.connected:
-                        if not self.device.open():
-                            self._rediscover()
-                            time.sleep(1.0); continue
-                        self.device.set_reverse(self.reverse)
-                        self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
-                        last_mono = 0.0
-                        last_bg_ts = 0.0
-                        self._devcfg_boot_sync()
+                    # 连接维护：同步通道（单设备老路径）在这里开/重连；异步通道
+                    # 各自在自己的发送线程里重连，渲染循环只要求“至少一台在线”。
+                    for ch in list(self.channels):
+                        if not ch.sync or ch.connected:
+                            continue
+                        if ch.ensure_open():
+                            self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
+                            last_mono = 0.0
+                            last_bg_ts = 0.0
+                            self._devcfg_boot_sync()
+                        else:
+                            ch.try_rediscover()
+                    if not self._any_connected():
+                        # 一台都没连上：歇一会儿再看（插件热加载照样能跑）
+                        time.sleep(1.0); continue
 
                     if self._devcfg_dirty:
                         self._flush_devcfg()
@@ -1564,8 +1732,12 @@ class Scheduler(threading.Thread):
                         else:
                             self._force_send = True
                     elif need_heartbeat:
-                        if self.device.heartbeat():
-                            self._last_send_mono = mono
+                        # 心跳只发给当前设备；它不在线、或正在发帧（异步通道的
+                        # 线程还在写串口）就跳过这一拍，免得两路写交错。
+                        ch = self.active_channel
+                        if ch is not None and ch.connected and not ch.busy:
+                            if self.device.heartbeat():
+                                self._last_send_mono = mono
 
                     if mono - self._touch_last_sample_ts >= TOUCH_SAMPLE_INTERVAL:
                         self._touch_last_sample_ts = mono
@@ -1584,15 +1756,19 @@ class Scheduler(threading.Thread):
                     if self._stop.is_set():
                         break
                     log.error("串口异常（设备可能拔掉了）：%s", _e)
-                    try:
-                        self.device.close()
-                    except Exception:
-                        pass
+                    # 只关当前设备：多设备时其它设备不该因为这一台掉线而被牵连
+                    ch = self.active_channel
+                    if ch is not None:
+                        try:
+                            ch.close()
+                        except Exception:
+                            pass
                     self.metrics["errors"] = int(self.metrics.get("errors", 0)) + 1
                     self._force_send = True
                     time.sleep(0.5)
                     continue
         finally:
+            self.stop_channels()     # 先停各台的发送线程，再拆插件
             self._teardown_all()
             log.info("Scheduler 退出")
 
@@ -1650,6 +1826,10 @@ def _device_default(dev_id="dev1", port="auto"):
         "orientation": "landscape",
         "reverse": False,
         "portrait_rotate": -90,
+        # 每台设备自己的显示设置：dim 是唯一权威值，其余三项在这里做镜像，
+        # 方便 WebUI / 外部脚本只读 display 就能拿到这台屏幕的全部显示参数。
+        "display": {"dim": 0, "orientation": "landscape", "reverse": False,
+                    "portrait_rotate": -90},
         "background": {"enabled": False, "path": "", "mode": "fit",
                        "dim": 0, "blur": 0, "paths": []},
         "touch": dict(_TOUCH_DEFAULTS),
@@ -1734,6 +1914,15 @@ def _sanitize_device(dev, index):
     out["reverse"] = bool(dev.get("reverse", False))
     rotate = _coerce_int(dev.get("portrait_rotate"), -90)
     out["portrait_rotate"] = rotate if rotate in (90, -90) else -90
+    disp = dev.get("display")
+    if not isinstance(disp, dict):
+        disp = {}
+    out["display"] = {
+        "dim": _coerce_int(disp.get("dim"), 0, 0, 90),
+        "orientation": out["orientation"],
+        "reverse": out["reverse"],
+        "portrait_rotate": out["portrait_rotate"],
+    }
     bg = dev.get("background")
     if not isinstance(bg, dict):
         bg = {}
@@ -1760,7 +1949,7 @@ def _sanitize_devices(cfg):
     if not isinstance(raw, list) or not raw:
         legacy = _device_default()
         for key in ("port", "pages", "current_page", "orientation", "reverse",
-                    "portrait_rotate", "background", "touch"):
+                    "portrait_rotate", "display", "background", "touch"):
             if key in cfg:
                 legacy[key] = cfg[key]
         raw = [legacy]
@@ -1776,7 +1965,7 @@ def _sanitize_devices(cfg):
         seen_ids.add(item["id"])
         devices.append(item)
     for key in ("port", "pages", "current_page", "orientation", "reverse",
-                "portrait_rotate", "background", "touch"):
+                "portrait_rotate", "display", "background", "touch"):
         cfg.pop(key, None)
     cfg["devices"] = devices
     return devices
@@ -2040,6 +2229,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <select id="dev-select" onchange="selectDevice()"></select>
   </label>
   <span class="msg" id="msg-dev"></span>
+  <div id="dev-list" class="tiny" style="margin-top:6px"></div>
   <div style="margin-top:6px">
     <img id="dev-preview" alt="" style="width:320px;height:160px;object-fit:contain;image-rendering:pixelated;background:#000;border:1px solid #ccc;border-radius:4px">
   </div>
@@ -2521,11 +2711,33 @@ async function loadDevices() {
     (j.devices || []).forEach(d => {
       const o = document.createElement('option');
       o.value = d.id;
-      o.textContent = `${d.id}  ${d.port || 'auto'}`;
+      const mark = d.offline ? '○' : (d.connected ? '●' : '×');
+      o.textContent = `${mark} ${d.id}  ${d.port || 'auto'}`;
       sel.appendChild(o);
     });
     if (active) sel.value = active;
   } catch(e) {}
+}
+
+// 每台设备一行：连接状态 / 固件版本 / 实时帧率 / 丢帧数，多设备时一眼看清谁掉了
+function renderDevices(list, active) {
+  const box = document.getElementById('dev-list');
+  if (!box) return;
+  box.textContent = '';
+  (list || []).forEach(d => {
+    const row = document.createElement('div');
+    const online = !!d.connected;
+    if (!online && !d.offline) row.className = 'err';
+    const state = d.offline ? '离线模拟' : (online ? '在线' : '离线');
+    let text = (d.id === active ? '▶ ' : '') + d.id + '  ' +
+               (d.port || 'auto') + '  ' + state;
+    if (d.version) text += '  固件 ' + d.version;
+    if (online || d.offline) text += '  ' + (d.fps || 0) + ' fps';
+    if (d.dropped) text += '  丢帧 ' + d.dropped;
+    if (d.err) text += '  ' + d.err;
+    row.textContent = text;
+    box.appendChild(row);
+  });
 }
 
 async function selectDevice() {
@@ -2634,11 +2846,14 @@ async function refresh() {
     if (sel && j.active && document.activeElement !== sel) {
       sel.value = j.active;
     }
+    renderDevices(j.devices, j.active);
     const m = j.metrics || {};
     if (m.fps !== undefined) {
       const rk = Object.keys(m.render_ms || {})
         .map(k => `${k} ${m.render_ms[k]}ms`).join('  ');
+      const dn = (j.devices || []).length;
       document.getElementById('metrics-line').textContent =
+        (dn > 1 ? `设备 ${dn} 台   ` : '') +
         `FPS ${m.fps}   吞吐 ${m.bytes_per_sec} B/s   帧 ${m.frames}   ` +
         `重连 ${m.reconnects}   渲染 ${rk}`;
     }
@@ -3441,8 +3656,8 @@ _PROBED = {}
 def _pick_free_port(used):
     """自动挑一个能握手的串口。
 
-    握手成功的那条连接**不关**，留在 _PROBED 里交给 DeviceManager 直接复用：
-    否则探测时打一遍“串口已打开 / 固件版本”，_build 里再开一次又打一遍。
+    握手成功的那条连接**不关**，留在 _PROBED 里交给调用方直接复用：
+    否则探测时打一遍“串口已打开 / 固件版本”，真正要用的实例还得再开一次。
     """
     try:
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -3464,15 +3679,58 @@ def _pick_free_port(used):
     return ""
 
 
+def _pick_device(used=()):
+    """扫一个能握手的串口并返回**已经打开**的设备；没有就返回 None。
+
+    探测成功的连接不关，直接交给通道复用（省掉又一遍握手/版本查询）；
+    “重新发现设备”的路径也走它，避免“探测把口占着、真正要用的实例反而打不开”。
+    """
+    try:
+        found = _pick_free_port(set(used or ()))
+    except Exception as e:
+        log.debug("扫描串口失败: %s", e)
+        return None
+    if not found:
+        return None
+    dev = _PROBED.pop(found, None)
+    if dev is not None:
+        return dev
+    dev = MiniDevice(found)
+    try:
+        if dev.open():
+            return dev
+    except Exception as e:
+        log.debug("打开 %s 失败: %s", found, e)
+    try:
+        dev.close()
+    except Exception:
+        pass
+    return None
+
+
+def _discover_device():
+    """给设备通道用的“重新发现”回调：返回一个已打开的设备，或 None。"""
+    return _pick_device(())
+
+
 class DeviceManager:
+    """多设备管理器：按配置建好每台设备的输出通道，交给一个 Scheduler 统一渲染。
+
+    一台设备一个 DeviceChannel（各自的 MiniDevice / FrameEncoder 差分缓存 /
+    串口锁 / 发送队列）。渲染和合成就做一次，然后扇出给每台；只有“每台一次
+    后处理 + 编码 + 串口写”是并行的，所以 N 台设备不会把渲染成本乘以 N。
+    只有一台设备时通道是同步的，行为和拆分前完全一致。
+    """
+
     def __init__(self, cfg, cfg_path, simulate=False):
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.simulate = bool(simulate)
         self.lock = threading.RLock()
-        self.schedulers = {}
+        self.channels = {}       # id -> DeviceChannel（按配置顺序）
         self.order = []
         self.active_id = None
+        self.scheduler = None
         self._build()
 
     def _build(self):
@@ -3487,28 +3745,68 @@ class DeviceManager:
             sim_dev = _device_default(sid, "offline")
             items.append(sim_dev)
         used = set()
+        specs = []
         for i, dev in enumerate(items):
             if not isinstance(dev, dict):
                 continue
             did = str(dev.get("id") or ("dev%d" % (i + 1)))
+            if did in self.channels:
+                continue        # sanitize 已经去过重，这里再保险一次
             port = str(dev.get("port") or "auto")
-            reused = None
+            device = None
             if port.lower() in ("auto", ""):
-                port = _pick_free_port(used) or ""
-                reused = _PROBED.pop(port, None)
-            if port:
-                used.add(port)
-            if reused is not None:
-                device = reused
-            else:
+                # 自动端口：启动时先探一个能握手的（已打开），后面掉线由通道自己重扫
+                device = _pick_device(used)
+                port = str(getattr(device, "port", "") or "")
+            if device is None:
                 device = (OfflineDevice() if port.lower() == "offline"
                           else MiniDevice(port or "auto"))
-            sched = Scheduler(device, dev, on_config_changed=self._persist,
-                              shared=self.cfg)
-            self.schedulers[did] = sched
+            if port and port.lower() != "offline":
+                used.add(port)
+            specs.append((did, dev, device, port))
+        # 只有一台设备时用同步通道（行为和拆分前完全一致）；多台时每台一个
+        # 发送线程 + 队列，一台慢/掉线不会拖住渲染循环和其它设备。
+        multi = len(specs) > 1
+        for did, dev, device, port in specs:
+            ch = DeviceChannel(did, dev, device, sync=not multi)
+            self.channels[did] = ch
             self.order.append(did)
-        if self.order:
-            self.active_id = self.order[0]
+        for did, ch in self.channels.items():
+            ch._discover = self._discover_for(did)
+        if not self.order:
+            return
+        self.active_id = self.order[0]
+        first = self.channels[self.order[0]]
+        self.scheduler = Scheduler(first.device, first.config,
+                                   on_config_changed=self._persist,
+                                   shared=self.cfg,
+                                   channels=self.channels_in_order())
+        # 启动时把每台都连一遍：连不上的 log.warning 跳过，不影响其它设备；
+        # 掉线/后插的设备由各自通道的线程继续重试。
+        for did in self.order:
+            ch = self.channels[did]
+            if ch.offline:
+                log.info("设备 %s：offline 模拟，不占串口", did)
+                continue
+            if ch.device.connected or ch.ensure_open():
+                log.info("设备 %s -> %s（在线%s）", did, ch.port or "auto",
+                         "，固件 " + ch.version if ch.version else "")
+            else:
+                log.warning("设备 %s（%s）连不上，跳过（后台继续重试）",
+                            did, ch.port or "auto")
+
+    def _discover_for(self, dev_id):
+        """给某台 auto 设备重新扫描串口时用：排除其它设备已经占用的口。"""
+        def _discover():
+            used = set()
+            for did, ch in list(self.channels.items()):
+                if did == dev_id:
+                    continue
+                p = ch.port
+                if p and p.lower() not in ("auto", "", "offline"):
+                    used.add(p)
+            return _pick_device(used)
+        return _discover
 
     def _persist(self):
         try:
@@ -3517,39 +3815,78 @@ class DeviceManager:
             log.warning("保存配置失败: %s", e)
 
     def start(self):
-        for did in self.order:
-            self.schedulers[did].start()
+        if self.scheduler is not None:
+            self.scheduler.start()
 
     def stop(self):
-        for did in self.order:
-            self.schedulers[did].stop()
-        for did in self.order:
+        sched = self.scheduler
+        if sched is not None:
+            sched.stop()
             try:
-                self.schedulers[did].join(timeout=3.0)
+                sched.join(timeout=3.0)
+            except Exception:
+                pass
+            sched.stop_channels()
+        for ch in list(self.channels.values()):
+            try:
+                ch.stop()
             except Exception:
                 pass
 
     def active(self):
+        """当前选中的设备对应的 Scheduler（所有设备共用一个）。"""
         with self.lock:
-            return self.schedulers.get(self.active_id)
+            return self.scheduler
+
+    def active_channel(self):
+        sched = self.scheduler
+        return sched.active_channel if sched is not None else None
+
+    def channel(self, dev_id):
+        return self.channels.get(dev_id)
+
+    def channels_in_order(self):
+        return [self.channels[d] for d in self.order]
 
     def select(self, did):
         with self.lock:
-            if did not in self.schedulers:
+            if did not in self.channels:
                 return False
             self.active_id = did
-            return True
+        if self.scheduler is not None:
+            self.scheduler.set_active(did)
+        return True
+
+    def close_devices(self):
+        for ch in list(self.channels.values()):
+            ch.close()
 
     def describe(self):
+        """每台设备的状态快照（WebUI 下拉/状态区、--devices 都用它）。
+
+        旧字段 id/port/connected/current/pages 都在，新加 version/fps/dropped
+        等等；offline 的模拟设备也列出来当占位。
+        """
+        sched = self.scheduler
         out = []
-        for did in self.order:
-            s = self.schedulers[did]
-            widgets = s._widgets
-            cur = s._current
-            name = widgets[cur].name if 0 <= cur < len(widgets) else None
-            out.append({"id": did, "port": s.device.port,
-                        "connected": s.device.connected,
-                        "current": name, "pages": len(widgets)})
+        with self.lock:
+            order = list(self.order)
+        for did in order:
+            ch = self.channels.get(did)
+            if ch is None:
+                continue
+            item = ch.snapshot()
+            item["active"] = (did == self.active_id)
+            if sched is not None:
+                widgets = sched._widgets
+                cur = sched._current
+                item["current"] = (widgets[cur].name
+                                   if 0 <= cur < len(widgets) else None)
+                item["pages"] = len(widgets)
+            else:
+                item["current"] = None
+                item["pages"] = 0
+            out.append(item)
         return out
 
 class WebUI(threading.Thread):
@@ -4094,8 +4431,8 @@ class WebUI(threading.Thread):
                         outer.cfg.setdefault("widget_config", {})
                         outer.cfg["widget_config"][name] = merged
                         save_config(outer.cfg, cfg_path)
-                        for s in outer.manager.schedulers.values():
-                            s.restart_widget(name)
+                        # 所有设备共用一个 Scheduler，重启一次就对全部设备生效
+                        sched.restart_widget(name)
                         self._json({"ok": True, "values": merged})
                     elif self.path == "/api/widget_action":
                         body = self._read_json()
@@ -4322,10 +4659,19 @@ def run_offline_window(manager, stop_event, device_id=None):
     bar.pack(fill="x")
     holder = {"photo": None}
 
-    def pick():
+    def pick_channel():
+        """模拟屏要显示哪块设备：指定的那台 -> 任意 offline 模拟 -> 当前设备。"""
         if device_id:
-            return manager.schedulers.get(device_id) or manager.active()
-        return manager.schedulers.get('sim') or manager.active()
+            ch = manager.channel(device_id)
+            if ch is not None:
+                return ch
+        for ch in manager.channels_in_order():
+            if ch.offline:
+                return ch
+        return manager.active_channel()
+
+    def pick():
+        return manager.active()
 
     def act(fn):
         def _run():
@@ -4343,8 +4689,8 @@ def run_offline_window(manager, stop_event, device_id=None):
     tk.Button(bar, text="关闭", command=stop_event.set).pack(side="right")
 
     def tick():
-        sched = pick()
-        dev = getattr(sched, "device", None) if sched is not None else None
+        ch = pick_channel()
+        dev = ch.device if ch is not None else None
         img = getattr(dev, "last", None) if dev is not None else None
         if img is not None:
             img = img.convert("RGB")
@@ -4616,6 +4962,129 @@ def cmd_selftest(port=None):
     return 0 if bad == 0 else 1
 
 
+def cmd_devices(cfg, cfg_path=None):
+    """--devices：列出配置里的所有设备和各自的连接情况（不启动推流）。"""
+    devs = cfg.get("devices") or []
+    if not devs:
+        _console("配置里没有任何设备")
+        return 2
+    _console("== 设备列表（%d 台）==" % len(devs))
+    if cfg_path:
+        _console("  配置文件: %s" % cfg_path)
+    online = 0
+    offline = 0
+    for i, dev in enumerate(devs):
+        if not isinstance(dev, dict):
+            continue
+        did = str(dev.get("id") or ("dev%d" % (i + 1)))
+        port = str(dev.get("port") or "auto")
+        ori = str(dev.get("orientation") or LANDSCAPE)
+        disp = dev.get("display")
+        if not isinstance(disp, dict):
+            disp = {}
+        dim = _coerce_int(disp.get("dim"), 0, 0, 90)
+        rev = "开" if dev.get("reverse") else "关"
+        cur = str(dev.get("current_page") or "-")
+        if port.lower() == "offline":
+            offline += 1
+            _console("  [%d] %-10s %-8s 离线模拟（不占串口）  朝向 %s  亮度 %d%%  "
+                     "翻转 %s  页 %s" % (i + 1, did, "offline", ori,
+                                         100 - dim, rev, cur))
+            continue
+        target = port
+        dev_obj = None
+        if port.lower() in ("auto", ""):
+            found = _pick_free_port(set())
+            if found:
+                dev_obj = _PROBED.pop(found, None)
+                target = found
+            else:
+                target = "auto"
+        if dev_obj is None:
+            dev_obj = MiniDevice(target or "auto")
+        ok = False
+        try:
+            ok = dev_obj.connected or dev_obj.open()
+        except Exception as e:
+            try:
+                dev_obj.transport.last_error = str(e)
+            except Exception:
+                pass
+        if ok:
+            online += 1
+            fw = getattr(getattr(dev_obj, "transport", None), "fw_version", None)
+            _console("  [%d] %-10s %-8s 在线  固件 %s  朝向 %s  亮度 %d%%  "
+                     "翻转 %s  页 %s"
+                     % (i + 1, did, target, ("%d.%d" % fw) if fw else "旧版",
+                        ori, 100 - dim, rev, cur))
+        else:
+            offline += 1
+            err = getattr(getattr(dev_obj, "transport", None), "last_error", "")
+            _console("  [%d] %-10s %-8s 离线（%s）  朝向 %s  亮度 %d%%  翻转 %s"
+                     % (i + 1, did, target, err or "打不开或握手失败",
+                        ori, 100 - dim, rev))
+        try:
+            dev_obj.close()
+        except Exception:
+            pass
+    _console("  合计: %d 台在线，%d 台离线" % (online, offline))
+    return 0
+
+
+def cmd_selftest_all(cfg, port=None):
+    """--selftest --all：配置里的每台真设备都体检一遍，任何一台失败退出码非 0。
+
+    offline 模拟设备没有真链路，跳过并标注；port 为 "auto" 的自动分一个能握手的
+    串口。只给 --selftest --port COM4 时仍是原来的单台行为。
+    """
+    devs = cfg.get("devices") or []
+    targets = []
+    used = set()
+    for i, dev in enumerate(devs):
+        if not isinstance(dev, dict):
+            continue
+        did = str(dev.get("id") or ("dev%d" % (i + 1)))
+        p = str(dev.get("port") or "auto")
+        if p.lower() == "offline":
+            _console("== %s == 跳过：offline 模拟设备" % did)
+            continue
+        if p.lower() in ("auto", ""):
+            found = _pick_free_port(used)
+            if not found:
+                _console("== %s == 自动端口没有找到可用的串口" % did)
+                targets.append((did, "", False))
+                continue
+            probe = _PROBED.pop(found, None)
+            if probe is not None:
+                try:
+                    probe.close()   # 只是确认这个口能用，真正的测试另开实例
+                except Exception:
+                    pass
+            p = found
+        if p in used:
+            _console("== %s == 端口 %s 和前面的设备重复，跳过" % (did, p))
+            targets.append((did, p, False))
+            continue
+        used.add(p)
+        targets.append((did, p, True))
+    if not targets:
+        _console("配置里没有可测的真设备")
+        return 2
+    bad = 0
+    for did, p, usable in targets:
+        if not usable:
+            bad += 1
+            continue
+        _console("")
+        _console("---- 设备 %s -> %s ----" % (did, p))
+        if cmd_selftest(p) != 0:
+            bad += 1
+    total = len(targets)
+    _console("")
+    _console("== 多设备自检: %d 台通过, %d 台失败 ==" % (total - bad, bad))
+    return 0 if bad == 0 else 1
+
+
 _FAULT_FILE = None
 
 
@@ -4696,8 +5165,12 @@ def main(argv=None):
     ap.add_argument("--simulate", "--offline", dest="simulate",
                     action="store_true", help="额外开一个模拟屏窗口")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--devices", action="store_true",
+                    help="列出配置里的多台设备及各自连接情况后退出")
     ap.add_argument("--selftest", action="store_true",
                     help="连上设备做自检（握手/版本/触摸/整帧链路/回执）后退出")
+    ap.add_argument("--all", dest="selftest_all", action="store_true",
+                    help="配合 --selftest：配置里每台设备都自检一遍（任一失败退出码非 0）")
     ap.add_argument("--flash", default=None,
                     help="\u628a\u56fa\u4ef6\u5199\u8fdb\u8bbe\u5907\u677f\u8f7d NOR\uff08\u56fa\u4ef6 v1.0.0\uff09")
     ap.add_argument("--plugins", action="store_true",
@@ -4714,7 +5187,25 @@ def main(argv=None):
         cmd_plugins(); return 0
     if args.new_widget:
         return cmd_new_widget(args.new_widget)
+    if args.devices:
+        try:
+            cfg = ensure_config_file(args.config or _default_config_path())
+        except Exception as e:
+            _console("读取配置失败: %s" % e)
+            return 2
+        if args.port:
+            devs = cfg.get("devices") or []
+            if devs and isinstance(devs[0], dict):
+                devs[0]["port"] = args.port
+        return cmd_devices(cfg, args.config or _default_config_path())
     if args.selftest:
+        if args.selftest_all:
+            try:
+                cfg = ensure_config_file(args.config or _default_config_path())
+            except Exception as e:
+                _console("读取配置失败: %s" % e)
+                return 2
+            return cmd_selftest_all(cfg, args.port)
         return cmd_selftest(args.port)
     if args.flash:
         return cmd_flash(args.flash, args.port)
@@ -4799,15 +5290,18 @@ def main(argv=None):
     if not manager.order:
         log.error("配置里没有任何设备")
         return 2
-    for did in manager.order:
-        s = manager.schedulers[did]
-        s._on_shutdown = _request_shutdown
-        log.info("设备 %s -> %s", did, s.device.port or "auto")
+    sched = manager.active()
+    if sched is not None:
+        sched._on_shutdown = _request_shutdown
+    if len(manager.order) > 1:
+        log.info("多设备推流: %d 台（%s）", len(manager.order),
+                 ", ".join(manager.order))
     manager.start()
     sim_id = None
     if args.simulate:
         for did in manager.order:
-            if getattr(manager.schedulers[did].device, 'port', '') == 'offline':
+            ch = manager.channel(did)
+            if ch is not None and ch.port == "offline":
                 sim_id = did
                 break
 
@@ -4835,8 +5329,9 @@ def main(argv=None):
         # 不管从哪条路退出（触控、网页、窗口叉、Ctrl+C），都在小屏上留一句，
         # 让用户知道是“被关掉”而不是死机。
         try:
-            for _did in manager.order:
-                manager.schedulers[_did].notify("上位机正在被关闭…", 1.5)
+            # 内容只合成一次，一次扇出就所有屏都亮起这句
+            if sched is not None:
+                sched.notify("上位机正在被关闭…", 1.5)
             time.sleep(0.6)
         except Exception:
             pass
@@ -4846,11 +5341,7 @@ def main(argv=None):
         except Exception: pass
         manager.stop()
         if web: web.stop()
-        for did in manager.order:
-            try:
-                manager.schedulers[did].device.close()
-            except Exception:
-                pass
+        manager.close_devices()
     return 0
 
 if __name__ == "__main__":

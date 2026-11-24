@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -321,6 +322,125 @@ class CompositeTests(unittest.TestCase):
         # 先合成（左红右蓝）-> 压暗 50% -> 180° 翻转：左右互换
         self.assertEqual(out.getpixel((0, 0)), (0, 0, 100))
         self.assertEqual(out.getpixel((159, 0)), (127, 0, 0))
+
+
+class MultiDeviceTests(unittest.TestCase):
+    """任务⑮：一份内容扇出到多台设备，每台自己的 diff 缓存 / 队列 / dim。"""
+
+    def channels(self, dims=(0, 0), reverses=(False, False), devices=None):
+        chans = []
+        for i, (dim, rev) in enumerate(zip(dims, reverses)):
+            cfg = {"id": "d%d" % (i + 1), "pages": [], "reverse": rev,
+                   "display": {"dim": dim}}
+            dev = devices[i] if devices else M.OfflineDevice()
+            chans.append(M.DeviceChannel("d%d" % (i + 1), cfg, dev,
+                                         sync=False))
+        sched = M.Scheduler(chans[0].device, chans[0].config, channels=chans)
+        for ch in chans:
+            ch.start()
+        self.addCleanup(lambda: [ch.stop() for ch in chans])
+        return sched, chans
+
+    @staticmethod
+    def wait_frames(ch, n, timeout=2.0):
+        """等这台通道真的发出去 n 帧（队列空了不等于写完了）。"""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if ch.snapshot()["frames"] >= n:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_one_composite_fans_out_to_all_devices(self):
+        sched, chans = self.channels()
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 0, 200))]
+        self.assertTrue(sched._send_frame(None, 0.0))
+        for ch in chans:
+            self.assertTrue(self.wait_frames(ch, 1), ch.id)
+        self.assertEqual(sched.metrics["composites"], 1)   # 只合成一次
+        for ch in chans:
+            self.assertIsNotNone(ch.device.last, ch.id)
+            self.assertEqual(ch.device.last.getpixel((0, 0)), (0, 0, 200))
+            self.assertEqual(ch.snapshot()["submitted"], 1)
+            self.assertEqual(ch.snapshot()["frames"], 1)
+        snap = sched.metrics_snapshot()
+        self.assertEqual(snap["device_count"], 2)
+        self.assertEqual([d["id"] for d in snap["devices"]], ["d1", "d2"])
+
+    def test_per_device_dim_and_reverse_are_independent(self):
+        sched, chans = self.channels(dims=(50, 0), reverses=(False, True))
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 0, 200))]
+        layer = Image.new("RGBA", (160, 80), (0, 0, 0, 0))
+        layer.paste((255, 0, 0, 255), (0, 0, 80, 80))     # 左半屏不透明红
+        sched._send_frame(layer, 0.0)
+        for ch in chans:
+            self.assertTrue(self.wait_frames(ch, 1))
+        a = chans[0].device.last                         # 亮度 50%，不翻转
+        self.assertEqual(a.getpixel((0, 0)), (127, 0, 0))
+        self.assertEqual(a.getpixel((159, 0)), (0, 0, 100))
+        b = chans[1].device.last                         # 不压暗，180° 翻转
+        self.assertEqual(b.getpixel((0, 0)), (0, 0, 200))
+        self.assertEqual(b.getpixel((159, 0)), (255, 0, 0))
+
+    def test_slow_device_submit_is_non_blocking(self):
+        class SlowDevice(M.OfflineDevice):
+            def __init__(self):
+                super().__init__()
+                self.waits = 0
+
+            def show_image(self, img):
+                self.waits += 1
+                time.sleep(0.3)
+                return super().show_image(img)
+
+        sched, chans = self.channels(devices=[SlowDevice(), M.OfflineDevice()])
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 0, 0))]
+        t0 = time.monotonic()
+        for _ in range(4):
+            self.assertTrue(sched._send_frame(None, 0.0))
+        cost = time.monotonic() - t0
+        # 慢设备在独立线程里发，渲染循环 4 次提交不会被它拖住
+        self.assertLess(cost, 0.2)
+        self.assertTrue(self.wait_frames(chans[1], 1))
+        self.assertEqual(chans[1].device.last.getpixel((0, 0)), (0, 0, 0))
+        snap = chans[0].snapshot()
+        self.assertLess(snap["queue"], 3)                 # 队列封顶，丢最旧
+        self.assertGreaterEqual(snap["dropped"], 1)
+
+    def test_single_device_stays_synchronous(self):
+        sched = M.Scheduler(M.OfflineDevice(), {"pages": []})
+        sched.background.frames = [Image.new("RGB", (160, 80), (0, 255, 0))]
+        self.assertTrue(sched._send_frame(None, 0.0))
+        # 单设备：发完即落地，行为和拆分前一致（CompositeTests 也依赖这点）
+        self.assertEqual(sched.device.last.getpixel((0, 0)), (0, 255, 0))
+        self.assertEqual(sched.metrics_snapshot()["devices"][0]["mode"], "sync")
+
+    def test_describe_lists_every_configured_device(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = {"devices": [{"id": "a", "port": "offline"},
+                           {"id": "b", "port": "COM_NOPE_9"}]}
+        mgr = M.DeviceManager(cfg, os.path.join(tmp, "config.json"))
+        try:
+            desc = mgr.describe()
+            self.assertEqual([d["id"] for d in desc], ["a", "b"])
+            self.assertTrue(desc[0]["offline"])
+            self.assertEqual(desc[0]["port"], "offline")
+            self.assertFalse(desc[1]["connected"])       # 连不上但不影响第一台
+            self.assertTrue(desc[0]["active"])
+            self.assertEqual(mgr.active_id, "a")
+            self.assertIsNotNone(mgr.active())
+            self.assertIs(mgr.active_channel(), mgr.channels["a"])
+        finally:
+            mgr.close_devices()
+
+    def test_sanitize_device_keeps_display_and_offline_port(self):
+        out = M._sanitize_device({"id": "x", "port": "offline",
+                                  "display": {"dim": 40}, "reverse": True}, 0)
+        self.assertEqual(out["port"], "offline")
+        self.assertEqual(out["display"]["dim"], 40)
+        self.assertTrue(out["display"]["reverse"])
+        self.assertEqual(out["display"]["orientation"], out["orientation"])
 
 
 if __name__ == "__main__":

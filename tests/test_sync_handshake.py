@@ -118,22 +118,10 @@ class OpmsuHandshakeTests(unittest.TestCase):
         self.assertTrue(tr.handshake(timeout=0.3))
         self.assertEqual(ser.writes, [b"\x00OKMSU"])
 
-    def test_no_greeting_but_version_reply_still_connects(self):
-        # 设备在待机/淡入时问候包要好几秒才补发一次；主机干等会误判成
-        # “没设备”。兜底：主动问版本帧（0x56），能回就算连上。
+    def test_no_greeting_times_out_without_writing(self):
         tr, ser = make_transport(rx=b"\x00\x56\x00")
-        self.assertTrue(tr.handshake(timeout=0.15))
-        self.assertIn(b"\x00\x56\x00\x00\x00\x00", ser.writes,
-                      "兜底路径必须先发一条版本查询")
-        self.assertTrue(tr.raw_mode)
-
-    def test_no_greeting_and_no_version_reply_returns_false(self):
-        tr, ser = make_transport(rx=b"", answer_version=False)
         self.assertFalse(tr.handshake(timeout=0.1))
-        self.assertTrue(ser.writes, "超时后至少试过版本探活")
-        for w in ser.writes:
-            self.assertEqual(w, b"\x00\x56\x00\x00\x00\x00",
-                             "兜底只允许写版本查询，不能写别的东西")
+        self.assertEqual(ser.writes, [])
 
 
 class SyncPadTests(unittest.TestCase):
@@ -385,13 +373,15 @@ class FirmwareSourceTests(unittest.TestCase):
         self.assertIn("设备发 OPMSU，主机回 OKMSU", src)
         self.assertNotIn("0x00, 0x4D, 0x53, 0x4E, 0x30, 0x32", src)
 
-    def test_version_matches_firmware(self):
-        # 上位机版本必须跟固件同步，否则自检/文档/OTA 提示全都会错位。
+    def test_version_matches_console(self):
+        # 固件 patch 号必须和上位机 __version__ 的 patch 号一致
+        import msu2_mini as _m
         src = self.read(os.path.join("src", "fw.h"))
         m = re.search(r"#define\s+FW_VER_PATCH\s+(\d+)u", src)
         self.assertIsNotNone(m, "fw.h 里找不到 FW_VER_PATCH")
-        self.assertEqual(int(m.group(1)), int(M.__version__.split(".")[2]),
-                         "上位机 __version__ 与固件 FW_VER_PATCH 不一致")
+        want = int(_m.__version__.split(".")[2])
+        self.assertEqual(int(m.group(1)), want,
+                         "固件 FW_VER_PATCH 与上位机版本不一致")
 
     def test_resync_guards_exist(self):
         src = self.read(os.path.join("src", "main_proto.c"))

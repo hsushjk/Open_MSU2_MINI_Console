@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -265,6 +266,49 @@ class BackgroundCrossfadeTests(unittest.TestCase):
         bg.frames = [Image.new("RGB", (160, 80), (7, 8, 9))]
         self.assertEqual(bg.tick(0.0).getpixel((0, 0)), (7, 8, 9))
 
+    def test_needs_frames_keeps_asking_until_fade_done(self):
+        # 问题 1+2：静态插件下没人再请求合成，淡入只发出第一帧（还是黑的）。
+        # needs_frames() 必须在整个过渡窗口里一直为真，主循环才会逐帧推。
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "white.png"
+            Image.new("RGB", (160, 80), (255, 255, 255)).save(src)
+            bg = M.Background()
+            bg.load(str(src))
+            self.assertTrue(bg.fading, "load 之后应该在淡入")
+            self.assertTrue(bg.needs_frames(0.0), "淡入开始就要请求帧")
+
+            ticks = 0
+            grays = set()
+            t = 0.0
+            while t < M.Background.CROSSFADE_SECS + 0.5:
+                if bg.needs_frames(t):
+                    frame = bg.tick(t).convert("RGB")
+                    grays.add(frame.getpixel((80, 40))[0])
+                    ticks += 1
+                t += 0.05
+            self.assertGreaterEqual(ticks, 8,
+                                    "1.0 s 淡入至少要推 8 次合成（≈0.08–0.12 s 一步）")
+            self.assertFalse(bg.fading)
+            self.assertGreaterEqual(len(grays), 3,
+                                    "中间帧要有多个灰度级，肉眼才看得出渐变")
+            self.assertFalse(bg.needs_frames(t + 1.0), "淡入结束后不该再请求帧")
+
+    def test_needs_frames_for_animated_background(self):
+        # 多帧 GIF / 轮播换图也走同一条持续推帧路径。
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "anim.gif"
+            a = Image.new("RGB", (160, 80), (255, 0, 0))
+            b = Image.new("RGB", (160, 80), (0, 0, 255))
+            a.save(src, save_all=True, append_images=[b], duration=80, loop=0)
+            bg = M.Background()
+            bg.load(str(src))
+            bg.tick(0.0)
+            bg.tick(M.Background.CROSSFADE_SECS + 0.2)   # 走完淡入
+            self.assertFalse(bg.fading)
+            self.assertGreaterEqual(len(bg.frames), 2)
+            self.assertTrue(bg.needs_frames(M.Background.CROSSFADE_SECS + 5.0),
+                            "动图翻页必须靠主循环持续要帧")
+
 
 class ClockColorTests(unittest.TestCase):
     def test_parse_color_accepts_hex_with_or_without_hash(self):
@@ -302,8 +346,16 @@ class ClockColorTests(unittest.TestCase):
 
 class IndexHtmlTests(unittest.TestCase):
     def test_favicon_wired(self):
-        self.assertIn('<link rel="icon" href="/favicon.ico" type="image/x-icon">',
-                      M.INDEX_HTML)
+        html = M.INDEX_HTML
+        # PNG 排前面：部分浏览器/反代不认 ICO；两个都带 ?v= 版本串，
+        # 这样换图标时不会被旧的 404/旧图标缓存卡住。
+        self.assertIn('<link rel="icon" type="image/png" sizes="32x32" '
+                      'href="/favicon.png?v=2">', html)
+        self.assertIn('<link rel="icon" type="image/x-icon" '
+                      'href="/favicon.ico?v=2">', html)
+        self.assertIn('href="/favicon.png?v=2"', html)
+        self.assertNotIn('<link rel="icon" href="/favicon.ico" '
+                         'type="image/x-icon">', html)
 
     def test_multi_background_ui_replaced_textarea(self):
         self.assertIn('id="bg-list"', M.INDEX_HTML)
@@ -322,6 +374,11 @@ class IndexHtmlTests(unittest.TestCase):
         self.assertIn("formatBytes", script)
         self.assertIn("xhr.upload.onprogress", script)
         self.assertIn("X-Purpose", script)
+        # 升级收尾：前端轮询 /api/flash/phase，设备重启期间显示「设备重启中…」，
+        # 拿到 {"ok":true,"fw":"x.y.z"} 后显示升级完成，不再僵在“已写入”。
+        self.assertIn("/api/flash/phase", script)
+        self.assertIn("设备重启中", script)
+        self.assertIn("升级完成", script)
 
     def test_single_default_config_path(self):
         src_text = Path(M.__file__).read_text(encoding="utf-8")
@@ -389,6 +446,11 @@ class WebUIHttpTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + path, timeout=10) as r:
             return r.status, r.headers.get("Content-Type", ""), r.read()
 
+    def _fetch(self, path):
+        """带响应头抓一次（favicon 要看 Cache-Control / Content-Type）。"""
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return r.status, r.headers, r.read()
+
     def _post(self, path, body, headers=None, raw=None):
         data = raw if raw is not None else json.dumps(body).encode()
         hdrs = {"Content-Type": "application/json"}
@@ -412,6 +474,38 @@ class WebUIHttpTests(unittest.TestCase):
         self.assertIn("image/x-icon", ctype)
         self.assertTrue(ico.startswith(b"\x00\x00\x01\x00"),
                         "favicon 应该是真正的 ICO 内容")
+
+    def test_favicon_formats_and_cache_headers(self):
+        # 浏览器实测“请求 200 但图标不显示”：旧 404 被缓存 + 只给 ICO。
+        # 现在 .ico 与 .png 都带 ?v=2，PNG 由 Pillow 从 ico 里抽最大尺寸转，
+        # 两个都允许缓存 1 小时（版本串变了才会重新拉）。
+        status, hdrs, ico = self._fetch("/favicon.ico?v=2")
+        self.assertEqual(status, 200)
+        self.assertIn("image/x-icon", hdrs.get("Content-Type", ""))
+        self.assertTrue(ico.startswith(b"\x00\x00\x01\x00"),
+                        "favicon.ico 应该是真正的 ICO 内容")
+        self.assertEqual(hdrs.get("Cache-Control"), M.FAVICON_CACHE_CONTROL)
+
+        status, hdrs, png = self._fetch("/favicon.png?v=2")
+        self.assertEqual(status, 200)
+        self.assertIn("image/png", hdrs.get("Content-Type", ""))
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"),
+                        "favicon.png 必须是 PNG 魔数（不是 ico 字节）")
+        self.assertEqual(hdrs.get("Cache-Control"), M.FAVICON_CACHE_CONTROL)
+        with Image.open(io.BytesIO(png)) as im:
+            self.assertEqual(im.format, "PNG")
+            self.assertGreaterEqual(im.size[0], 16)
+
+    def test_flash_phase_endpoint_is_get(self):
+        # 前端用 GET 轮询 /api/flash/phase：升级请求还挂着的时候靠它把提示
+        # 从「正在写入」切到「设备重启中…」。以前只有 POST 分支，GET 会 404。
+        status, ctype, body = self._get("/api/flash/phase")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", ctype)
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data.get("ok"))
+        self.assertIn("phase", data)
+        self.assertIn("elapsed", data)
 
     def test_status_touch_asset_endpoints(self):
         # /api/status 是给轮询用的状态快照，本来就没有 ok 字段

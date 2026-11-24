@@ -76,7 +76,7 @@ class SerialTransport:
         self.last_status = None      # 调试模式下最近一帧的 11 字节详情（px/win/ms）
 
     @_serial_locked
-    def open(self):
+    def open(self, handshake_timeout=2.0):
         with self._lock:
             if self._connected and self._handshaked:
                 return True
@@ -100,7 +100,8 @@ class SerialTransport:
                     self.last_error = f"打开 {self.port} 失败: {e}"
                     return False
             self._connected = True
-            if not self._handshaked and not self.handshake():
+            if not self._handshaked and not self.handshake(
+                    timeout=handshake_timeout):
                 self.close(); return False
             log.info("串口已打开: %s @ %d", self.port, self.baud)
             ver = self.query_version()
@@ -461,7 +462,11 @@ class SerialTransport:
             self._drain_upload_window()
             return False, "CRC check failed on the device (0x%02X)" % (r if r is not None else 0)
         self._ser.write(MiniProtocol.flash_apply())
-        time.sleep(0.2)
+        # 收到 [OK] uploaded 后设备立刻重启：马上关串口，从这里起一个字节都不写。
+        # 旧代码 sleep(0.2) 的“礼貌等待”正好让调度器往正在重启的句柄里塞像素帧，
+        # Windows 上就是 WriteFile failed (PermissionError(13, ...)) 刷屏。
+        self.close()
+        log.info("固件已写入，串口已关闭，等待设备重新枚举")
         return True, "uploaded %d bytes, device is rebooting" % total
 
     @_serial_locked

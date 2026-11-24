@@ -245,9 +245,12 @@ class MiniDevice:
         self._full_resends = 0
         self._last_repair_warn = 0.0
         self._tiles_ok = True
+        # 固件升级期间挂起：设备正在重启/重新枚举，通道不能再往里写像素帧，
+        # 否则 Windows 会抛 WriteFile failed (PermissionError(13, ...))。
+        self._suspended = False
 
-    def open(self):
-        ok = self.transport.open()
+    def open(self, handshake_timeout=2.0):
+        ok = self.transport.open(handshake_timeout=handshake_timeout)
         if ok:
             self.encoder.reset()
             self._ack_fails = 0
@@ -266,7 +269,21 @@ class MiniDevice:
     @property
     def connected(self): return self.transport.connected
 
+    def suspend(self):
+        """固件升级用：恢复之前拒绝发送任何像素帧、也不再自动重连。"""
+        self._suspended = True
+
+    def resume(self):
+        self._suspended = False
+
+    @property
+    def suspended(self):
+        return self._suspended
+
     def show_image(self, img):
+        if self._suspended:
+            # 设备在重启：直接丢掉这一帧，别往不存在的句柄里写。
+            return False
         ok = self._show_image_once(img)
         if ok:
             return True
@@ -455,6 +472,9 @@ class MiniDevice:
 
 
     def flash_firmware(self, data, progress=None):
+        # 上传期间先挂起：设备收完 flash_apply 就重启，串口会消失；
+        # transport.flash_firmware 收到 [OK] uploaded 后自己 close()。
+        self._suspended = True
         return self.transport.flash_firmware(data, progress=progress)
 
     def boot_trace(self):
@@ -482,15 +502,28 @@ class OfflineDevice:
         self.last = None
         self.frames = 0
         self.transport = type("T", (), {"bytes_written": 0})()
+        self._suspended = False
 
-    def open(self):
+    def open(self, handshake_timeout=2.0):
         self.connected = True
         return True
 
     def close(self):
         self.connected = False
 
+    def suspend(self):
+        self._suspended = True
+
+    def resume(self):
+        self._suspended = False
+
+    @property
+    def suspended(self):
+        return self._suspended
+
     def show_image(self, img):
+        if self._suspended:
+            return False
         self.last = img.copy()
         self.frames += 1
         self.transport.bytes_written += img.size[0] * img.size[1] * 2

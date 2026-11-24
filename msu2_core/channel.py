@@ -211,6 +211,12 @@ class DeviceChannel:
 
     def _deliver(self, img):
         """真正写设备（同步通道在渲染线程、异步通道在发送线程里调用）。"""
+        if getattr(self.device, "suspended", False):
+            # 固件升级中：设备正在重启，一个字节都不能写。直接吞掉这一帧，
+            # 计一次 dropped，但返回 True —— 让调度器别以为“发送失败”而重试。
+            self._dropped += 1
+            self._last_error = "设备正在升级固件，暂停发送"
+            return True
         t0 = time.perf_counter()
         try:
             ok = bool(self.device.show_image(img))
@@ -241,9 +247,19 @@ class DeviceChannel:
         """确保这台设备在线；连不上返回 False（只影响自己）。"""
         if self.connected:
             return True
+        if getattr(self.device, "suspended", False):
+            # 固件升级后等设备重新枚举：由 Scheduler 的升级流程负责重连并 resume，
+            # 这里不能抢着 open()，否则会和轮询抢同一个 COM 句柄、还会刷警告。
+            return False
         ok = False
         try:
-            ok = bool(self.device.open())
+            ok = bool(self.device.open(handshake_timeout=1.0))
+        except TypeError:
+            try:
+                ok = bool(self.device.open())
+            except Exception as e:
+                self._last_error = str(e)
+                ok = False
         except Exception as e:
             self._last_error = str(e)
             ok = False
@@ -265,6 +281,9 @@ class DeviceChannel:
     def try_rediscover(self):
         """auto 端口的设备：每 3 秒扫一次串口，拔插后 COM 号变了也能自己找回。"""
         if self.offline or self._discover is None:
+            return False
+        if getattr(self.device, "suspended", False):
+            # 升级流程正在自己轮询/重连，别和它抢串口。
             return False
         now = time.monotonic()
         if now - self._last_scan < REDISCOVER_INTERVAL:

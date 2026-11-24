@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -441,6 +442,226 @@ class MultiDeviceTests(unittest.TestCase):
         self.assertEqual(out["display"]["dim"], 40)
         self.assertTrue(out["display"]["reverse"])
         self.assertEqual(out["display"]["orientation"], out["orientation"])
+
+
+class BackgroundSchedulingTests(unittest.TestCase):
+    """问题 1+2：背景淡入/动图期间，主循环必须持续请求合成帧。
+
+    以前 need_bg 要求 len(frames) > 1，单张静态背景的淡入永远只推第一帧
+    （黑屏），屏幕上看着像“硬切 + 逐行刷新”。
+    """
+
+    def make(self, **cfg):
+        cfg.setdefault("pages", [])
+        return M.Scheduler(M.OfflineDevice(), cfg)
+
+    def test_bg_due_true_through_fade_then_stops(self):
+        sched = self.make()
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "white.png")
+            Image.new("RGB", (160, 80), (255, 255, 255)).save(src)
+            sched._bg_enabled = True
+            sched.background.load(src)
+            last = 0.0
+            ticks = 0
+            t = 0.0
+            while t < M.Background.CROSSFADE_SECS + 0.5:
+                if sched._bg_due(t, last):
+                    self.assertIsNotNone(sched.background.tick(t))
+                    self.assertTrue(sched._send_frame(None, t))
+                    last = t
+                    ticks += 1
+                t += 0.01
+            self.assertGreaterEqual(ticks, 8,
+                                    "1.0 s 淡入至少推 8 帧（离线设备 80 ms 一步）")
+            self.assertGreaterEqual(sched.device.frames, 8)
+            self.assertFalse(sched.background.fading)
+            self.assertFalse(sched._bg_due(t + 1.0, last),
+                             "淡入结束后不该继续空推帧")
+
+    def test_bg_step_matches_link_rate(self):
+        sched = self.make()
+        self.assertAlmostEqual(sched._bg_step_secs(), 0.08, places=3)
+        sched._send_gap = 0.30
+        self.assertLessEqual(sched._bg_step_secs(), 0.30)
+        sched._send_gap = 0.01
+        self.assertGreaterEqual(sched._bg_step_secs(), 0.04)
+
+
+class CapturingSerial:
+    """假串口：记录每一笔写入，close() 后拒绝再写。"""
+
+    def __init__(self):
+        self.writes = []
+        self.closed = False
+
+    def write(self, data):
+        if self.closed:
+            raise OSError("port is closed")
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def reset_input_buffer(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def read(self, n=1):
+        return b""
+
+
+class ScripedRebootDevice:
+    """假设备：open() 按脚本返回，用来测升级后的有界重连轮询。"""
+
+    def __init__(self, reopen_calls=1, version=(1, 0, 4, 0)):
+        self.port = "COM_fake"
+        self.connected = False
+        self._suspended = False
+        self.opens = 0
+        self.reopen_calls = reopen_calls      # 前几次 open() 返回 False
+        self.version = version
+        self.flashed = []
+        self.transport = type("T", (), {})()
+        self.transport.fw_version = (1, 0, 3)
+        self.transport.query_version = (
+            lambda timeout=0.4: self.version)
+
+    def open(self, handshake_timeout=2.0):
+        self.opens += 1
+        if self.opens <= self.reopen_calls:
+            return False
+        self.connected = True
+        return True
+
+    def close(self):
+        self.connected = False
+
+    def suspend(self):
+        self._suspended = True
+
+    def resume(self):
+        self._suspended = False
+
+    @property
+    def suspended(self):
+        return self._suspended
+
+    def flash_firmware(self, data, progress=None):
+        self.flashed.append(len(data))
+        return True, "uploaded %d bytes, device is rebooting" % len(data)
+
+
+class FirmwareFlashTests(unittest.TestCase):
+    """问题 4：写完 [OK] uploaded 立刻关串口，然后有界轮询等设备回来。"""
+
+    def make(self):
+        return M.Scheduler(M.OfflineDevice(), {"pages": []})
+
+    def test_transport_closes_port_immediately_after_ok(self):
+        tr = M.SerialTransport("COM_fake")
+        ser = CapturingSerial()
+        tr._ser = ser
+        tr._connected = True
+        tr._handshaked = True
+        tr._reply_byte = lambda *a, **k: 0x06       # 设备对每一步都回 0x06
+        ok, why = tr.flash_firmware(bytes(512))
+        self.assertTrue(ok, why)
+        self.assertIn("rebooting", why)
+        self.assertIsNone(tr._ser, "收到 [OK] 之后必须立刻关串口")
+        self.assertFalse(tr.connected)
+        self.assertTrue(ser.closed)
+        self.assertEqual(ser.writes[-1], M.MiniProtocol.flash_apply(),
+                         "flash_apply 必须是最后一笔写入")
+        before = len(ser.writes)
+        self.assertFalse(tr.write(b"\x00" * 8), "关串口后 write() 必须直接拒绝")
+        self.assertEqual(len(ser.writes), before, "关串口后不该再有任何写入")
+
+    def test_device_flash_suspends_channel_writes(self):
+        dev = M.MiniDevice("COM_fake")
+        dev.transport = type("T", (), {
+            "fw_version": (1, 0, 3),
+            "flash_firmware": lambda self, data, progress=None: (
+                True, "uploaded")})()
+        ok, _why = dev.flash_firmware(bytes(256))
+        self.assertTrue(ok)
+        self.assertTrue(dev.suspended, "上传期间必须挂起，通道不能再写帧")
+        self.assertFalse(dev.show_image(Image.new("RGB", (160, 80))))
+
+    def test_wait_device_back_success(self):
+        sched = self.make()
+        dev = ScripedRebootDevice(reopen_calls=2)
+        back, fw, why = sched._wait_device_back(dev, poll=0.01, timeout=2.0)
+        self.assertTrue(back, why)
+        self.assertEqual(fw, "1.0.4")
+        self.assertEqual(len(dev.flashed), 0)
+
+    def test_wait_device_back_timeout(self):
+        sched = self.make()
+        dev = ScripedRebootDevice(reopen_calls=10 ** 9)
+        back, fw, why = sched._wait_device_back(dev, poll=0.01, timeout=0.08)
+        self.assertFalse(back)
+        self.assertEqual(fw, "")
+        self.assertIn("拔插", why)
+        self.assertGreaterEqual(dev.opens, 2, "15 s 窗口内要反复试 open()")
+
+    def test_flash_safe_success_reports_fw_and_resumes(self):
+        sched = self.make()
+        dev = ScripedRebootDevice(reopen_calls=0)
+        sched.device = dev
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as fh:
+            fh.write(bytes(256))
+            fw_path = fh.name
+        try:
+            res = sched.flash_firmware_safe(fw_path)
+        finally:
+            os.unlink(fw_path)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["rebooted"])
+        self.assertEqual(res["fw"], "1.0.4")
+        self.assertIn("升级完成", res["msg"])
+        self.assertEqual(dev.flashed, [256])
+        self.assertFalse(dev.suspended, "设备回来之后要恢复发帧")
+        self.assertEqual(sched.flash_phase, "done")
+        self.assertEqual(sched._devcfg_pause_until, 0.0)
+
+    def test_flash_safe_timeout_reports_unplug_hint(self):
+        sched = self.make()
+        dev = ScripedRebootDevice(reopen_calls=0)
+        sched.device = dev
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as fh:
+            fh.write(bytes(256))
+            fw_path = fh.name
+        try:
+            with mock.patch.object(
+                    sched, "_wait_device_back",
+                    return_value=(False, "",
+                                  "设备没有回来，请拔插一次 USB 再重试")):
+                res = sched.flash_firmware_safe(fw_path)
+        finally:
+            os.unlink(fw_path)
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["rebooted"], "已经上传成功，设备只是没回来")
+        self.assertIn("拔插", res["err"])
+        self.assertTrue(dev.suspended, "没回来时保持挂起，避免往复活中的串口写帧")
+
+
+class SuspendedChannelTests(unittest.TestCase):
+    """升级期间通道要静默丢帧：不写串口、也不让调度器当成发送失败重试。"""
+
+    def test_deliver_skips_frames_while_suspended(self):
+        dev = M.OfflineDevice()
+        ch = M.DeviceChannel("d1", {"pages": []}, dev, sync=True)
+        dev.connected = False          # 模拟“串口已经关了”的升级窗口
+        dev.suspend()
+        self.assertTrue(ch.submit(solid()), "挂起时算“已处理”，别触发重试")
+        self.assertEqual(dev.frames, 0, "挂起期间一个像素帧都不能写")
+        self.assertGreaterEqual(ch.snapshot()["dropped"], 1)
+        self.assertFalse(ch.ensure_open(), "挂起期间不该抢着 open()")
+        dev.resume()
+        self.assertTrue(ch.submit(solid()))
+        self.assertEqual(dev.frames, 1)
+        self.assertTrue(ch.ensure_open())
 
 
 if __name__ == "__main__":

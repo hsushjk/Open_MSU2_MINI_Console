@@ -102,6 +102,16 @@ except Exception:  # pragma: no cover - 没装 numpy 时退化为原样发送
 
 HEARTBEAT_INTERVAL = 2.0
 
+# 固件升级（Web OTA）之后的“等设备回来”：
+# flash_apply 写出后设备立刻重启，串口会消失再重新枚举。这里每 200 ms 试一次
+# open()+query_version()，最多等 15 s；收到 [OK] uploaded 后一个像素帧都不写。
+REBOOT_POLL_SECS = 0.2
+REBOOT_TIMEOUT = 15.0
+REBOOT_HANDSHAKE_TIMEOUT = 0.35
+
+# favicon 允许浏览器缓存一小时：版本号在 URL 查询串里（?v=2），换图标时改它。
+FAVICON_CACHE_CONTROL = "public, max-age=3600"
+
 # 插件热加载：主循环每隔这么久查一次插件文件指纹（mtime+size）。
 RELOAD_POLL = 2.0
 
@@ -129,7 +139,10 @@ class Background:
     MAX_FRAMES = 300
     MODES = ("fit", "fill", "stretch")
     PLAYLIST_SECS = 12.0
-    CROSSFADE_SECS = 0.45       # 背景图切换/首次出现时的交叉淡入淡出时长
+    # 0.45 s 在真机上只能推 3–4 帧（25 KB 整帧约 130–180 ms），淡入还没开始
+    # 就结束了，眼睛看到的是“一帧黑 -> 硬切”，所以拉长到 1.0 s：按实测帧
+    # 间隔 0.12–0.20 s 算，一次淡入有 5–8 个中间帧，渐变肉眼可见。
+    CROSSFADE_SECS = 1.0        # 背景图切换/首次出现时的交叉淡入淡出时长
 
     def __init__(self):
         self.path = ""
@@ -144,9 +157,12 @@ class Background:
         self.group_ts = None
         self.idx = 0
         self.t_last = None
+        self.pl_interval = self.PLAYLIST_SECS
+        self.shuffle = False
         self._fade_from = None
         self._fade_start = None
         self._fade_pending = False
+        self._fade_frames = 0
         self._last_frame = None
 
     def configure(self, dim=0, blur=0):
@@ -175,11 +191,41 @@ class Background:
             self._fade_from = Image.new("RGB", (SCREEN_W, SCREEN_H), "black")
         self._fade_start = None
         self._fade_pending = True
+        self._fade_frames = 0
 
     def _reset_fade(self):
         self._fade_from = None
         self._fade_start = None
         self._fade_pending = False
+        self._fade_frames = 0
+
+    @property
+    def fading(self):
+        """交叉淡入淡出是否还没走完（Scheduler 靠它决定要不要继续要帧）。"""
+        return self._fade_from is not None
+
+    def needs_frames(self, now):
+        """现在是否还必须继续合成/发送新帧。
+
+        三个来源：
+        - 交叉淡入淡出进行中：时间在走，必须持续推帧才能看到渐变；
+        - 背景轮播到点：该换下一组图了；
+        - 动图帧到点：GIF/目录多帧动画该翻页了。
+        插件静止（不渲染）时 Scheduler 也要靠这个继续要帧，否则背景会冻住。
+        """
+        if self._fade_from is not None:
+            return True
+        if len(self.groups) > 1 and self.group_ts is not None:
+            if now - self.group_ts >= self.pl_interval:
+                return True
+        if len(self.frames) > 1:
+            try:
+                dur = float(self.durations[self.idx])
+            except (IndexError, TypeError, ValueError):
+                dur = 0.0
+            if dur > 0.0 and (self.t_last is None or now - self.t_last >= dur):
+                return True
+        return False
 
     def _apply_fade(self, img, now):
         """把某一帧和淡出起点混合；没有淡入任务时原样返回。"""
@@ -191,10 +237,18 @@ class Background:
         span = max(0.01, float(self.CROSSFADE_SECS))
         t = 0.0 if self._fade_start is None else (now - self._fade_start) / span
         if t >= 1.0:
+            started = self._fade_start
+            frames = self._fade_frames
             self._fade_from = None
             self._fade_start = None
+            self._fade_frames = 0
+            if frames:
+                elapsed = (now - started) if started is not None else span
+                log.info("背景交叉淡入完成：%.2f s 内推了 %d 个中间帧",
+                         elapsed, frames)
             return img
         t = max(0.0, min(1.0, t))
+        self._fade_frames += 1
         try:
             return Image.blend(self._fade_from, img.convert("RGB"), t)
         except Exception:
@@ -842,6 +896,13 @@ class Scheduler(threading.Thread):
         self._current = 0
         self._cooldown_until = 0.0
         self._last_send_mono = 0.0
+        self._last_retry_mono = 0.0
+        # 固件升级状态：WebUI 的 /api/flash/phase 靠它把“正在写”和“设备重启中”
+        # 分开显示；_flash_lock 防止两个页面同时刷固件。
+        self._flash_lock = threading.Lock()
+        self.flash_phase = ""
+        self.flash_started = 0.0
+        self._reboot_attempts = 0
 
         self._reload_widgets()
 
@@ -1197,35 +1258,148 @@ class Scheduler(threading.Thread):
     def asset_erase_safe(self, kind, slot):
         return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
 
-    def flash_firmware_safe(self, path):
-        """Upload a firmware image into the device NOR and reboot it."""
+    @staticmethod
+    def _open_device(dev, timeout=2.0):
+        """调设备 open()，兼容不接受 handshake_timeout 的实现（测试替身）。"""
+        open_fn = getattr(dev, "open", None)
+        if not callable(open_fn):
+            return False
         try:
-            data, note = _load_firmware_image(path)
-        except Exception as exc:
-            log.error("固件升级失败：读不了固件 %s：%s", path, exc)
-            return False, "读不了固件：%s" % (exc,)
-        if len(data) > 48000:
-            log.error("固件升级失败：镜像太大（%d 字节，上限 48000）", len(data))
-            return False, "固件太大（%d 字节，上限 48000）" % len(data)
-        fw = getattr(self.device.transport, "fw_version", None) or getattr(
-            self.device, "fw_version", None)
-        fwv = normalize_fw_version(fw)
-        if fwv is not None and fwv < (1, 0, 0):
-            log.error("固件升级失败：设备固件 %s 不支持自更新",
-                      format_fw_version(fwv))
-            return False, ("设备固件 %s 不支持自更新，请先用 ISP 刷一次 v1.0.0"
-                           % format_fw_version(fwv))
-        log.info("固件升级：写入 %d 字节", len(data))
+            return bool(open_fn(handshake_timeout=timeout))
+        except TypeError:
+            return bool(open_fn())
 
-        def _run():
-            return self.device.flash_firmware(data)
+    def _wait_device_back(self, dev, poll=None, timeout=None):
+        """固件写完后的有界轮询：每 200 ms 试一次，最多 15 s。
 
-        ok, why = self._asset_idle(_run, pause=60.0)
-        if ok:
+        设备重启时串口会消失再出现，transport.flash_firmware 收到 [OK]
+        uploaded 后已经主动关掉了旧句柄，所以这里只 open() + query_version()，
+        绝不写像素帧。返回 (是否回来, "x.y.z", 失败说明)。
+        """
+        poll = REBOOT_POLL_SECS if poll is None else float(poll)
+        deadline = time.monotonic() + (REBOOT_TIMEOUT if timeout is None
+                                       else float(timeout))
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            try:
+                if self._open_device(dev, timeout=REBOOT_HANDSHAKE_TIMEOUT):
+                    tr = getattr(dev, "transport", None)
+                    ver = None
+                    if tr is not None:
+                        try:
+                            ver = tr.query_version(timeout=0.4)
+                        except Exception:
+                            ver = None
+                    if ver:
+                        self._reboot_attempts = attempts
+                        return True, format_fw_version(
+                            normalize_fw_version(ver) or ver), ""
+                try:
+                    if getattr(dev, "connected", False):
+                        dev.close()
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.debug("等待设备回来（第 %d 次）：%s", attempts, exc)
+            time.sleep(poll)
+        self._reboot_attempts = attempts
+        return False, "", "设备没有回来，请拔插一次 USB 再重试"
+
+    def flash_firmware_safe(self, path):
+        """把固件写进设备 NOR 并等它重启回来，返回 WebUI 可直接下发的字典。
+
+        成功：{"ok": True, "rebooted": True, "fw": "1.0.4", "msg": "升级完成：固件 1.0.4"}
+        设备没回来：{"ok": False, "rebooted": True, "err": "设备没有回来，请拔插一次 USB 再重试"}
+        读文件/上传失败：{"ok": False, "rebooted": False, "err": ...}
+        """
+        result = {"ok": False, "rebooted": False, "fw": ""}
+        if not self._flash_lock.acquire(blocking=False):
+            result["err"] = "另一个固件升级正在进行中"
+            return result
+        self.flash_phase = "uploading"
+        self.flash_started = time.monotonic()
+        self._reboot_attempts = 0
+        try:
+            try:
+                data, note = _load_firmware_image(path)
+            except Exception as exc:
+                log.error("固件升级失败：读不了固件 %s：%s", path, exc)
+                self.flash_phase = "failed"
+                result["err"] = "读不了固件：%s" % (exc,)
+                return result
+            if len(data) > 48000:
+                log.error("固件升级失败：镜像太大（%d 字节，上限 48000）", len(data))
+                self.flash_phase = "failed"
+                result["err"] = "固件太大（%d 字节，上限 48000）" % len(data)
+                return result
+            dev = self.device
+            fw = (getattr(getattr(dev, "transport", None), "fw_version", None)
+                  or getattr(dev, "fw_version", None))
+            fwv = normalize_fw_version(fw)
+            if fwv is not None and fwv < (1, 0, 0):
+                log.error("固件升级失败：设备固件 %s 不支持自更新",
+                          format_fw_version(fwv))
+                self.flash_phase = "failed"
+                result["err"] = ("设备固件 %s 不支持自更新，请先用 ISP 刷一次 v1.0.0"
+                                 % format_fw_version(fwv))
+                return result
+            # 从现在起通道不再发帧；主循环也会被 _devcfg_pause_until 挡住。
+            suspend = getattr(dev, "suspend", None)
+            if callable(suspend):
+                suspend()
+            if not getattr(dev, "connected", False):
+                # 上一次升级超时/失败后串口是关着的：先连上再写。
+                if not self._open_device(dev, timeout=1.5):
+                    resume = getattr(dev, "resume", None)
+                    if callable(resume):
+                        resume()
+                    self.flash_phase = "failed"
+                    result["err"] = "设备没有连上，请先插好 USB 再试"
+                    log.error("固件升级失败：设备 %s 没有连上",
+                              getattr(dev, "port", ""))
+                    return result
+            log.info("固件升级：写入 %d 字节", len(data))
+            try:
+                ok, why = self._asset_idle(
+                    lambda: dev.flash_firmware(data), pause=60.0)
+            except Exception as exc:
+                ok, why = False, "上传异常：%s" % (exc,)
+            if not ok:
+                resume = getattr(dev, "resume", None)
+                if callable(resume):
+                    resume()
+                self._devcfg_pause_until = 0.0
+                self._force_send = True
+                self.flash_phase = "failed"
+                result["err"] = str(why)
+                log.error("固件升级失败：%s", why)
+                return result
             log.info("固件升级：%s", why)
-        else:
-            log.error("固件升级失败：%s", why)
-        return bool(ok), str(why)
+            # transport.flash_firmware 收到 [OK] uploaded 后已经主动关了串口，
+            # 从这里开始一个字节都不写，只做有界轮询等它重新枚举、回版本。
+            self.flash_phase = "rebooting"
+            back, fw_text, why_back = self._wait_device_back(dev)
+            if not back:
+                # 保持 suspend：设备不在时让通道安安静静，等用户拔插后重刷。
+                self.flash_phase = "failed"
+                result["rebooted"] = True
+                result["err"] = why_back
+                log.error("固件升级后设备没有回来（轮询 %d 次）：%s",
+                          self._reboot_attempts, why_back)
+                return result
+            resume = getattr(dev, "resume", None)
+            if callable(resume):
+                resume()
+            self._devcfg_pause_until = 0.0
+            self._force_send = True
+            self.flash_phase = "done"
+            log.info("固件升级完成：设备已回来，固件 %s（轮询 %d 次）",
+                     fw_text, self._reboot_attempts)
+            return {"ok": True, "rebooted": True, "fw": fw_text,
+                    "msg": "升级完成：固件 %s" % fw_text}
+        finally:
+            self._flash_lock.release()
 
     def asset_wipe_safe(self):
         return self._asset_idle(lambda: self.device.asset_wipe(), pause=1.0)
@@ -1519,6 +1693,27 @@ class Scheduler(threading.Thread):
         self.metrics["_bytes_last"] = total
         self.metrics["bytes"] = int(self.metrics.get("bytes", 0)) + delta
         self._frames_window.append((mono, delta))
+
+    def _bg_step_secs(self):
+        """背景淡入/动图连续推帧的节拍：跟上一帧实际占用的链路时间对齐。
+
+        0.45 s 的旧淡入只能塞进 3–4 帧，看上去就是硬切。这里按上一帧的发送
+        耗时（_count_frame 里的 _send_gap，已经带了 15% 余量）决定下一帧最早
+        什么时候排；链路空闲（离线/测试设备）时用 80 ms 兜底，保证 1.0 s 的
+        淡入有 ≥12 次合成请求。真正发不出去时 _send_frame 返回 False，
+        主循环会在 0.1 s 后用 _force_send 重试，不会卡死。
+        """
+        gap = float(getattr(self, "_send_gap", 0.0) or 0.0)
+        if gap <= 0.0:
+            gap = 0.08
+        return max(0.04, min(0.30, gap))
+
+    def _bg_due(self, mono, last_bg_ts):
+        """这一轮要不要为背景图再合成/推一帧（淡入、动图、轮播换图都算）。"""
+        return (self._bg_enabled
+                and self.background.needs_frames(mono)
+                and mono - last_bg_ts >= self._bg_step_secs())
+
     @staticmethod
     def _plugin_fingerprint(dirs):
         """采集插件文件指纹：顶层 *.py 与 */__init__.py，取 (mtime_ns, size)。"""
@@ -1911,9 +2106,10 @@ class Scheduler(threading.Thread):
                     wctx.orientation = self.orientation
 
                     need_render = (mono - last_mono >= w.interval)
-                    need_bg = (self._bg_enabled and
-                               len(self.background.frames) > 1 and
-                               mono - last_bg_ts >= 0.1)
+                    # 背景是否“还在动”：淡入淡出、轮播换图、动图翻页都算。
+                    # 以前这里要求 len(frames) > 1，单张静态背景的淡入永远推不
+                    # 出去，屏幕上只能看到“一帧黑 -> 硬切”（还以为是设备逐行刷新）。
+                    need_bg = self._bg_due(mono, last_bg_ts)
                     need_heartbeat = (not need_render and not need_bg and
                                       mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
 
@@ -1941,6 +2137,13 @@ class Scheduler(threading.Thread):
                             overlay = self._overlay
                     else:
                         overlay = None
+
+                    # 上一帧发失败（设备忙/掉线/正在重启）：0.1 s 后重试一次，
+                    # 不要等到插件自己的 interval 才动，否则淡入会停在半透明。
+                    need_retry = (self._force_send and not need_render and
+                                  not need_bg and overlay is None and
+                                  mono >= self._devcfg_pause_until and
+                                  mono - self._last_retry_mono >= 0.1)
 
                     if overlay is not None:
                         key = id(overlay)
@@ -1985,6 +2188,14 @@ class Scheduler(threading.Thread):
                         if self._send_frame(self._last_imgs.get(w.name), mono):
                             self._last_send_mono = mono
                             self._count_frame(mono)
+                        else:
+                            self._force_send = True
+                    elif need_retry:
+                        self._last_retry_mono = mono
+                        if self._send_frame(self._last_imgs.get(w.name), mono):
+                            self._last_send_mono = mono
+                            self._count_frame(mono)
+                            self._force_send = False
                         else:
                             self._force_send = True
                     elif need_heartbeat:
@@ -2393,7 +2604,9 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Open_MSU2_MINI_Console</title>
-<link rel="icon" href="/favicon.ico" type="image/x-icon">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon.png?v=2">
+<link rel="icon" type="image/x-icon" href="/favicon.ico?v=2">
+<link rel="apple-touch-icon" href="/favicon.png?v=2">
 <style>
 body { font-family: Consolas, Menlo, monospace; max-width: 820px;
        margin: 2em auto; padding: 0 1em; color: #222; font-size: 14px;
@@ -4029,19 +4242,32 @@ async function firmwarePicked(ev) {
   const pickBtn = document.getElementById('fw-pick');
   if (pickBtn) pickBtn.disabled = true;
   const started = Date.now();
+  let phase = 'uploading';
   const timer = setInterval(() => {
-    setMsg('msg-flash', '正在写入设备…（已 ' +
-           Math.round((Date.now() - started) / 1000) + ' 秒，别关窗口）', false);
+    const secs = Math.round((Date.now() - started) / 1000);
+    setMsg('msg-flash', phase === 'rebooting'
+      ? ('设备重启中…正在等它回来（已 ' + secs + ' 秒，别拔线）')
+      : ('正在写入设备…（已 ' + secs + ' 秒，别关窗口）'), false);
+  }, 400);
+  // 写 flash 的 HTTP 请求要挂几十秒；另开短轮询拿阶段，
+  // 设备重启期间把提示从「正在写入」切成「设备重启中…」。
+  const phaseTimer = setInterval(async () => {
+    try {
+      const p = await getJSON('/api/flash/phase');
+      if (p && p.phase) phase = p.phase;
+    } catch (e) {}
   }, 500);
   let j = null;
   try {
     j = await postJSON('/api/flash', { path: up.path });
   } finally {
     clearInterval(timer);
+    clearInterval(phaseTimer);
     if (pickBtn) pickBtn.disabled = false;
   }
   if (j && j.ok) {
-    setMsg('msg-flash', '已写入：' + (j.msg || '设备正在重启'), false);
+    // 后端已经关串口 → 有界轮询 → 设备重新枚举并回版本号，这里一次性收尾。
+    setMsg('msg-flash', j.msg || ('升级完成：固件 ' + (j.fw || '未知')), false);
   } else {
     setMsg('msg-flash', '失败：' + ((j && j.err) || '未知原因'), true);
   }
@@ -4448,9 +4674,41 @@ class WebUI(threading.Thread):
         self._stop = threading.Event()
         self._pv = {}
         self._pv_lock = threading.RLock()
+        # favicon.png：把 icon.ico 里最大尺寸的那张转成 PNG 后缓存，
+        # 某些浏览器（含部分 Chromium 版本 + 反代）不认 ICO，认 PNG。
+        self._icon_png = None
+        self._icon_png_lock = threading.Lock()
         self._restart = threading.Event()
         self._pending_rebind = None
         self._rebind_lock = threading.Lock()
+
+    def _icon_png_bytes(self):
+        """icon.ico 最大尺寸那张 → PNG 字节；没有图标时返回 b""。"""
+        with self._icon_png_lock:
+            if self._icon_png is not None:
+                return self._icon_png
+        data = _icon_bytes()
+        png = b""
+        if data:
+            try:
+                im = Image.open(io.BytesIO(data))
+                try:
+                    sizes = sorted(getattr(im, "ico", None).sizes()
+                                   if getattr(im, "ico", None) else [])
+                except Exception:
+                    sizes = []
+                if sizes:
+                    im.size = max(sizes)     # 挑 ICO 里最大的一张
+                im = im.convert("RGBA")
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                png = buf.getvalue()
+            except Exception as exc:
+                log.warning("favicon 转 PNG 失败：%s", exc)
+                png = b""
+        with self._icon_png_lock:
+            self._icon_png = png
+        return png
 
     @property
     def scheduler(self):
@@ -4484,11 +4742,11 @@ class WebUI(threading.Thread):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a): pass
 
-            def _send(self, body, ctype):
+            def _send(self, body, ctype, cache="no-store"):
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", ctype)
-                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Cache-Control", cache)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -4583,9 +4841,17 @@ class WebUI(threading.Thread):
                     self._html(INDEX_HTML); return
 
                 if path in ("/favicon.ico", "/favicon.png"):
-                    ico = _icon_bytes()
-                    if ico:
-                        self._send(ico, "image/x-icon")
+                    # ?v=2 版本串由 urlparse 自动忽略，这里按格式分别回：
+                    # .png → Pillow 从 ico 里抽最大尺寸转 PNG；.ico → 原始 ICO。
+                    # 都允许浏览器缓存 1 小时，换图标时改 HTML 里的 ?v=。
+                    if path.endswith(".png"):
+                        body = outer._icon_png_bytes()
+                        ctype = "image/png"
+                    else:
+                        body = _icon_bytes()
+                        ctype = "image/x-icon"
+                    if body:
+                        self._send(body, ctype, FAVICON_CACHE_CONTROL)
                     else:
                         self.send_error(404)
                     return
@@ -4601,6 +4867,19 @@ class WebUI(threading.Thread):
                                 "devices": outer.manager.describe()}); return
 
                 sched, dcfg = self._dev()
+
+                if path == "/api/flash/phase":
+                    # 前端在 /api/flash 还没返回时轮询这个（GET）：设备重启那
+                    # 段要显示「设备重启中…」，不能一直卡在「正在写入」。
+                    if sched is None:
+                        self._json({"ok": True, "phase": "idle", "elapsed": 0.0})
+                    else:
+                        self._json({
+                            "ok": True,
+                            "phase": getattr(sched, "flash_phase", "") or "idle",
+                            "elapsed": round(time.monotonic() - float(
+                                getattr(sched, "flash_started", 0.0) or 0.0), 2)})
+                    return
 
                 if path == "/api/status":
                     if sched is None:
@@ -4917,13 +5196,24 @@ class WebUI(threading.Thread):
                         body = self._read_json()
                         path = str(body.get("path", "") or "")
                         if not path:
-                            self._json({"ok": False, "err": "没有选择固件文件"})
+                            self._json({"ok": False, "rebooted": False,
+                                        "fw": "", "err": "没有选择固件文件"})
                         else:
-                            ok, why = sched.flash_firmware_safe(path)
-                            if not ok:
-                                log.error("Web 固件升级失败（%s）：%s", path, why)
-                            self._json({"ok": ok, "msg": "" if not ok else why,
-                                        "err": "" if ok else why})
+                            # flash_firmware_safe 会自己：挂起通道 → 上传 →
+                            # 立刻关串口 → 有界轮询等设备回来，返回可直接下发的字典。
+                            res = sched.flash_firmware_safe(path)
+                            if not res.get("ok"):
+                                log.error("Web 固件升级失败（%s）：%s",
+                                          path, res.get("err", ""))
+                            self._json(res)
+                    elif self.path == "/api/flash/phase":
+                        # 上传最多几十秒，HTTP 请求会一直挂着；前端另开一个
+                        # 短轮询拿阶段，好在设备重启期间显示「设备重启中…」。
+                        self._json({"ok": True,
+                                    "phase": getattr(sched, "flash_phase", "") or "idle",
+                                    "elapsed": round(time.monotonic() -
+                                                      float(getattr(sched, "flash_started", 0.0)),
+                                                      2)})
                     elif self.path == "/api/asset/wipe":
                         ok, why = sched.asset_wipe_safe()
                         self._json({"ok": ok, "err": "" if ok else why})

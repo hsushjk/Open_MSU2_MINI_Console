@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "open-msu2-mini-console"
 version = "1.0.9"
-description = "MSU2_MINI 小屏上位机（Open_MSU2_MINI_Console）"
+description = "MSU2_MINI 上位机（Open_MSU2_MINI_Console）"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -30,7 +30,6 @@ full = ["pynput>=1.7.6", "numpy>=1.21.0", "pywin32>=306; sys_platform == 'win32'
 
 [project.urls]
 Homepage = "https://github.com/hsushjk/Open_MSU2_MINI_Console"
-Upstream = "https://github.com/hsushjk/MSU2_MINI_Console"
 Firmware = "https://github.com/hsushjk/Open_MSU2_MINI"
 
 [project.scripts]

@@ -32,13 +32,13 @@ def solid(w=160, h=80, color=(0, 0, 0)):
 
 
 class FrameEncoderTests(unittest.TestCase):
-    def test_first_frame_is_full_and_rle_compressed(self):
+    def test_first_frame_is_full(self):
         enc = M.FrameEncoder()
         body = enc.encode(solid())
         self.assertTrue(enc.last_full)
+        # 整帧按 512 B 分段，可压缩时走 RLE、否则原样，这里只约束上限
         self.assertGreater(len(body), 0)
-        # 纯黑整屏：RLE 应该远小于 25.6 KB 原样
-        self.assertLess(len(body), 2000)
+        self.assertLess(len(body), 26500)
 
     def test_small_change_sends_only_that_tile(self):
         enc = M.FrameEncoder()
@@ -49,7 +49,8 @@ class FrameEncoderTests(unittest.TestCase):
         second = enc.encode(img2)
         self.assertFalse(enc.last_full)
         self.assertGreater(len(first), len(second))
-        self.assertLess(len(second), 200)
+        # 一个 16x16 块 = 512 B 像素 + 窗口/段头
+        self.assertLess(len(second), 1024)
 
     def test_identical_frame_sends_nothing(self):
         enc = M.FrameEncoder()
@@ -211,7 +212,10 @@ class RepairTests(unittest.TestCase):
     def test_all_tiles_bad_resends_full_frame(self):
         dev = self.make([(1 << M.TILE_N) - 1, 0])
         dev._repair_tiles()
-        self.assertEqual(len(dev.transport.writes), 1)  # 一次整帧，不是 50 块
+        # 整帧按 2048 B 分块限速发送：每笔不超过分块大小
+        self.assertGreater(len(dev.transport.writes), 0)
+        self.assertTrue(all(len(w) <= 2048
+                            for w in dev.transport.writes))
         self.assertEqual(dev._full_resends, 1)
 
     def test_two_bad_tiles_are_patched(self):

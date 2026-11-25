@@ -198,7 +198,8 @@ class SerialTransport:
         total = len(view)
         if total <= 0:
             return 0
-        if not _POSIX_NB:
+        if not _POSIX_NB or not hasattr(self._ser, "fileno"):
+            # 测试替身没有真实文件描述符，退回普通写
             return self._ser.write(view) or 0
         fd = self._ser.fileno()
         try:

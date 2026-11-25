@@ -297,7 +297,7 @@ class TouchDemoWidget(Widget):
 
 ### 7.5 什么时候不要实现
 
-纯展示类插件（如 `clock` / `pcstats`）没必要响应触控——用户按了没反馈就是最好的反馈。**实现了反而会让用户困惑**："为什么按了没反应？"（其实有反应，就是没视觉效果）。
+纯展示类插件（如 `clock` / `pcstats`）一般不需要响应触控：没有可展示的反馈，用户容易误以为没有反应。
 
 建议只在**有明显"下一项"语义**的插件里实现：
 
@@ -332,7 +332,7 @@ def render(self, ctx):
     return img
 ```
 
-**我觉得这个机制非常重要**。19200 波特率下一帧要 13 秒，如果每秒都重绘，屏幕永远在刷，还占满了串口导致其它操作（切页、翻转）没法响应
+这个机制是必需的。19200 波特率下一帧要 13 秒，如果每秒都重绘，屏幕永远在刷，还占满了串口导致其它操作（切页、翻转）没法响应
 
 ### 8.2 切页后要清缓存
 
@@ -406,7 +406,7 @@ class MinuteWidget(Widget):
 
     def on_action(self, action, payload, ctx):
         if action == "touch_single":
-            # 单击立即刷一次（其实这个例子没必要）
+            # 单击立即刷一次（这个例子可以省略）
             ctx.state.pop("_last_key", None)
             return {"ok": True}
         return {"ok": False, "err": f"未知动作: {action}"}

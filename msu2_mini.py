@@ -114,7 +114,7 @@ ASSET_RAW_BYTES = SCREEN_W * SCREEN_H * 2
 
 
 def _open_device(dev, timeout=2.0):
-    """调设备 open()；测试替身可能不接受 handshake_timeout，故兜底调无参版本。"""
+    """调设备 open()；测试替身可能不接受 handshake_timeout，故退回调无参版本。"""
     open_fn = getattr(dev, "open", None)
     if not callable(open_fn):
         return False
@@ -1667,7 +1667,7 @@ class Scheduler(threading.Thread):
 
         换图是硬切，用不到这个节拍；它只给动图（GIF/多帧目录）翻页用：
         按上一帧的发送耗时（_count_frame 里的 _send_gap，已经带了 15% 余量）
-        决定下一帧最早什么时候排；链路空闲（离线/测试设备）时用 80 ms 兜底。
+        决定下一帧最早什么时候排；链路空闲（离线/测试设备）时按 80 ms 计算。
         真正发不出去时 _send_frame 返回 False，主循环会在 0.1 s 后用
         _force_send 重试，不会卡死。
         """
@@ -2072,7 +2072,7 @@ class Scheduler(threading.Thread):
                     need_render = (mono - last_mono >= w.interval)
                     # 背景是否到点要动：轮播换图、动图翻页都算。
                     # 以前这里要求 len(frames) > 1，单张静态背景的轮播换图就
-                    # 只能等插件自己下一次渲染，间隔根本不听话。
+                    # 只能等插件自己下一次渲染，间隔无法控制。
                     need_bg = self._bg_due(mono, last_bg_ts)
                     need_heartbeat = (not need_render and not need_bg and
                                       mono - self._last_send_mono >= HEARTBEAT_INTERVAL)

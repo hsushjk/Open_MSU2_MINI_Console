@@ -9,6 +9,8 @@ MSU2_MINI（CH32X033F8P6 + ST7735S 160×80）的开源上位机。程序在本�
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="platform">
 </p>
 
+![example1](./example/1.png)
+
 ## 功能
 
 - 16 个内置插件页，覆盖时钟、日历、待办、音乐、系统资源、剪贴板、GIF 等；外挂插件放目录即被发现，改动后热重载。

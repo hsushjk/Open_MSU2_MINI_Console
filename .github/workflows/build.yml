@@ -81,8 +81,10 @@ jobs:
         shell: pwsh
         run: |
           $name = "MSU2_Console-windows-${{ matrix.arch }}-${{ matrix.mode }}"
-          $extra = if ("${{ matrix.arch }}" -eq "x86") { "--no-numpy" } else { "" }
-          python tools/build_exe.py --mode ${{ matrix.mode }} --name $name --dist dist --work build $extra
+          $flags = @("tools/build_exe.py", "--mode", "${{ matrix.mode }}", "--name", $name,
+                     "--dist", "dist", "--work", "build")
+          if ("${{ matrix.arch }}" -eq "x86") { $flags += "--no-numpy" }
+          python @flags
 
       - name: smoke test
         if: matrix.mode == 'console'

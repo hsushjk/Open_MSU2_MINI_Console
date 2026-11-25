@@ -1,6 +1,6 @@
 # Open_MSU2_MINI_Console
 
-MSU2_MINI 小屏（CH32X033F8P6 + ST7735S 160×80）的开源上位机，版本 1.0.9。程序在本地起一个 WebUI（默认 `http://0.0.0.0:8765`），用于管理插件页、合成并推送帧、写入开机与待机画面、通过 USB 完成固件升级，以及配置全局触控手势。支持 Windows 与 Linux。
+MSU2_MINI 小屏（CH32X033F8P6 + ST7735S 160×80）的开源上位机。程序在本地起一个 WebUI，用于管理插件页、合成并推送帧、写入开机与待机画面、通过 USB 完成固件升级，以及配置全局触控手势。支持 Windows 与 Linux。
 
 ## 功能
 
@@ -41,7 +41,7 @@ pip install pyserial pillow psutil
 python msu2_mini.py --port /dev/serial/by-id/usb-MSU2_MSU2_MINI_*
 ```
 
-设备重新枚举后节点号可能由 `/dev/ttyACM0` 变为 `/dev/ttyACM1`，因此推荐使用 `/dev/serial/by-id/` 下的固定链接，升级后的重连也依赖该路径。`--headless` 表示不启动 WebUI；需要在浏览器中操作时不要加这个参数。Linux 平台的测试数据与限制见 [docs/LINUX.md](docs/LINUX.md)。
+设备重新枚举后节点号可能由 `/dev/ttyACM0` 变为 `/dev/ttyACM1`，因此推荐使用 `/dev/serial/by-id/` 下的固定链接，升级后的重连也依赖该路径。`--headless` 表示不启动 WebUI；需要在浏览器中操作时不要加这个参数。
 
 ### 依赖
 

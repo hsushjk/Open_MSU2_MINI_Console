@@ -2413,10 +2413,55 @@ def _sanitize_config(cfg):
     host = web.get("host")
     cfg["web"] = {"host": host if isinstance(host, str) and host else "0.0.0.0",
                   "port": _coerce_int(web.get("port"), 8765, 1, 65535)}
+    raw_ack = cfg.get("plugin_ack")
+    ack = []
+    for item in (raw_ack if isinstance(raw_ack, list) else []):
+        name = str(item or "").strip()
+        if name and len(name) <= 64 and name not in ack:
+            ack.append(name)
+    cfg["plugin_ack"] = ack[:64]
     lvl = str(cfg.get("log_level") or "INFO").upper()
     cfg["log_level"] = lvl if lvl in ("DEBUG", "INFO", "WARNING", "ERROR",
                                       "CRITICAL") else "INFO"
     return cfg
+
+# 名字里带这些词的插件通常是投屏类：这类插件会把屏幕当连续帧显示器用，
+# 与固件的数据通路设计相冲突，启动后在 WebUI 提示一次。
+PLUGIN_RISK_WORDS = ("screen", "cast", "mirror", "display", "view")
+
+
+def _external_plugin_names():
+    """外部插件目录里的插件名（取文件名，不含扩展名）。"""
+    names = []
+    try:
+        ext = _widgets_pkg.external_report()
+    except Exception:
+        return names
+    for folder in ext.get("dirs") or []:
+        try:
+            for p in sorted(Path(folder).glob("*.py")):
+                stem = p.stem
+                if stem.startswith("_") or stem in names:
+                    continue
+                names.append(stem)
+        except Exception:
+            continue
+    return names
+
+
+def risky_plugin_names(cfg):
+    """需要提示的插件：文件名命中关键词且不在白名单里。"""
+    acked = {str(x) for x in (cfg.get("plugin_ack") or [])}
+    out = []
+    for name in _external_plugin_names():
+        low = name.lower()
+        if not any(w in low for w in PLUGIN_RISK_WORDS):
+            continue
+        if name in acked:
+            continue
+        out.append(name)
+    return out
+
 
 def _visible_config(cfg):
     """配置里真正会写进文件的键。
@@ -4334,6 +4379,58 @@ loadPages();
 refresh();
 setInterval(refresh, 1000);
 setInterval(loadDevices, 5000);
+function showPluginWarning(names) {
+  const mask = document.createElement('div');
+  mask.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);' +
+    'display:flex;align-items:center;justify-content:center;z-index:99';
+  const card = document.createElement('div');
+  card.style.cssText = 'max-width:34em;background:#fff;color:#222;border-radius:10px;' +
+    'padding:1.3em 1.6em;box-shadow:0 8px 28px rgba(0,0,0,.3);' +
+    'font-family:Consolas,monospace;line-height:1.75';
+  const h = document.createElement('div');
+  h.style.cssText = 'font-weight:700;font-size:1.05em;color:#a11;margin-bottom:.6em';
+  h.textContent = '插件提示';
+  const body = document.createElement('div');
+  body.innerHTML = '你可能正在加载投屏相关插件，该固件不是为投屏设计的<br>' +
+    '若坚持使用。点击"确认"将';
+  names.forEach(function (n, i) {
+    const tag = document.createElement('code');
+    tag.textContent = n;
+    body.appendChild(tag);
+    if (i < names.length - 1) body.appendChild(document.createTextNode('、'));
+  });
+  body.appendChild(document.createTextNode(' 加入白名单。'));
+  const note = document.createElement('div');
+  note.style.cssText = 'margin-top:.7em;color:#666';
+  note.textContent = '加入白名单后不再提示；删除 config.json 里的 plugin_ack 可撤销。';
+  body.appendChild(note);
+  const bar = document.createElement('div');
+  bar.style.cssText = 'display:flex;gap:.6em;justify-content:flex-end;margin-top:1.1em';
+  const ok = document.createElement('button');
+  ok.textContent = '确认';
+  const cancel = document.createElement('button');
+  cancel.textContent = '取消';
+  bar.appendChild(ok);
+  bar.appendChild(cancel);
+  card.appendChild(h);
+  card.appendChild(body);
+  card.appendChild(bar);
+  mask.appendChild(card);
+  document.body.appendChild(mask);
+  ok.onclick = async function () {
+    mask.remove();
+    try { await postJSON('/api/plugin_ack', {names: names}); } catch (e) {}
+  };
+  cancel.onclick = function () { mask.remove(); };
+}
+
+async function checkPluginWarning() {
+  try {
+    const j = await getJSON('/api/plugin_warning');
+    if (j && j.names && j.names.length) showPluginWarning(j.names);
+  } catch (e) {}
+}
+checkPluginWarning();
 </script>
 </body>
 </html>
@@ -4981,6 +5078,11 @@ class WebUI(threading.Thread):
                         "actions": dict(getattr(obj, "actions", {}) or {}),
                     }); return
 
+                if path == "/api/plugin_warning":
+                    self._json({"ok": True,
+                                "names": risky_plugin_names(outer.cfg)})
+                    return
+
                 if path == "/api/touch_config":
                     tk = dcfg.get("touch", {}) or {}
                     vals = {}
@@ -5292,6 +5394,20 @@ class WebUI(threading.Thread):
                         ok = sched.switch_to(name)
                         self._json({"ok": ok, "current": name,
                                     "err": "" if ok else "插件未启用"})
+                    elif self.path == "/api/plugin_ack":
+                        body = self._read_json()
+                        raw = body.get("names")
+                        if raw is None:
+                            raw = [body.get("name", "")]
+                        acked = list(outer.cfg.get("plugin_ack") or [])
+                        for item in raw:
+                            name = str(item or "").strip()
+                            if name and name not in acked:
+                                acked.append(name)
+                        outer.cfg["plugin_ack"] = acked[:64]
+                        save_config(outer.cfg, cfg_path)
+                        self._json({"ok": True,
+                                    "names": risky_plugin_names(outer.cfg)})
                     elif self.path == "/api/widget_config":
                         body = self._read_json()
                         name = str(body.get("name", ""))
@@ -6177,6 +6293,9 @@ def main(argv=None):
     if ext.get("failed"):
         log.warning("外部插件加载失败 %d 个: %s", len(ext["failed"]),
                     ext["failed"])
+    risky = risky_plugin_names(cfg)
+    if risky:
+        log.warning("插件名命中投屏关键词 %s：这类插件会把屏幕当连续帧显示器用，固件不是按这个用途设计的", ", ".join(risky))
 
     if args.port:
         devs = cfg.get("devices") or []

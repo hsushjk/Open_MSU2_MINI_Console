@@ -1,6 +1,13 @@
 # Open_MSU2_MINI_Console
 
-MSU2_MINI 小屏（CH32X033F8P6 + ST7735S 160×80）的开源上位机。程序在本地起一个 WebUI，用于管理插件页、合成并推送帧、写入开机与待机画面、通过 USB 完成固件升级，以及配置全局触控手势。支持 Windows 与 Linux。
+MSU2_MINI（CH32X033F8P6 + ST7735S 160×80）的开源上位机。程序在本地起一个 WebUI，用于管理插件页、合成并推送帧、写入开机与待机画面、通过 USB 完成固件升级，以及配置全局触控手势。支持 Windows 与 Linux。
+
+> **该上位机必须搭配固件[`Open_MSU2_MINI_FW`](https://github.com/hsushjk/Open_MSU2_MINI_FW)使用**
+
+<p>
+  <img src="https://img.shields.io/badge/python%2B-blue" alt="python">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="platform">
+</p>
 
 ## 功能
 

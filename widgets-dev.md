@@ -1,572 +1,341 @@
-﻿# 插件开发和导入手册
+# 插件开发手册
 
-**您可能觉得我的项目写的可差，确实差，我基本上不怎么会python，敬请谅解**
+本文面向要给上位机写插件的人。插件是一段 Python 代码：上位机按固定间隔调用它，它返回一张 160×80 的图像，上位机负责编码并通过 USB 串口送到设备。插件不需要关心串口、编码和协议。
 
-## 1. 插件目录结构
+本文只讲插件接口。设备协议见固件仓库的 README，上位机的安装与命令行参数见本仓库 README。
 
-```
-项目根/
-├── msu2_mini.py          主程序（不需要动）
-├── msu2_core/            插件基础设施（一般不需要动）
-│   ├── widget.py         Widget 基类
-│   ├── registry.py       注册表
-│   └── config_schema.py  配置字段类型
-└── widgets/              你写的插件都放这里
-├── __init__.py       自动发现（不需要动）
-├── demos.py
-└── your_plugin.py    ← 你新建的文件
-```
+## 1. 代码位置
 
-**核心原则**：加插件只需要在 `widgets/` 里**新建一个 .py 文件**。主程序、`msu2_core`、其它插件，一律不用改。
+| 路径 | 作用 |
+|---|---|
+| `widgets/` | 内置插件，随仓库一起分发 |
+| `widgets/__init__.py` | 插件加载器（内置 + 外挂），不需要改 |
+| `widgets/_util.py` | 文本测量、截断、滚动等公共函数 |
+| `msu2_core/widget.py` | `Widget` 基类、`RenderContext`、字体 |
+| `msu2_core/registry.py` | 注册表 `WIDGET_REGISTRY` 与 `register` |
+| `msu2_core/config_schema.py` | 声明式配置 `Field` 与合并逻辑 |
+| `msu2_core/branding.py` | `data_dir()`：程序同目录的数据目录 |
+| `example/widgets/hello_widget.py` | 外挂插件示例（含动作、触控、配置） |
 
-## 2. 最小可用插件
+外挂插件目录按以下顺序扫描，路径不存在就跳过：
 
-新建 `widgets/hello.py`：
+1. 环境变量 `MSU2_WIDGETS_DIR`（可写多个，Windows 用 `;` 分隔，其它平台用 `:`）
+2. 打包版（exe）：exe 同目录的 `widgets\`
+3. 源码版：程序目录的 `widgets_ext\`
+4. 用户目录：`%LOCALAPPDATA%\MSU2_MINI\widgets`，非 Windows 为 `$XDG_DATA_HOME/MSU2_MINI/widgets`（缺省 `~/.local/share`）
+
+`python msu2_mini.py --plugins` 会打印实际扫描到的目录、加载失败的插件，以及全部插件的名称、朝向、优先级和来源（内置/外挂）。
+
+## 2. 最小插件
+
+在 `widgets/` 下新建 `hello.py`：
 
 ```python
-# -*- coding: utf-8 -*-
-"""一个最小示例：在屏幕中央显示 Hello。"""
 from PIL import Image, ImageDraw
-from msu2_core import Widget, register, BOTH, get_font
+
+from msu2_core import BOTH, Widget, get_font, register
 
 
 @register
 class HelloWidget(Widget):
-    """第一行 docstring 会成为插件描述。"""
-    name = "hello"              # 唯一 ID，不能和其它插件重名
-    interval = 1.0              # 刷新间隔（秒）
-    orientations = BOTH         # BOTH / (LANDSCAPE,) / (PORTRAIT,)
-    priority = 100              # 排序权重，越小越靠前，可以重复
+    """在屏幕中央显示一行文字。"""      # 第一行 docstring 会成为 Web 上的插件描述
+
+    name = "hello"                      # 唯一 ID，不能与其它插件重名
+    interval = 1.0                      # 期望的刷新间隔（秒）
+    orientations = BOTH                 # BOTH / (LANDSCAPE,) / (PORTRAIT,)
+    priority = 100                     # 越小越靠前，影响默认顺序
 
     def render(self, ctx):
         W, H = ctx.size
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.text((W // 2, H // 2), "Hello",
-               fill="white", font=get_font(24), anchor="mm")
+        ImageDraw.Draw(img).text(
+            (W // 2, H // 2), "Hello", fill="white",
+            font=get_font(24), anchor="mm")
         return img
 ```
 
-保存，重启程序。日志里会看到：
+保存后启动上位机：源码运行会在日志里看到 `插件模块加载完成: 成功 N 个 (... hello)`；Web 页面（默认 `http://127.0.0.1:8765`）的插件列表里出现 `hello`，启用后小屏显示。程序运行中新增或修改插件文件，约 2 秒后会自动重载；也可以点 Web 页面的「重载插件」。
 
-```
-[INFO] msu2.widgets: 插件模块加载完成: 成功 N 个 (... hello)
-[INFO] msu2: 已注册插件: [..., 'hello']
-```
+## 3. Widget 类属性
 
-Web 页面上会出现 `hello [landscape/portrait]`，启用后小屏就显示了。
+| 属性 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | `str` | 必填 | 唯一 ID，也是配置键名 |
+| `interval` | `float` | `1.0` | 期望刷新间隔（秒）。实际最快受单帧传输耗时限制，见第 12 节 |
+| `orientations` | `tuple` | `BOTH` | 支持的朝向：`BOTH`、`(LANDSCAPE,)`、`(PORTRAIT,)` |
+| `priority` | `int` | `50` | 越小越靠前；决定 Web 列表默认顺序和首次生成配置的顺序 |
+| `config_schema` | `list[Field]` | `[]` | 声明式配置，见第 8 节 |
+| `actions` | `dict[str, str]` | `{}` | Web 上的按钮：`{动作名: 按钮文字}`，见第 9 节 |
+| `touch_help` | `str` | `""` | 触控说明，显示在 Web 的插件行 |
 
-## 3. Widget 基类完整 API
+插件与内置同名时会覆盖内置实现，日志里打印 `插件 X 被重复注册，后者覆盖前者`。不要依赖这个行为，除非确实要替换内置插件。
 
-```python
-class Widget:
-    # ---- 类属性 ----
-    name = "base"              # str，唯一 ID
-    interval = 1.0             # float，秒
-    orientations = BOTH        # tuple，(LANDSCAPE, PORTRAIT) 的子集
-    priority = 50              # int，越小越靠前（首次生成 config 时用）
-    config_schema = []         # list[Field]，声明式配置
-    actions = {}               # dict[str, str]，Web 按钮
+## 4. 生命周期
 
-    # ---- 生命周期 ----
-    def setup(self, ctx):
-        """插件加载时调用一次。适合读文件、开线程、初始化状态。"""
+| 方法 | 调用时机 | 常见用途 |
+|---|---|---|
+| `setup(self, ctx)` | 插件实例创建后 | 读文件、开后台线程、初始化状态 |
+| `teardown(self, ctx)` | 程序退出、热重载、改配置重建前 | 停线程、关文件、释放资源 |
+| `on_enter(self, ctx)` | 切换到本插件所在页 | 清缓存，强制下一帧重绘 |
+| `on_leave(self, ctx)` | 离开本插件所在页 | 暂停计时、保存状态 |
+| `render(self, ctx)` | 每 `interval` 秒一次（仅在当前页） | 返回一帧图像，或 `None` 表示不重绘 |
+| `get_config(self, ctx)` | 自行调用 | 读取本插件配置（已用默认值补齐） |
+| `on_action(self, action, payload, ctx)` | Web 按钮或触控事件 | 返回 `{"ok": bool, "err": str}` |
 
-    def teardown(self, ctx):
-        """插件卸载/程序退出时调用。适合关闭线程、释放资源。"""
+`render` 必须是同步返回；耗时操作放后台线程。`render` 抛异常会被捕获并记录，渲染循环继续，但每帧抛异常会刷满日志，所以内部要自己兜底。
 
-    def on_enter(self, ctx):
-        """本插件成为当前显示页时调用。适合清缓存（切页后强制重绘）。"""
-
-    def on_leave(self, ctx):
-        """本插件离开当前显示页时调用。"""
-
-    def render(self, ctx) -> Image.Image:
-        """
-        核心方法，主循环每隔 interval 秒调一次。
-        返回 PIL.Image（推荐 RGBA）表示要画的帧。
-        返回 None 表示"本轮不需要重绘"。
-        """
-
-    def get_config(self, ctx) -> dict:
-        """读自己的配置（已用 config_schema 的默认值补齐）。"""
-
-    def on_action(self, action, payload, ctx) -> dict:
-        """
-        Web 按钮点击 / 硬件触控时调用。
-        返回 {'ok': bool, 'err': str(可选)}。
-        """
-```
-
-## 4. RenderContext 详解
-
-每次 `render()` 收到的 `ctx` 里有：
+## 5. RenderContext
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `ctx.size` | `(W, H)` | 当前朝向下的画布尺寸。横屏 (160, 80)，竖屏 (80, 160) |
+| `ctx.size` | `(W, H)` | 当前朝向下的画布尺寸：横屏 `(160, 80)`，竖屏 `(80, 160)` |
 | `ctx.orientation` | `str` | `"landscape"` 或 `"portrait"` |
 | `ctx.now` | `float` | 当前时间戳（`time.time()`） |
-| `ctx.state` | `dict` | **每个插件独立**的持久字典，可跨帧、跨页存数据 |
-| `ctx.config` | `dict` | 全局 config（只读） |
-| `ctx.device` | `MiniDevice` | 底层设备对象 |
+| `ctx.state` | `dict` | 本插件私有、跨帧保留的状态字典 |
+| `ctx.config` | `dict` | 全局配置（只读，不要修改） |
+| `ctx.device` | `MiniDevice` | 底层设备对象，插件一般不需要用 |
 
-**`ctx.state` 是插件专属的**，不用怕键名冲突。但要注意：`restart_widget`（Web 改配置后触发）会重置 state，如果你希望状态持久化，得写回 `ctx.config["widget_config"][name]`。
+`ctx.state` 只在当前插件实例内有效：热重载、改配置（会重建插件）、程序退出都会清空。需要跨重启保留的数据按第 11 节落盘。
 
-## 5. 声明式配置：`config_schema`
+## 6. 渲染约定
 
-只要在 Widget 类里声明 `config_schema`，Web 上该插件的 `⋯` 菜单里就会自动出现 `设置`，点开就是一个表单。
+- 画布尺寸用 `ctx.size` 取，不要写死 160×80：竖屏是 80×160。
+- 推荐返回 `RGBA` 图像，alpha 会和背景（纯色、图片或 GIF）合成；返回 `RGB` 按不透明处理。
+- 返回 `None` 表示"这一帧不用重画"。内容没变时返回 `None` 可以省掉一次完整传输，例如用缓存键判断：
+
+```python
+def render(self, ctx):
+    cfg = self.get_config(ctx)
+    key = (ctx.orientation, cfg["title"], ctx.state.get("msg"))
+    if ctx.state.get("_key") == key:
+        return None
+    ctx.state["_key"] = key
+    ...
+    return img
+```
+
+- 单帧渲染尽量控制在 50 ms 以内。上位机是单线程调度，渲染慢会直接压低帧率。
+- 字体用 `get_font(size, bold=False, cjk=True)`（带缓存）。内置 NotoSansMonoCJKsc，中英文都能显示；`probe_fonts()` 列出可用字体，`set_user_font()` 可换用户字体。字号建议 8–40，横屏常用 10–24。
+- 长文本用 `widgets/_util.py` 提供的函数：`text_w(font, text)` 测宽、`ellipsis(font, text, max_w)` 截断、`row_text(...)` 单行滚动、`marquee(...)` 横向滚动。
+- 时间敏感的动画（秒针、滚动字幕）应基于 `ctx.now` 计算，不要依赖 `interval` 精确。
+
+## 7. 声明式配置
+
+在类里声明 `config_schema`，Web 上该插件就会出现「设置」表单，保存后写入 `widget_config/<插件名>.json`：
 
 ```python
 from msu2_core import Field
 
 class MyWidget(Widget):
     config_schema = [
-        Field("name", "str", "名字", default="世界"),
-        Field("count", "int", "次数", default=10, min=1, max=100),
-        Field("gain", "float", "增益", default=2.0, min=0.5, max=10.0, step=0.5),
+        Field("title", "str", "标题", default="你好"),
+        Field("count", "int", "条数", default=5, min=1, max=20),
+        Field("speed", "float", "速度", default=1.0, min=0.1, max=5.0, step=0.1),
         Field("enable", "bool", "启用", default=True),
         Field("mode", "select", "模式", default="A", options=["A", "B", "C"]),
-        Field("items", "list_str", "列表", default=["a", "b", "c"],
-              help="每行一个"),
+        Field("items", "list_str", "条目", default=["a", "b"], help="每行一条"),
     ]
-```
-
-`Field` 参数：
-
-| 参数 | 说明 |
-|---|---|
-| `key` | 字段名（必填，第一个位置参数） |
-| `type` | `str` / `int` / `float` / `bool` / `select` / `list_str` |
-| `label` | Web 上显示的标签 |
-| `default` | 默认值 |
-| `help` | 帮助文字（显示在标签后面） |
-| `options` | 仅 `select` 用，字符串列表 |
-| `min` / `max` / `step` | 仅 `int` / `float` 用 |
-
-读配置：
-
-```python
-def render(self, ctx):
-    cfg = self.get_config(ctx)
-    name = cfg["name"]        # 用户填的值，未填则是 default
-    count = cfg["count"]
-```
-
-用户改完保存后，主程序会**自动 teardown + setup 你的插件**（`restart_widget`），所以 `setup` 里的初始化逻辑要幂等。
-
-## 6. 声明式按钮：`actions` + `on_action`
-
-想让 Web 上出现按钮：
-
-```python
-class PomodoroWidget(Widget):
-    actions = {
-        "start": "开始",
-        "stop":  "停止",
-    }
-
-    def on_action(self, action, payload, ctx):
-        if action == "start":
-            ctx.state["running"] = True
-            return {"ok": True}
-        if action == "stop":
-            ctx.state["running"] = False
-            return {"ok": True}
-        return {"ok": False, "err": f"未知动作 {action}"}
-```
-
-保存后 Web 页面每一行的 `⋯` 菜单里会出现"开始"、"停止"两个动作（和 `设置` 并列）。
-
-**注意**：`on_action` 执行完，主程序会自动设一次 `_switch`，让 Scheduler 下一轮**立即重绘**（不需要等 interval）。所以按钮按下后屏幕几乎立刻变化。
-
-`payload` 参数留给未来扩展（比如带参数的动作），目前是 `{}`。
-
-### 6.1 循环浏览（多条目插件用）
-
-想让一个页面上轮流显示多条内容，只需要在 `config_schema` 里加两个字段，并把翻页动作接上：
-
-```python
-config_schema = [
-    Field("cycle", "bool", "循环浏览", default=False),
-    Field("cycle_interval", "float", "切换周期(秒)", default=5.0, min=2, max=3600),
-]
-
-actions = {"next": "下一个", "prev": "上一个"}
-
-def on_action(self, action, payload, ctx):
-    if action in ("next", "prev", "touch_single", "touch_double"):
-        self._step(ctx, 1 if action in ("next", "touch_single") else -1)
-        return {"ok": True}
-    return {"ok": False, "err": "未知动作"}
-```
-
-计时必须用 `time.monotonic()`（墙钟被改动时不会卡住），并在状态里记住上次切换的单调时刻。
-
-### 6.2 长文本滚动
-
-`widgets/_util.py` 提供三个工具，用来替代"省略号截断"：
-
-```python
-from ._util import row_text, ellipsis, text_w
-
-row_text(img, (x, y), 长文本, font, "#cccccc", max_w, ctx.now, scroll=True)
-```
-
-`scroll=True` 时超出 `max_w` 的文字会匀速滚动（`ctx.now` 驱动，帧缓存要把它算进 key）；`scroll=False` 时用 `ellipsis` 截断；`text_w(font, text)` 量宽、`ellipsis` 二分求最短可显示前缀。
-
-## 7. 硬件触控支持
-
-MSU2_MINI 面板上有一个触摸按键，可以识别三种手势——**单击 / 双击 / 长按**。
-
-### 7.1 两种运行模式
-
-主程序有两种模式处理触控：
-
-- **透传模式**：某个手势选 `未定义（透传给插件）` 时，这个手势的触控事件被转发给**当前显示的插件**，通过 `on_action` 送到你手里。
-- **全局模式**：该手势选了具体动作，则这个手势走主程序全局定义。两种模式可以按手势混用。
-
-**为什么这样设计**：屏幕只有一个键，全局定义是"系统级操作"（翻页 / 翻转 / 关机等），透传是"内容级操作"（切歌 / 勾选待办等）。用户根据使用场景自行选择。
-
-### 7.2 收到的动作名
-
-透传模式下，`on_action` 会收到三个专属动作名：
-
-| action 字符串 | 触发时机 |
-|---|---|
-| `touch_single` | 单击（按下-松开，间隔 < 800ms，且 350ms 内无第二次按下） |
-| `touch_double` | 双击（350ms 内连按两次） |
-| `touch_long` | 长按（按住 ≥ 800ms） |
-
-用类属性 `touch_help` 声明这些手势在你插件里的含义，它会显示在 Web 的配置面板顶部：
-
-```python
-touch_help = "单击=下一个，双击=上一个，长按=勾选/取消"
-```
-
-**注意**：单击有 350ms 的延迟——因为主程序要等双击窗口关闭才能确定不是双击。这是判定逻辑的必然结果。
-
-### 7.3 最小示例
-
-```python
-# -*- coding: utf-8 -*-
-"""触控示例：单击数字 +1，双击 -1，长按归零。"""
-from PIL import Image, ImageDraw
-from msu2_core import Widget, register, BOTH, get_font
-
-
-@register
-class TouchDemoWidget(Widget):
-    """演示触控响应。"""
-    name = "touch_demo"
-    interval = 1.0
-    orientations = BOTH
-    priority = 200
-
-    def setup(self, ctx):
-        ctx.state["count"] = 0
-
-    def on_action(self, action, payload, ctx):
-        if action == "touch_single":
-            ctx.state["count"] = ctx.state.get("count", 0) + 1
-            return {"ok": True}
-        if action == "touch_double":
-            ctx.state["count"] = ctx.state.get("count", 0) - 1
-            return {"ok": True}
-        if action == "touch_long":
-            ctx.state["count"] = 0
-            return {"ok": True}
-        return {"ok": False, "err": f"未知动作: {action}"}
-
-    def render(self, ctx):
-        W, H = ctx.size
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.text((W // 2, H // 2), str(ctx.state.get("count", 0)),
-               fill="white", font=get_font(40, bold=True, cjk=False),
-               anchor="mm")
-        return img
-```
-
-### 7.4 返回值语义
-
-- `return {"ok": True}` → 主程序**立即重绘**，用户马上看到效果
-- `return {"ok": False, "err": "..."}` → 日志里会记录，但屏幕不重绘
-
-如果你的动作会改 `ctx.state`，**一定返回 `ok=True`**，否则要等 `interval` 秒才重绘。
-
-### 7.5 什么时候不要实现
-
-纯展示类插件（如 `clock` / `pcstats`）一般不需要响应触控：没有可展示的反馈，用户容易误以为没有反应。
-
-建议只在**有明显"下一项"语义**的插件里实现：
-
-| 插件类型 | 推荐实现 |
-|---|---|
-| 列表 / 轮播类（todo / countdown） | ✔ 单击 / 双击翻项，长按操作当前项 |
-| 媒体控制类（music） | ✔ 单击 / 双击切歌，长按播放暂停 |
-| 可刷新类（crypto / wifi_scanner） | ✔ 单击手动刷新 |
-| 开关类（clipboard 固定） | ✔ 长按切换状态 |
-| 纯展示类（clock / pcstats / calendar） | ✘ 没必要 |
-
-### 7.6 参考实现
-
-- `widgets/music.py` → `_send_media_key()`
-- `widgets/todo.py` → `_selected` 光标 + 窗口跟随
-- `widgets/wifi_scanner.py` → 清缓存触发重扫
-- `widgets/clipboard.py` → `pinned` 状态切换
-
-## 8. 渲染注意事项
-
-### 8.1 返回 None 的语义
-
-如果你的插件内容**大部分时间不变**（比如时钟只在秒数变时才需要重绘），可以缓存上次的画布 key，不变就返回 `None`：
-
-```python
-def render(self, ctx):
-    key = f"{int(ctx.now)}"     # 每秒变一次
-    if ctx.state.get("_last_key") == key:
-        return None              # 告诉 Scheduler 本轮跳过
-    ctx.state["_last_key"] = key
-    # ... 绘制 ...
-    return img
-```
-
-这个机制是必需的。19200 波特率下一帧要 13 秒，如果每秒都重绘，屏幕永远在刷，还占满了串口导致其它操作（切页、翻转）没法响应
-
-### 8.2 切页后要清缓存
-
-用 `_last_key` 缓存的插件，切页回来时必须清缓存，否则屏幕还是上一页残留：
-
-```python
-def on_enter(self, ctx):
-    ctx.state.pop("_last_key", None)
-```
-
-### 8.3 朝向
-
-`ctx.size` 会随朝向变化。不要硬编码 160×80。如果你的插件只支持横屏，声明：
-
-```python
-orientations = (LANDSCAPE,)
-```
-
-Scheduler 切页时会自动跳过不支持当前朝向的插件。
-
-### 8.4 颜色与透明
-
-返回的图片建议用 `"RGBA"` 模式，未绘制的像素保持透明，会透出背景图。如果不想透出背景，可以先铺一层纯色：
-
-```python
-img = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-```
-
-### 8.5 字体
-
-```python
-from msu2_core import get_font
-
-f = get_font(20)                    # 内置 Noto Sans Mono CJK SC，中英文都支持
-f = get_font(20, bold=True)         # 粗体（内置 Bold 字重）
-f = get_font(20, cjk=False)         # 参数仅保留兼容，字体同上
-```
-
-字体固定为随程序分发的 **Noto Sans Mono CJK SC**（`msu2_core/assets/fonts/`，SIL OFL 1.1），
-不依赖系统字体，各平台渲染结果一致，数字与英文都是等宽的。
-`cjk` 参数只为兼容旧代码保留，两种取值使用同一字体。
-
-**字体有缓存**，可以在 `render` 里反复调用 `get_font`，应该不会有性能问题。
-
-## 9. 完整示例：显示当前分钟
-
-```python
-# -*- coding: utf-8 -*-
-"""显示当前分钟数的示例插件。"""
-import time
-from PIL import Image, ImageDraw
-from msu2_core import Widget, register, BOTH, Field, get_font
-
-
-@register
-class MinuteWidget(Widget):
-    """每分钟变化一次的数字。"""
-    name = "minute"
-    interval = 1.0
-    orientations = BOTH
-    priority = 200
-
-    config_schema = [
-        Field("label", "str", "标签", default="MIN"),
-        Field("color", "select", "颜色", default="青色",
-              options=["青色", "绿色", "红色", "黄色"]),
-    ]
-
-    def on_enter(self, ctx):
-        ctx.state.pop("_last_key", None)
-
-    def on_action(self, action, payload, ctx):
-        if action == "touch_single":
-            # 单击立即刷一次（这个例子可以省略）
-            ctx.state.pop("_last_key", None)
-            return {"ok": True}
-        return {"ok": False, "err": f"未知动作: {action}"}
 
     def render(self, ctx):
         cfg = self.get_config(ctx)
-        W, H = ctx.size
+        title = cfg["title"]          # 已被类型转换与范围钳制
+```
 
-        minute = time.localtime().tm_min
-        key = f"{minute}|{W}x{H}|{cfg['color']}"
-        if ctx.state.get("_last_key") == key:
+| 参数 | 说明 |
+|---|---|
+| `key` | 字段名（第一个位置参数） |
+| `type` | `str` / `int` / `float` / `bool` / `select` / `list_str` |
+| `label` | Web 上显示的名称 |
+| `default` | 默认值 |
+| `help` | 字段后的说明文字 |
+| `options` | 仅 `select`：可选项列表；值不在列表里时回退默认值 |
+| `min` / `max` / `step` | 仅 `int` / `float`：范围与步长，读取时按 `min`/`max` 钳制 |
+
+`list_str` 在表单里是多行文本，读取时得到 `list[str]`（最多 200 项）。`bool` 接受 `"1"/"true"/"yes"/"on"` 等写法。
+
+配置保存位置是程序同目录的 `widget_config/<插件名>.json`，每个插件一个文件；总 `config.json` 只保留页面、设备、显示等全局设置。改配置会重建插件实例（`ctx.state` 清空），如果需要保留状态，在 `on_leave` 或 `teardown` 里自行落盘。
+
+## 8. 动作：`actions` 与 `on_action`
+
+`actions` 里的每一条都会在 Web 插件卡片上生成一个按钮：
+
+```python
+class TodoWidget(Widget):
+    actions = {"add": "新增一条", "clear": "清空"}
+
+    def on_action(self, action, payload, ctx):
+        if action == "add":
+            ctx.state.setdefault("items", []).append("[ ] 新的条目")
+            return {"ok": True, "msg": "已添加"}
+        if action == "clear":
+            ctx.state["items"] = []
+            return {"ok": True}
+        return {"ok": False, "err": "未知动作: %s" % action}
+```
+
+调用路径：
+
+- Web 按钮：`POST /api/widget_action`，`payload` 为请求 JSON 里的 `payload` 字段（没有则为 `{}`）。
+- 硬件触控（当前页、且该手势设为 `passthrough`）：`on_action("touch_single", {}, ctx)`、`on_action("touch_double", {}, ctx)`、`on_action("touch_long", {}, ctx)`。
+
+返回值必须是 dict：
+
+- `{"ok": True}`：请求立刻重绘，并把当前配置落盘（适合"插件自己改了自己的配置"的场景）。
+- `{"ok": False, "err": "..."}`：Web 上提示错误。
+- 其它字段会原样返回给 Web 端，可用来传提示文本。
+
+`on_action` 抛异常会被捕获，Web 收到 `{"ok": False, "err": "..."}`，日志里有完整堆栈。
+
+## 9. 硬件触控
+
+设备只有一个电容触摸通道，没有坐标。上位机按时间判断手势，相关常量：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `TOUCH_SAMPLE_INTERVAL` | 0.03 s | 触摸采样间隔 |
+| `TOUCH_LONG_PRESS` | 0.8 s | 按住多久算长按 |
+| `TOUCH_DOUBLE_WINDOW` | 0.5 s | 两次单击的最大间隔（超过则第一次单击不再等待） |
+| `TOUCH_MIN_TAP_GAP` | 0.012 s | 两次点击的最小间隔 |
+
+Web 页面的「触控」区域把每种手势映射到全局动作（翻页、亮度、锁定、截图、播放宏、启动程序等）或 `passthrough`。设为 `passthrough` 时事件才交给插件。插件用 `touch_help` 写一行说明，会显示在 Web 的插件行上。
+
+注意双击判定：如果也配置了单击处理，单击回调会晚 `double_window` 才触发（上位机要先确认不是双击）。
+
+## 10. 数据持久化
+
+| 数据 | 位置 | 说明 |
+|---|---|---|
+| 帧间状态 | `ctx.state` | 实例内有效，重建即丢 |
+| 插件配置 | `widget_config/<插件名>.json` | 由 `config_schema` 自动管理 |
+| 自建数据文件 | `data_dir()` | 程序同目录；用插件名前缀 |
+
+```python
+from msu2_core.branding import data_dir
+
+def _state_path():
+    return data_dir() / "my_plugin_state.json"
+```
+
+不要把文件写到 `%LOCALAPPDATA%`、系统临时目录或用户主目录：上位机的约定是"所有数据都在程序同目录"，方便整个文件夹拷走。写文件用"临时文件 + `os.replace`"保证原子性，读取时对损坏的 JSON 做兜底。
+
+## 11. 后台线程与耗时操作
+
+需要网络、磁盘、抓屏的插件，把耗时操作放到后台线程，`render` 只读最新快照：
+
+```python
+import threading
+
+class StatsWidget(Widget):
+    def setup(self, ctx):
+        self._lock = threading.Lock()
+        self._latest = None
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def _loop(self):
+        while not self._stop.wait(2.0):
+            try:
+                data = fetch_something()
+            except Exception:
+                continue                      # 后台线程异常必须自己吃掉
+            with self._lock:
+                self._latest = data
+
+    def teardown(self, ctx):
+        self._stop.set()
+        self._th.join(timeout=1.5)            # 必须等线程退出
+
+    def render(self, ctx):
+        with self._lock:
+            data = self._latest
+        if data is None:
             return None
-        ctx.state["_last_key"] = key
-
-        color_map = {
-            "青色": "#00e0ff",
-            "绿色": "#22cc66",
-            "红色": "#ff4444",
-            "黄色": "#ffcc00",
-        }
-        color = color_map.get(cfg["color"], "#ffffff")
-
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-
-        f_lbl = get_font(10, cjk=True)
-        f_num = get_font(40, bold=True, cjk=False)
-
-        d.text((6, 4), cfg["label"], fill="#808080", font=f_lbl)
-        d.text((W // 2, H // 2 + 4), f"{minute:02d}",
-               fill=color, font=f_num, anchor="mm")
-        return img
+        ...
 ```
 
-## 10. 调试
+约束：
 
-**打开 DEBUG 日志**：
+- 线程必须是 daemon，并在 `teardown` 里停掉并 `join`，否则热重载会留下旧线程。
+- 不要在 `render` 里 sleep、等网络或用阻塞锁。
+- 不要跨线程共用不支持并发的对象（例如抓屏库的实例、tkinter 对象）；这类库通常要求"每个线程一份实例"。
+- 后台线程里抛出的异常不会中断程序，但线程会静默退出，务必自己 `try/except` 并记录。
+
+## 12. 帧率与 `interval` 的实际含义
+
+`interval` 是"希望多久渲染一次"，不是保证值。上位机在发送一帧后还会按实测传输耗时设置一个最小帧间隔（约传输耗时的 1.15 倍，最多 0.6 秒），避免把设备接收缓冲顶满。所以：
+
+- 小画面（1–3 KB/帧）通常能跑到 20–50 fps；
+- 整屏 160×80 RGB565 一帧约 25.6 KB，Windows 下约 200 ms 一帧，约 5 fps；
+- 把 `interval` 设成 0.01 不会更快，只会让调度器一直处于"没到时间"的状态。
+
+想让画面更流畅，优先减少每帧的实际变化量：只画变化的内容、用缓存键在内容不变时返回 `None`、少用大面积渐变和抖动图案（它们会让每帧字节数变大）。
+
+## 13. 外挂插件
+
+- 单个文件：`<外挂目录>/my_plugin.py`
+- 包：`<外挂目录>/my_plugin/__init__.py`（可以带同目录的辅助模块和数据文件）
+
+两者都能被自动发现；包适合带资源文件或多个模块的插件。外挂插件与内置插件的写法完全一致（同样的 `Widget` 基类、配置、动作）。
+
+依赖声明三种位置任选其一：
+
+- `<插件名>.requirements.txt`（单文件插件的常见做法）
+- 外挂目录里的 `requirements.txt`（该目录所有插件共用）
+- 包内的 `requirements.txt`
+
+缺失依赖时会先尝试用当前 Python 执行 `pip install`；打包版没有独立 Python 时，直接从 PyPI 下载纯 Python（或与上位机 Python ABI 一致的）wheel 解压到 `_deps` 目录并加入 `sys.path`。纯 Python 依赖最省事，带编译扩展的包需要和上位机的 Python 版本/架构匹配。
+
+新增或修改插件文件后约 2 秒自动重载；也可以在 Web 页面点「重载插件」。重载和改配置都会重建插件实例，`ctx.state` 会清空。
+
+投屏/镜像类插件：插件名包含 `screen`、`cast`、`mirror`、`display`、`view` 时，启动会在 Web 页面弹一次提示；确认后写入 `config.json` 的 `plugin_ack` 列表，之后不再提示。删除该列表项可恢复提示。
+
+## 14. 创建与调试
 
 ```bash
-python msu2_mini.py --log DEBUG
+python msu2_mini.py --new-widget my_clock   # 生成模板（默认写到 widgets_ext/）
+python msu2_mini.py --plugins               # 列出插件、来源目录与加载失败原因
+python msu2_mini.py --log-level DEBUG       # 打开调试日志
 ```
 
-会看到：
+常见问题：
 
-- 每个插件注册成功/失败
-- 每帧渲染耗时（`渲染 <插件名>: render=NN.Nms total=NN.Nms`）
-- 心跳发送
-- 切页动作
-- 触摸手势识别（`触摸: 单击` / `触摸: 双击` / `触摸: 长按`）
-- 触摸 ADC 原始值（`touch adc=NNNN base=NNNN`）
+| 现象 | 检查 |
+|---|---|
+| 插件没出现 | 日志里是否有 `加载插件模块 X 失败`；文件名是否以 `_` 开头（会被跳过）；是否与内置插件重名 |
+| Web 里看不到 | 插件列表分「已启用 / 已停用」两栏；看朝向是否需要切换 |
+| 屏幕上没变化 | `orientations` 是否包含当前朝向；`pages` 里是否启用；`render` 是否一直返回 `None` |
+| 触控没反应 | 对应手势是否设为 `passthrough`；日志里 `touch_*` 是否有异常 |
+| 改配置后状态丢了 | 预期行为：改配置会重建插件，需要自行落盘 |
+| 配置找不到 | 插件配置在 `widget_config/<插件名>.json`，不在总 `config.json` |
 
-**日志里 `[ERROR]` 或 `[WARNING]`**：
+## 15. 内置插件
 
-- `插件 XXX setup 失败: ...` → setup 里抛异常了，插件仍会加载但可能渲染不出来
-- `插件 XXX 渲染异常: ...` → render 里抛异常了，主循环会打日志并继续下一个
-- `插件 XXX touch_single 失败: ...` → `on_action` 里抛异常了
-- `配置解析失败 (...)，已备份到 ...` → config.json 坏了，旧文件被另存为 `.bad` 后重建
-- `Web UI 启动失败: ...` → 端口被占用，换一个 `web.port` 再启动
+`widgets/` 目录自带 16 个插件，可以直接阅读源码作为参考：
 
-**在插件里输出日志**：
+| 名称 | 说明 |
+|---|---|
+| `clock` | 时间、日期、星期，颜色可配 |
+| `calendar` | 月历 |
+| `countdown` | 倒数日 |
+| `holiday` | 节假日/纪念日倒数 |
+| `anniversary` | 纪念日列表与累计天数 |
+| `pcstats` | CPU、内存、负载 |
+| `network_detail` | 网络流量与速率 |
+| `disk_io` | 磁盘读写速率 |
+| `music` | 媒体播放信息（依赖系统接口，缺依赖时降级） |
+| `todo` | 待办清单，可读写 Markdown 文件 |
+| `crypto` | 汇率/报价（需要网络） |
+| `clipboard` | 剪贴板历史（Windows） |
+| `app_usage` | 前台应用使用时长（Windows） |
+| `keyboard_stats` | 键盘按键统计（需要可选依赖） |
+| `mouse_mileage` | 鼠标移动距离与点击统计（需要可选依赖） |
+| `gif` | 播放 GIF 动图（作为背景页使用） |
 
-```python
-import logging
-log = logging.getLogger("msu2.widgets.myplugin")
-log.info("我的日志")
-```
+## 16. 已知限制
 
-会跟主程序日志混在一起，方便排查。
-
-**手动重载插件**：Web 页面上点 `重载插件` 按钮，会重新加载所有 `widgets/` 目录（不需要重启程序）。
-
-**测试触控阈值**：
-
-启动日志：
-
-```
-[INFO] msu2: 触摸基准 = 1234
-```
-
-按一下触摸键，日志应该出现：
-
-```
-[INFO] msu2: 触摸: 单击
-```
-
-如果按下时**没有**输出，说明 `threshold` 太大，把 `config.json` 里 `touch.threshold` 改小。
-
-如果没按也一直输出，说明 `threshold` 太小，改大。
-
-具体数值观察方法：加 `--log DEBUG`，日志里会打每次采样的 ADC 值（`touch adc=NNNN base=NNNN`），看按下和松开时的差值。
-
-## 11. 外挂插件（不重新打包）
-
-插件可以放在**程序目录外面**，这样单文件 exe 不用重新打包就能加插件。
-
-### 11.1 目录
-
-程序启动时会按顺序扫这些目录，**找到的全部加载**：
-
-| 顺序 | 目录 | 说明 |
-| --- | --- | --- |
-| 1 | `%MSU2_WIDGETS_DIR%` | 环境变量，多个目录用系统路径分隔符（Windows `;`，Linux `:`） |
-| 2 | `<exe 所在目录>/widgets/` | 最常用的一个，直接把插件丢在 exe 旁边 |
-| 3 | `%LOCALAPPDATA%\MSU2_MINI\widgets\` | 用户级目录，exe 放 Program Files 没有写权限时用 |
-
-源码方式运行（`python msu2_mini.py`）时，`widgets/` 是内置插件包本身，所以外挂目录改成项目根下的 `widgets_ext/`，同样支持环境变量。
-
-### 11.2 写法
-
-外挂插件的写法和内置插件**完全一样**，唯一区别是导入必须用绝对路径：
-
-```python
-from msu2_core import Widget, register, BOTH, get_font
-from widgets._util import row_text
-```
-
-不能用相对导入（`from ._util import ...`），因为外挂模块不属于 `widgets` 包。
-
-一个文件一个模块，也可以放整个包：
-
-```
-widgets/
-├── hello_widget.py          单文件插件
-└── my_plugin/
-    ├── __init__.py          包插件（内部可以相对导入自己的子模块）
-    └── helper.py
-```
-
-以 `_` 或 `.` 开头的文件和目录会被跳过。
-
-### 11.3 依赖限制
-
-外挂插件跑在主程序进程里，**只能 import 已经打包进 exe 的库**：
-
-- 必有：标准库、`Pillow`、`pyserial`、`psutil`
-- 选有：`numpy`、`pynput`（取决于打包时有没有装）
-
-用了别的第三方库会 `ModuleNotFoundError`，插件加载失败但不影响其它插件。替代方案是自己用 `urllib.request` / `subprocess` / `ctypes` 实现。
-
-### 11.4 覆盖内置插件
-
-外挂插件和内置插件**同名**时，后加载的外挂版本会覆盖内置版本（日志会打 `插件 xxx 被重复注册，后者覆盖前者`）。可以用这个办法就地替换某个内置插件的行为，改坏了把文件删掉即可恢复。
-
-### 11.5 验证
-
-```bash
-MSU2_Console.exe --plugins
-```
-
-`SRC` 列会显示 `内置` / `外挂`。启动日志里也会打：
-
-```
-外部插件目录: C:\...\widgets
-外部插件加载 1 个: hello_widget.py (C:\...\widgets)
-```
-
-失败时日志会打 `加载外部插件 <路径> 失败: <原因>`，`--log DEBUG` 能看到完整堆栈。
-
-### 11.6 示例
-
-`example/widgets/hello_widget.py` 是一份可直接使用的外挂插件示例，涵盖了配置项（`config_schema`）、插件动作（`actions` + `on_action`）、触控手势（`on_action("touch_single", ...)`）、帧缓存（第二次返回 `None`）等常用写法。
-
-祝你好运
+- 一帧最多 25 600 字节，也就是 160×80 的 RGB565 全屏；超过会被裁掉或需要重发，表现为掉帧。
+- 设备没有帧缓冲，像素是边收边画的：一帧发送过程中屏幕会自上而下刷新。大范围的整帧更新能看到这个过程，插件无法规避（差分由上位机统一处理）。
+- 触控只有单击、双击、长按三种手势，没有坐标、压力或滑动。
+- 插件不能直接改亮度、朝向、待机设置，这些是全局设置。
+- 插件运行在上位机进程里，崩溃会带崩整个程序，务必对文件、网络、第三方库的异常做兜底。

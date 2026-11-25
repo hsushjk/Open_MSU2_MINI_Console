@@ -87,7 +87,7 @@ from msu2_core.transport import (  # noqa: E402
     format_fw_version, normalize_fw_version,
 )
 from msu2_core.device import (  # noqa: E402
-    FrameEncoder, MiniDevice, OfflineDevice, TOUCH_CH,  # noqa: F401
+    FrameEncoder, MiniDevice, OfflineDevice, PendingDevice, TOUCH_CH,  # noqa: F401
     _full_frame, _tile_frame, _tile_signatures,  # noqa: F401
 )
 from msu2_core.channel import DeviceChannel  # noqa: E402
@@ -4520,19 +4520,24 @@ def _pick_free_port(used):
     except Exception:
         return ""
     # 优先只看 USB CDC 口：蓝牙/虚拟串口打开一次要好几秒，而且永远握不上手。
-    usb = [c.device for c in comports
+    usb = [c for c in comports
            if "1A86" in (c.hwid or "").upper()
            or "USB" in (c.hwid or "").upper()]
-    ports = usb if usb else [c.device for c in comports]
-    for name in ports:
+    # 本机 VID/PID 精确匹配的排最前面，握手等待给长一点（插上后固件还在启动也认）。
+    usb.sort(key=lambda c: 0 if "FE0D" in (c.hwid or "").upper() else 1)
+    ports = [(c.device, 0.6 if "FE0D" in (c.hwid or "").upper() else 0.35)
+             for c in usb]
+    if not ports:
+        ports = [(c.device, 0.35) for c in comports]
+    for name, wait in ports:
         if name in used:
             continue
         probe = MiniDevice(name)
         ok = False
         try:
-            # 探测模式：只给 0.35 秒看有没有问候，失败就走人；
+            # 探测模式：只给很短的时间看有没有问候，失败就走人；
             # 绝不往别人的串口灌 32 KB（蓝牙口会白等好几秒）。
-            ok = probe.open(handshake_timeout=0.35, purge_retry=False)
+            ok = probe.open(handshake_timeout=wait, purge_retry=False)
         except Exception:
             ok = False
         if ok:
@@ -4622,8 +4627,13 @@ class DeviceManager:
                 device = _pick_device(used)
                 port = str(getattr(device, "port", "") or "")
             if device is None:
-                device = (OfflineDevice() if port.lower() == "offline"
-                          else MiniDevice(port or "auto"))
+                if port.lower() == "offline":
+                    device = OfflineDevice()
+                elif port:
+                    device = MiniDevice(port)
+                else:
+                    # auto 且没扫到：先用占位对象，通道扫到真设备会替换它。
+                    device = PendingDevice()
             if port and port.lower() != "offline":
                 used.add(port)
             specs.append((did, dev, device, port))
@@ -5111,13 +5121,23 @@ class WebUI(threading.Thread):
                                   "fmt": v["fmt"], "len": v["len"]}
                                  for (k, s), v in sorted(sizes.items())]
                     acfg = dcfg.get("asset") or {}
+
+                    def _dev_int(key, default):
+                        """设备回报优先，没连上/没这项时退回本地配置。"""
+                        got = (info or {}).get(key)
+                        if isinstance(got, (int, float)):
+                            return int(got)
+                        try:
+                            return int(acfg.get(key, default))
+                        except (TypeError, ValueError):
+                            return int(default)
+
                     self._json({"ok": True, "device": info, "slots": slots,
-                                "boot_mode": int(acfg.get("boot_mode", 0)),
-                                "standby_mode": int(acfg.get("standby_mode", 1)),
-                                "count": int(acfg.get("count", 1)),
-                                "dwell": int(acfg.get("dwell", 3)),
-                                "boot_hold": int((info or {}).get(
-                                    "boot_hold", acfg.get("boot_hold", 4))),
+                                "boot_mode": _dev_int("boot_mode", 0),
+                                "standby_mode": _dev_int("standby_mode", 1),
+                                "count": _dev_int("count", 1),
+                                "dwell": _dev_int("dwell", 3),
+                                "boot_hold": _dev_int("boot_hold", 4),
                                 "boot_report": (info or {}).get("boot_report")})
                     return
 

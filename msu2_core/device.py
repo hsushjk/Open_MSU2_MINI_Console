@@ -500,6 +500,55 @@ class MiniDevice:
         return self.transport.read_adc(TOUCH_CH, timeout=0.008)
 
 
+class PendingDevice:
+    """自动端口还没扫到设备时的占位对象。
+
+    它不打开任何串口：``open()`` 直接返回 False，所有发送接口都是空操作。
+    通道的「重新发现」逻辑扫到真设备后会把它整个换掉，所以启动时没插屏幕
+    也能正常起 WebUI，插上就自动接上。
+    """
+
+    def __init__(self):
+        self.port = ""
+        self.transport = None
+        self.connected = False
+        self.screen_reversed = False
+        self.tile_repairs = 0
+        self.tx_ms = 0.0
+        self._suspended = False
+
+    def open(self, handshake_timeout=2.0, purge_retry=True):
+        return False
+
+    def close(self):
+        pass
+
+    def suspend(self):
+        self._suspended = True
+
+    def resume(self):
+        self._suspended = False
+
+    @property
+    def suspended(self):
+        return self._suspended
+
+    def show_image(self, img):
+        return False
+
+    def set_reverse(self, reverse):
+        pass
+
+    def set_dim(self, dim):
+        pass
+
+    def read_touch(self):
+        return None
+
+    def heartbeat(self):
+        return True
+
+
 class OfflineDevice:
     def __init__(self):
         self.port = "offline"

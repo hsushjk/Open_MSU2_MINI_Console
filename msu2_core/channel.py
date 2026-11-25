@@ -272,7 +272,10 @@ class DeviceChannel:
         if now - self._open_warn_at > 10.0:
             self._open_warn_at = now
             why = str(getattr(getattr(self.device, "transport", None),
-                              "last_error", "") or "没有响应")
+                              "last_error", "") or "")
+            if not why:
+                why = ("自动扫描未发现设备，插上后会自动接上" if not self.port
+                       else "没有响应")
             log.warning("设备 %s（%s）连不上，跳过并稍后重试：%s",
                         self.id, self.port or "auto", why)
         return False

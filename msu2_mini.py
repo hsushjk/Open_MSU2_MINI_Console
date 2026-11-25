@@ -96,6 +96,9 @@ SCREEN_W, SCREEN_H = LANDSCAPE_SIZE
 MANUAL_COOLDOWN = 0.8
 
 HEARTBEAT_INTERVAL = 2.0
+# 超过这么久没发过帧，设备多半已经自己进了待机（或黑屏）——屏幕不再是
+# 我们上一次发的那一帧，下一帧必须整屏重画。
+STANDBY_GUARD_SECS = 4.0
 
 # 固件升级（Web OTA）之后的“等设备回来”：
 # flash_apply 写出后设备立刻重启，串口会消失再重新枚举。这里每 200 ms 试一次
@@ -1213,6 +1216,27 @@ class Scheduler(threading.Thread):
             if lock is not None:
                 lock.release()
 
+    def invalidate_screen(self):
+        """设备端被命令直接改过屏（预览/擦除/设置生效）。
+
+        编码器还记着"上一帧我发过什么"，但屏幕已经不是那一帧了；只补差异会
+        把上一张图的像素留在没变化的地方（残影）。这里把上一帧丢掉并置强制
+        重发，下一帧就走整屏，把屏幕完整盖一遍。
+        """
+        devices = []
+        for dev in [getattr(self, "device", None)] + [
+                getattr(ch, "device", None) for ch in list(getattr(self, "channels", []) or [])]:
+            if dev is None:
+                continue
+            if all(dev is not d for d in devices):
+                devices.append(dev)
+        for dev in devices:
+            try:
+                dev.encoder.reset()
+            except Exception:
+                pass
+        self._force_send = True
+
     def asset_query(self, tries=3):
         """读设备资产信息；开机瞬间设备可能正忙着画开机图，多试几次。"""
         for _ in range(max(1, int(tries))):
@@ -1228,10 +1252,16 @@ class Scheduler(threading.Thread):
         return None
 
     def asset_draw_safe(self, kind, slot):
-        return self._asset_idle(lambda: self.device.asset_draw(kind, slot))
+        ok, why = self._asset_idle(lambda: self.device.asset_draw(kind, slot))
+        if ok:
+            self.invalidate_screen()
+        return ok, why
 
     def asset_erase_safe(self, kind, slot):
-        return self._asset_idle(lambda: self.device.asset_erase(kind, slot))
+        ok, why = self._asset_idle(lambda: self.device.asset_erase(kind, slot))
+        if ok:
+            self.invalidate_screen()
+        return ok, why
 
     def flash_firmware_safe(self, path):
         """把固件写进设备 NOR 并等它重启回来，返回 WebUI 可直接下发的字典。
@@ -1347,13 +1377,6 @@ class Scheduler(threading.Thread):
             if lock is not None:
                 lock.release()
         self._devcfg_pause_until = 0.0
-        if ok:
-            self._force_send = True
-            if kind == MiniProtocol.ASSET_STANDBY:
-                try:
-                    self.device.asset_draw(kind, slot)
-                except Exception:
-                    pass
         info = {"raw": raw_len,
                 "sent": len(payload) if ok else sent_len,
                 "fmt": fmt}
@@ -2063,6 +2086,11 @@ class Scheduler(threading.Thread):
                     w = widgets[current]
                     now = time.time()
                     mono = time.monotonic()
+                    # 设备长时间没收到帧会自己进待机/黑屏：屏幕已经不是我们上次
+                    # 发的那一帧，下一帧必须整屏盖一遍（否则只补差异会留下残影）。
+                    if (self._last_send_mono and
+                            mono - self._last_send_mono > STANDBY_GUARD_SECS):
+                        self.invalidate_screen()
                     self.ctx.now = now
                     self.ctx.orientation = self.orientation
                     wctx = self._ctx_for(w)
@@ -5248,6 +5276,7 @@ class WebUI(threading.Thread):
                                          "standby_mode": standby_mode,
                                          "count": count, "dwell": dwell})
                             save_config_soon(outer.cfg, cfg_path)
+                            sched.invalidate_screen()
                         self._json({"ok": ok,
                                     "err": "" if ok else why})
                     elif self.path == "/api/asset/draw":
@@ -6042,7 +6071,11 @@ def cmd_devices(cfg, cfg_path=None):
                 dev_obj = _PROBED.pop(found, None)
                 target = found
             else:
-                target = "auto"
+                offline += 1
+                _console("  [%d] %-10s %-8s 自动（未找到，插上后会自动接上）  朝向 %s  "
+                         "亮度 %d%%  翻转 %s" % (i + 1, did, "auto", ori,
+                                               100 - dim, rev))
+                continue
         if dev_obj is None:
             dev_obj = MiniDevice(target or "auto")
         ok = False
